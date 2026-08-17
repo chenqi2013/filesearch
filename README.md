@@ -6,8 +6,9 @@
 
 - 添加、移除一个或多个本地索引目录
 - PDF、DOCX、XLSX、PPTX、TXT、MD、CSV、JSON、LOG、RST 文本抽取
-- 按文件大小和修改时间执行增量重建
-- 关键词、轻量语义、混合三种检索模式
+- SQLite WAL 文件元数据 + Tantivy BM25 分段倒排索引，可面向 5,000–50,000 个文件
+- BGE-small-zh-v1.5 本地 ONNX Embedding，支持关键词、中文语义、混合三种检索模式
+- 按文件大小和修改时间增量重建，文件变化 900 ms 去抖后后台自动更新
 - 文件类型过滤、命中片段、相关度、大小和修改时间
 - 打开原文件、在资源管理器中定位文件
 - 索引进度、文档/片段计数、失败文件列表
@@ -52,18 +53,35 @@ pnpm desktop:build
 
 ## 数据位置
 
-桌面版把 `index.json` 存储在 Tauri 的应用本地数据目录：
+桌面版把 SQLite、Tantivy 和本地模型缓存放在 Tauri 的应用本地数据目录：
 
-- Windows：`%LOCALAPPDATA%\com.localfind.desktop\index.json`
-- macOS：`~/Library/Application Support/com.localfind.desktop/index.json`
+- Windows：`%LOCALAPPDATA%\com.localfind.desktop\`
+- macOS：`~/Library/Application Support/com.localfind.desktop/`
 
-删除该文件即可清理索引。应用只读取源文件，不会修改、移动或删除源文件。
+其中 `search.db` 保存文件元数据、失败记录和文档级向量，`tantivy/` 保存全文倒排索引，`models/` 缓存 BGE 中文模型。旧版 `index.json` 会自动迁移并在后台补齐新向量。应用只读取源文件，不会修改、移动或删除源文件。
 
-## MVP 边界
+首次执行语义索引时会下载一次 `BAAI/bge-small-zh-v1.5` ONNX 模型，之后完全在本地推理；文档内容不会上传。模型不可下载或推理失败时，会自动使用离线中文词项向量，关键词检索和索引服务仍可用。
 
-- “语义搜索”使用本地中文字符/词项特征哈希向量，零模型下载、零云请求，适合验证自然语言检索流程，但同义词理解不及神经网络 Embedding。
+完全离线环境可在启动前设置 `FILESEARCH_EMBEDDING_OFFLINE=1`，跳过模型下载并直接使用离线特征；取消该变量并重启后会再次尝试加载 BGE。
+
+## 大数据量设计
+
+- SQLite 使用 WAL、批量 32 条 Embedding 和事务写入，索引过程内存有界。
+- Tantivy 只保存分段词项与定位 ID，正文和状态由 SQLite 管理，避免 JSON 全量读写。
+- 语义层保存每个文档一个 512 维向量；5 万文档约 98 MB 原始向量数据，查询时顺序扫描并与 Tantivy 候选融合。
+- 文件监听自动合并短时间内的批量变化；共享盘断线时保留已有结果，恢复后自动补扫。
+- 关键词查询跳过向量读取，单文件增量事件只读取轻量路径映射，避免在 5 万文件规模下反复载入约 98 MB 向量。
+
+运行 50,000 文档 SQLite 容量测试：
+
+```bash
+cargo test -p search-core sqlite_wal_handles_fifty_thousand_documents -- --ignored
+```
+
+## 当前边界
+
 - `.doc`、`.xls`、`.ppt` 旧版二进制格式尚未解析；可先另存为 OOXML 格式。
-- 扫描版 PDF 与图片 OCR、问答摘要、文件系统实时监听不在本版范围内。
-- 当前持久化格式为 JSON，适合 MVP 与约数千份文档验证；生产版 5 万文件规模建议替换为 SQLite/Tantivy 与本地向量索引。
+- 扫描版 PDF 与图片 OCR、问答摘要尚未实现；加密 PDF 会明确列为失败文件。
+- 已完成 5 万条合成元数据容量测试；上线前仍建议在目标 Windows 机器和真实混合文档/共享盘环境进行长时间压力测试。
 
 详细设计见 [docs/architecture.md](docs/architecture.md)，测试记录见 [docs/test-report.md](docs/test-report.md)。

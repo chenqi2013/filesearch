@@ -1,25 +1,33 @@
+mod embedding;
 mod extract;
 mod indexer;
 mod model;
 mod search;
+mod storage;
+mod text_index;
+mod watcher;
 
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
-use indexer::{build_index, load, save};
+use embedding::EmbeddingEngine;
 use model::{
-    IndexAccepted, IndexRequest, PersistedIndex, SearchRequest, SearchResponse, ServiceStats,
+    IndexAccepted, IndexFailure, IndexRequest, SearchRequest, SearchResponse, ServiceStats,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
+use storage::{sqlite_path, Storage};
+use text_index::TextIndex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
+use watcher::WatchService;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Local document search core service")]
@@ -31,12 +39,18 @@ struct Args {
 }
 
 struct AppState {
-    index: RwLock<PersistedIndex>,
-    index_path: PathBuf,
+    runtime: tokio::runtime::Handle,
+    storage: Arc<Storage>,
+    text_index: Arc<TextIndex>,
+    embedder: Arc<EmbeddingEngine>,
     indexing: AtomicBool,
     processed: AtomicUsize,
     total: AtomicUsize,
     current_file: Mutex<Option<String>>,
+    pending_changes: Mutex<HashSet<PathBuf>>,
+    watcher_refresh_pending: AtomicBool,
+    watcher: Mutex<Option<WatchService>>,
+    watcher_status: RwLock<String>,
 }
 
 type SharedState = Arc<AppState>;
@@ -47,15 +61,41 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
-    let index_path = args.data_dir.join("index.json");
+    std::fs::create_dir_all(&args.data_dir)?;
+
+    let storage = Arc::new(Storage::open(&sqlite_path(&args.data_dir))?);
+    let migrated = storage.migrate_legacy(&args.data_dir.join("index.json"))?;
+    let text_index = Arc::new(TextIndex::open(&args.data_dir.join("tantivy"))?);
+    let counts = storage.counts()?;
+    if text_index.document_count() != counts.chunks as u64 {
+        tracing::info!(
+            sqlite_chunks = counts.chunks,
+            "rebuilding Tantivy index from SQLite"
+        );
+        text_index.rebuild(&storage.list_documents()?, &storage.list_chunks()?)?;
+    }
+    let embedder = Arc::new(EmbeddingEngine::new(args.data_dir.join("models")));
     let state = Arc::new(AppState {
-        index: RwLock::new(load(&index_path)),
-        index_path,
+        runtime: tokio::runtime::Handle::current(),
+        storage,
+        text_index,
+        embedder,
         indexing: AtomicBool::new(false),
         processed: AtomicUsize::new(0),
         total: AtomicUsize::new(0),
         current_file: Mutex::new(None),
+        pending_changes: Mutex::new(HashSet::new()),
+        watcher_refresh_pending: AtomicBool::new(false),
+        watcher: Mutex::new(None),
+        watcher_status: RwLock::new("starting".to_owned()),
     });
+    restart_watcher(&state);
+
+    let directories = state.storage.directories()?;
+    if (migrated || state.storage.missing_embedding_count()? > 0) && !directories.is_empty() {
+        launch_full_index(Arc::clone(&state), directories);
+    }
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/stats", get(stats))
@@ -83,35 +123,45 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "service": "search-core", "version": env!("CARGO_PKG_VERSION") }))
+async fn health(State(state): State<SharedState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": "search-core",
+        "version": env!("CARGO_PKG_VERSION"),
+        "storage": "sqlite+tantivy",
+        "embedding": state.embedder.status(),
+    }))
 }
 
 async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
-    let index = state.index.read();
+    let counts = state.storage.counts().unwrap_or(storage::StorageCounts {
+        documents: 0,
+        chunks: 0,
+        failures: 0,
+    });
     Json(ServiceStats {
         status: if state.indexing.load(Ordering::Relaxed) {
-            "indexing".to_owned()
+            "indexing"
         } else {
-            "ready".to_owned()
-        },
-        document_count: index.documents.len(),
-        chunk_count: index
-            .documents
-            .iter()
-            .map(|document| document.chunks.len())
-            .sum(),
-        failed_count: index.failures.len(),
+            "ready"
+        }
+        .to_owned(),
+        document_count: counts.documents,
+        chunk_count: counts.chunks,
+        failed_count: counts.failures,
         processed_files: state.processed.load(Ordering::Relaxed),
         total_files: state.total.load(Ordering::Relaxed),
         current_file: state.current_file.lock().clone(),
-        directories: index.directories.clone(),
-        last_indexed: index.last_indexed.clone(),
+        directories: state.storage.directories().unwrap_or_default(),
+        last_indexed: state.storage.last_indexed().unwrap_or_default(),
+        storage_backend: "SQLite WAL + Tantivy BM25".to_owned(),
+        embedding_model: state.embedder.status(),
+        watcher_status: state.watcher_status.read().clone(),
     })
 }
 
 async fn failures(State(state): State<SharedState>) -> Json<Value> {
-    Json(json!({ "failures": state.index.read().failures.clone() }))
+    Json(json!({ "failures": state.storage.failures().unwrap_or_default() }))
 }
 
 async fn search_documents(
@@ -125,10 +175,21 @@ async fn search_documents(
         ));
     }
     let started = Instant::now();
-    let index = state.index.read();
-    let results = search::search(&index.documents, &request);
+    let query = request.query.clone();
+    let task_state = Arc::clone(&state);
+    let results = tokio::task::spawn_blocking(move || {
+        search::search(
+            &task_state.storage,
+            &task_state.text_index,
+            &task_state.embedder,
+            &request,
+        )
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
     Ok(Json(SearchResponse {
-        query: request.query,
+        query,
         total: results.len(),
         elapsed_ms: started.elapsed().as_millis(),
         results,
@@ -139,11 +200,7 @@ async fn start_index(
     State(state): State<SharedState>,
     Json(request): Json<IndexRequest>,
 ) -> Result<(StatusCode, Json<IndexAccepted>), (StatusCode, Json<Value>)> {
-    if state
-        .indexing
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !launch_full_index(Arc::clone(&state), request.paths) {
         return Ok((
             StatusCode::CONFLICT,
             Json(IndexAccepted {
@@ -152,25 +209,6 @@ async fn start_index(
             }),
         ));
     }
-
-    let task_state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let previous = task_state.index.read().clone();
-        let next = build_index(&request.paths, &previous, |update| {
-            task_state
-                .processed
-                .store(update.processed, Ordering::Relaxed);
-            task_state.total.store(update.total, Ordering::Relaxed);
-            *task_state.current_file.lock() = update.current_file.map(ToOwned::to_owned);
-        });
-        if let Err(error) = save(&task_state.index_path, &next) {
-            tracing::error!(%error, "failed to persist index");
-        }
-        *task_state.index.write() = next;
-        *task_state.current_file.lock() = None;
-        task_state.indexing.store(false, Ordering::SeqCst);
-    });
-
     Ok((
         StatusCode::ACCEPTED,
         Json(IndexAccepted {
@@ -178,6 +216,144 @@ async fn start_index(
             message: "索引任务已启动".to_owned(),
         }),
     ))
+}
+
+fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
+    if state
+        .indexing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    state.processed.store(0, Ordering::Relaxed);
+    state.total.store(0, Ordering::Relaxed);
+    let runtime = state.runtime.clone();
+    runtime.spawn_blocking(move || {
+        let result = indexer::build_index(
+            &paths,
+            &state.storage,
+            &state.text_index,
+            &state.embedder,
+            |update| update_progress(&state, update),
+        );
+        if let Err(error) = result {
+            tracing::error!(%error, "full index task failed");
+            let _ = state.storage.record_failure(&IndexFailure {
+                path: "<index-task>".to_owned(),
+                category: "internal".to_owned(),
+                reason: format!("索引任务失败: {error:#}"),
+            });
+        }
+        finish_index_task(&state, true);
+    });
+    true
+}
+
+fn queue_incremental(state: SharedState, paths: Vec<PathBuf>) {
+    state.pending_changes.lock().extend(paths);
+    launch_pending_incremental(state);
+}
+
+fn launch_pending_incremental(state: SharedState) {
+    if state.pending_changes.lock().is_empty()
+        || state
+            .indexing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
+    let runtime = state.runtime.clone();
+    runtime.spawn_blocking(move || {
+        loop {
+            let paths = state.pending_changes.lock().drain().collect::<Vec<_>>();
+            if paths.is_empty() {
+                break;
+            }
+            if let Err(error) = indexer::update_paths(
+                &paths,
+                &state.storage,
+                &state.text_index,
+                &state.embedder,
+                |update| update_progress(&state, update),
+            ) {
+                tracing::error!(%error, "incremental index task failed");
+            }
+        }
+        finish_index_task(&state, false);
+    });
+}
+
+fn finish_index_task(state: &SharedState, refresh_watcher: bool) {
+    *state.current_file.lock() = None;
+    state.indexing.store(false, Ordering::SeqCst);
+    if refresh_watcher || state.watcher_refresh_pending.swap(false, Ordering::SeqCst) {
+        restart_watcher(state);
+    }
+    if !state.pending_changes.lock().is_empty() {
+        launch_pending_incremental(Arc::clone(state));
+    }
+}
+
+fn update_progress(state: &AppState, update: indexer::ProgressUpdate<'_>) {
+    state.processed.store(update.processed, Ordering::Relaxed);
+    state.total.store(update.total, Ordering::Relaxed);
+    *state.current_file.lock() = update.current_file.map(ToOwned::to_owned);
+}
+
+fn restart_watcher(state: &SharedState) {
+    let roots = state
+        .storage
+        .directories()
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let paths_state: Weak<AppState> = Arc::downgrade(state);
+    let error_state: Weak<AppState> = Arc::downgrade(state);
+    let recovered_state: Weak<AppState> = Arc::downgrade(state);
+    match WatchService::start(
+        roots,
+        move |paths| {
+            if let Some(state) = paths_state.upgrade() {
+                queue_incremental(state, paths);
+            }
+        },
+        move |message| {
+            if let Some(state) = error_state.upgrade() {
+                *state.watcher_status.write() = format!("degraded: {message}");
+                let _ = state.storage.record_failure(&IndexFailure {
+                    path: "<file-watcher>".to_owned(),
+                    category: "offline".to_owned(),
+                    reason: message,
+                });
+            }
+        },
+        move |path| {
+            if let Some(state) = recovered_state.upgrade() {
+                state.watcher_refresh_pending.store(true, Ordering::SeqCst);
+                *state.watcher_status.write() = "recovering".to_owned();
+                queue_incremental(state, vec![path]);
+            }
+        },
+    ) {
+        Ok(watcher) => {
+            *state.watcher_status.write() = watcher.status();
+            *state.watcher.lock() = Some(watcher);
+        }
+        Err(error) => {
+            *state.watcher_status.write() = format!("error: {error}");
+            tracing::error!(%error, "failed to start file watcher");
+        }
+    }
+}
+
+fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": error.to_string() })),
+    )
 }
 
 async fn shutdown_signal() {

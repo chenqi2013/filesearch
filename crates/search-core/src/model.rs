@@ -1,36 +1,75 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PersistedIndex {
+pub struct LegacyIndex {
+    #[serde(default)]
     pub directories: Vec<String>,
-    pub documents: Vec<DocumentRecord>,
+    #[serde(default)]
+    pub documents: Vec<LegacyDocument>,
+    #[serde(default)]
     pub failures: Vec<IndexFailure>,
     pub last_indexed: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentRecord {
+pub struct LegacyDocument {
     pub id: String,
     pub path: String,
     pub name: String,
     pub extension: String,
     pub modified_ms: u64,
     pub size: u64,
-    pub chunks: Vec<ChunkRecord>,
+    #[serde(default)]
+    pub chunks: Vec<LegacyChunk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkRecord {
+pub struct LegacyChunk {
     pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedDocument {
+    pub id: String,
+    pub root: String,
+    pub path: String,
+    pub name: String,
+    pub extension: String,
+    pub modified_ms: u64,
+    pub size: u64,
+    pub chunks: Vec<String>,
     pub embedding: Vec<f32>,
-    #[serde(default)]
-    pub terms: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredDocument {
+    pub id: String,
+    pub root: String,
+    pub path: String,
+    pub name: String,
+    pub extension: String,
+    pub modified_ms: u64,
+    pub size: u64,
+    pub embedding: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredChunk {
+    pub id: u64,
+    pub document_id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexFailure {
     pub path: String,
+    #[serde(default = "default_failure_category")]
+    pub category: String,
     pub reason: String,
+}
+
+fn default_failure_category() -> String {
+    "parse".to_owned()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -64,7 +103,7 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub id: String,
     pub path: String,
@@ -98,4 +137,7 @@ pub struct ServiceStats {
     pub current_file: Option<String>,
     pub directories: Vec<String>,
     pub last_indexed: Option<String>,
+    pub storage_backend: String,
+    pub embedding_model: String,
+    pub watcher_status: String,
 }

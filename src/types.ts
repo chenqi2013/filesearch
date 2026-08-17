@@ -10,6 +10,9 @@ export interface ServiceStats {
   current_file?: string;
   directories: string[];
   last_indexed?: string;
+  storage_backend?: string;
+  embedding_model?: string;
+  watcher_status?: string;
 }
 
 export interface SearchResult {
@@ -32,6 +35,6 @@ export interface SearchResponse {
 
 export interface IndexFailure {
   path: string;
+  category?: "encrypted" | "permission" | "offline" | "corrupt" | "parse" | "internal";
   reason: string;
 }
-

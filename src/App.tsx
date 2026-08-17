@@ -162,8 +162,10 @@ function App() {
             {stats.directories.length === 0 && <p className="muted compact">{t.noFolder}</p>}
             {stats.directories.map((path) => (
               <div className="folder-row" key={path}>
-                <Folder aria-hidden="true" />
-                <span title={path}>{basename(path)}</span>
+                <button className="folder-open" title={`${t.openFolder}: ${path}`} onClick={() => void openPath(path)}>
+                  <Folder aria-hidden="true" />
+                  <span>{basename(path)}</span>
+                </button>
                 <button className="icon-button subtle" title={t.remove} onClick={() => void indexFolders(stats.directories.filter((item) => item !== path))}><Trash2 /></button>
               </div>
             ))}
@@ -268,4 +270,3 @@ const formatTimestamp = (value: number, locale: Locale) => new Intl.DateTimeForm
 const formatDate = (value: string, locale: Locale) => formatTimestamp(new Date(value).getTime(), locale);
 
 export default App;
-

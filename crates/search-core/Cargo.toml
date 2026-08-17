@@ -9,11 +9,15 @@ anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+fastembed = { git = "https://github.com/Anush008/fastembed-rs.git", tag = "v5.7.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries"] }
+notify = "6.1.1"
 parking_lot = "0.12"
 pdf-extract = "0.9"
 quick-xml = "0.37"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tantivy = { git = "https://github.com/quickwit-oss/tantivy.git", tag = "0.24.2", default-features = false, features = ["mmap", "lz4-compression"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
@@ -21,3 +25,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+tempfile = "3"

@@ -24,6 +24,7 @@ const messages = {
     searchTitle: "输入关键词或一句话",
     searchAction: "在已索引文档中查找相关内容",
     open: "打开文件",
+    openFolder: "打开文件夹",
     reveal: "所在目录",
     remove: "移除目录",
     reindex: "重新索引",
@@ -62,6 +63,7 @@ const messages = {
     searchTitle: "Search with keywords or a sentence",
     searchAction: "Find relevant passages in indexed documents",
     open: "Open file",
+    openFolder: "Open folder",
     reveal: "Show in folder",
     remove: "Remove folder",
     reindex: "Reindex",
@@ -100,6 +102,7 @@ const messages = {
     searchTitle: "Введите ключевые слова или фразу",
     searchAction: "Поиск по проиндексированным документам",
     open: "Открыть файл",
+    openFolder: "Открыть папку",
     reveal: "Показать в папке",
     remove: "Удалить папку",
     reindex: "Переиндексировать",
@@ -119,4 +122,3 @@ const messages = {
 
 export type Messages = (typeof messages)[Locale];
 export const getMessages = (locale: Locale): Messages => messages[locale];
-

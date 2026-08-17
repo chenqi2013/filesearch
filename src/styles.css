@@ -45,10 +45,12 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; flex: 0 0 auto; }
 .icon-button:disabled { opacity: .35; cursor: default; }
 .icon-button svg { width: 16px; height: 16px; }
 .folder-list { display: grid; gap: 3px; margin-top: 7px; max-height: 34vh; overflow: auto; }
-.folder-row { height: 38px; display: grid; grid-template-columns: 20px minmax(0, 1fr) 28px; align-items: center; gap: 8px; padding: 0 5px 0 8px; border-radius: 5px; font-size: 13px; }
+.folder-row { height: 38px; display: grid; grid-template-columns: minmax(0, 1fr) 28px; align-items: center; gap: 3px; padding: 0 5px 0 3px; border-radius: 5px; font-size: 13px; }
 .folder-row:hover { background: #e3e7e1; }
-.folder-row > svg { color: var(--amber); }
-.folder-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-open { min-width: 0; height: 100%; padding: 0 5px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 8px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.folder-open:focus-visible { border-radius: 4px; outline: 2px solid var(--accent); outline-offset: -2px; }
+.folder-open > svg { color: var(--amber); }
+.folder-open > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-row .subtle { opacity: 0; }
 .folder-row:hover .subtle { opacity: 1; }
 .add-folder { height: 36px; margin: 10px 5px 0; display: flex; align-items: center; justify-content: center; gap: 7px; border: 1px dashed #b9c0ba; border-radius: 5px; background: transparent; color: #52605a; cursor: pointer; }

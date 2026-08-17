@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -30,8 +30,13 @@ pub fn extract_text(path: &Path) -> Result<String> {
                 std::fs::read(path).with_context(|| format!("无法读取 {}", path.display()))?;
             String::from_utf8_lossy(&bytes).into_owned()
         }
-        "pdf" => pdf_extract::extract_text(path)
-            .with_context(|| format!("PDF 解析失败: {}", path.display()))?,
+        "pdf" => {
+            if pdf_has_encrypt_marker(path)? {
+                return Err(anyhow!("加密 PDF 不支持，请解密后重新索引"));
+            }
+            pdf_extract::extract_text(path)
+                .with_context(|| format!("PDF 解析失败: {}", path.display()))?
+        }
         "docx" => extract_ooxml(path, OoxmlKind::Word)?,
         "pptx" => extract_ooxml(path, OoxmlKind::PowerPoint)?,
         "xlsx" => extract_ooxml(path, OoxmlKind::Excel)?,
@@ -43,6 +48,19 @@ pub fn extract_text(path: &Path) -> Result<String> {
         return Err(anyhow!("未提取到可索引文本"));
     }
     Ok(normalized)
+}
+
+fn pdf_has_encrypt_marker(path: &Path) -> Result<bool> {
+    const WINDOW: u64 = 128 * 1024;
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(WINDOW);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity((length - start) as usize);
+    file.read_to_end(&mut tail)?;
+    Ok(tail
+        .windows(b"/Encrypt".len())
+        .any(|window| window == b"/Encrypt"))
 }
 
 enum OoxmlKind {
@@ -133,6 +151,7 @@ fn normalize_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn extracts_xml_text_without_tags() {
@@ -140,5 +159,43 @@ mod tests {
             .unwrap();
         assert!(value.contains("本地搜索"));
         assert!(value.contains("MVP"));
+    }
+
+    #[test]
+    fn rejects_corrupt_office_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.docx");
+        std::fs::write(&path, b"not a zip archive").unwrap();
+        let error = extract_text(&path).unwrap_err().to_string();
+        assert!(error.contains("无效") || error.to_lowercase().contains("invalid"));
+    }
+
+    #[test]
+    fn identifies_encrypted_pdf_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("encrypted.pdf");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"%PDF-1.7\n1 0 obj << /Encrypt 2 0 R >>\n%%EOF")
+            .unwrap();
+        let error = extract_text(&path).unwrap_err().to_string();
+        assert!(error.contains("加密 PDF"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_permission_denied_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.txt");
+        std::fs::write(&path, "secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = extract_text(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = result {
+            assert_eq!(
+                crate::indexer::classify_failure(&format!("{error:#}")),
+                "permission"
+            );
+        }
     }
 }
