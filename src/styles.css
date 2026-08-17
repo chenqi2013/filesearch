@@ -130,6 +130,8 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; flex: 0 0 auto; }
 .toast svg { width: 15px; }
 .muted { color: var(--muted); }.compact { padding: 5px 8px; font-size: 12px; }
 .spin { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
+.progress-track.indeterminate span { width: 38%; animation: progress-slide 1.4s ease-in-out infinite; }
+@keyframes progress-slide { from { transform: translateX(-110%); } to { transform: translateX(280%); } }
 
 @media (max-width: 1050px) {
   .topbar { grid-template-columns: 190px minmax(300px, 1fr) auto; gap: 14px; }

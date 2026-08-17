@@ -134,6 +134,14 @@ function App() {
     [response],
   );
   const progress = stats.total_files ? Math.round((stats.processed_files / stats.total_files) * 100) : 0;
+  const modelLoading = stats.embedding_model?.includes("正在加载") ?? false;
+  const operation = modelLoading
+    ? t.embeddingLoading
+    : stats.total_files === 0
+      ? t.scanning
+    : stats.current_file
+      ? `${t.processingFile}: ${basename(stats.current_file)}`
+      : t.writingIndex;
 
   return (
     <div className="app-shell">
@@ -173,9 +181,12 @@ function App() {
           <button className="add-folder" onClick={addFolder}><Plus />{t.addFolder}</button>
 
           <div className="index-summary">
-            <div className="status-line"><span className={`status-dot ${connected ? stats.status : "offline"}`} />{!connected ? t.unavailable : stats.status === "indexing" ? t.indexing : t.ready}</div>
+            <div className="status-line"><span className={`status-dot ${connected ? stats.status : "offline"}`} />{!connected ? t.unavailable : stats.status === "indexing" ? operation : t.ready}</div>
             {stats.status === "indexing" && (
-              <div className="progress-block"><div className="progress-track"><span style={{ width: `${progress}%` }} /></div><small>{stats.processed_files} / {stats.total_files}</small></div>
+              <div className="progress-block">
+                <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>
+                <small>{modelLoading ? stats.embedding_model : `${stats.processed_files} / ${stats.total_files}`}</small>
+              </div>
             )}
             <div className="stat-grid">
               <span><strong>{stats.document_count}</strong>{t.documents}</span>
