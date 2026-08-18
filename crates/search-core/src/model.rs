@@ -127,6 +127,55 @@ pub struct IndexAccepted {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct IndexedDocument {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub extension: String,
+    pub modified_ms: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedChunk {
+    pub id: u64,
+    pub document_id: String,
+    pub document_name: String,
+    pub document_path: String,
+    pub position: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PageRequest {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_page_limit")]
+    pub limit: usize,
+}
+
+impl PageRequest {
+    pub fn bounded(self) -> Self {
+        Self {
+            offset: self.offset,
+            limit: self.limit.clamp(1, 100),
+        }
+    }
+}
+
+fn default_page_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ServiceStats {
     pub status: String,
     pub document_count: usize,

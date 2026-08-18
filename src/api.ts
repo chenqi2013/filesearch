@@ -1,4 +1,12 @@
-import type { IndexFailure, SearchMode, SearchResponse, ServiceStats } from "./types";
+import type {
+  IndexFailure,
+  IndexedChunk,
+  IndexedDocument,
+  Page,
+  SearchMode,
+  SearchResponse,
+  ServiceStats,
+} from "./types";
 
 const CORE_URL = "http://127.0.0.1:47653";
 
@@ -27,6 +35,7 @@ export const coreApi = {
       method: "POST",
       body: JSON.stringify({ query, mode, extension: extension || null, limit: 50 }),
     }),
-  failures: async () => (await request<{ failures: IndexFailure[] }>("/failures")).failures,
+  documents: (offset = 0, limit = 50) => request<Page<IndexedDocument>>(`/documents?offset=${offset}&limit=${limit}`),
+  chunks: (offset = 0, limit = 50) => request<Page<IndexedChunk>>(`/chunks?offset=${offset}&limit=${limit}`),
+  failures: (offset = 0, limit = 50) => request<Page<IndexFailure>>(`/failures?offset=${offset}&limit=${limit}`),
 };
-

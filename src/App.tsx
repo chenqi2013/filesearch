@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
+  ChevronLeft,
   ChevronRight,
   Clock3,
   ExternalLink,
@@ -19,7 +20,22 @@ import {
 } from "lucide-react";
 import { coreApi } from "./api";
 import { getMessages, type Locale } from "./i18n";
-import type { IndexFailure, SearchMode, SearchResponse, SearchResult, ServiceStats } from "./types";
+import type {
+  IndexFailure,
+  IndexedChunk,
+  IndexedDocument,
+  Page,
+  SearchMode,
+  SearchResponse,
+  SearchResult,
+  ServiceStats,
+} from "./types";
+
+type InventoryKind = "documents" | "chunks" | "failures";
+type InventoryState =
+  | { kind: "documents"; page: Page<IndexedDocument> }
+  | { kind: "chunks"; page: Page<IndexedChunk> }
+  | { kind: "failures"; page: Page<IndexFailure> };
 
 const EMPTY_STATS: ServiceStats = {
   status: "ready",
@@ -45,7 +61,8 @@ function App() {
   const [response, setResponse] = useState<SearchResponse | null>(null);
   const [selected, setSelected] = useState<SearchResult | null>(null);
   const [searching, setSearching] = useState(false);
-  const [failures, setFailures] = useState<IndexFailure[] | null>(null);
+  const [inventory, setInventory] = useState<InventoryState | null>(null);
+  const [inventoryLoading, setInventoryLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const refreshStats = useCallback(async () => {
@@ -112,11 +129,20 @@ function App() {
     }
   };
 
-  const showFailures = async () => {
+  const showInventory = async (kind: InventoryKind, offset = 0) => {
+    setInventoryLoading(true);
     try {
-      setFailures(await coreApi.failures());
+      if (kind === "documents") {
+        setInventory({ kind, page: await coreApi.documents(offset) });
+      } else if (kind === "chunks") {
+        setInventory({ kind, page: await coreApi.chunks(offset) });
+      } else {
+        setInventory({ kind, page: await coreApi.failures(offset) });
+      }
     } catch (error) {
       setNotice(`${t.error}: ${String(error)}`);
+    } finally {
+      setInventoryLoading(false);
     }
   };
 
@@ -189,9 +215,9 @@ function App() {
               </div>
             )}
             <div className="stat-grid">
-              <span><strong>{stats.document_count}</strong>{t.documents}</span>
-              <span><strong>{stats.chunk_count}</strong>{t.chunks}</span>
-              <button onClick={showFailures}><strong>{stats.failed_count}</strong>{t.failures}</button>
+              <button onClick={() => void showInventory("documents")}><strong>{stats.document_count}</strong>{t.documents}</button>
+              <button onClick={() => void showInventory("chunks")}><strong>{stats.chunk_count}</strong>{t.chunks}</button>
+              <button onClick={() => void showInventory("failures")}><strong>{stats.failed_count}</strong>{t.failures}</button>
             </div>
             <div className="index-actions">
               <span><Clock3 />{stats.last_indexed ? formatDate(stats.last_indexed, locale) : t.never}</span>
@@ -241,17 +267,86 @@ function App() {
         </main>
       </div>
 
-      {failures && (
-        <div className="modal-backdrop" onMouseDown={() => setFailures(null)}>
-          <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-            <header><div><AlertTriangle /><h2>{t.failedFiles}</h2></div><button className="icon-button" onClick={() => setFailures(null)} title={t.close}><X /></button></header>
-            <div className="failure-list">
-              {failures.length === 0 ? <p className="muted">{t.noFailures}</p> : failures.map((failure) => <div key={failure.path}><strong>{failure.path}</strong><p>{failure.reason}</p></div>)}
-            </div>
-          </section>
-        </div>
-      )}
+      {inventory && <InventoryModal inventory={inventory} loading={inventoryLoading} t={t} locale={locale} onClose={() => setInventory(null)} onPage={(offset) => void showInventory(inventory.kind, offset)} onOpen={openPath} />}
       {notice && <button className="toast" onClick={() => setNotice(null)}>{notice}<X /></button>}
+    </div>
+  );
+}
+
+function InventoryModal({
+  inventory,
+  loading,
+  t,
+  locale,
+  onClose,
+  onPage,
+  onOpen,
+}: {
+  inventory: InventoryState;
+  loading: boolean;
+  t: ReturnType<typeof getMessages>;
+  locale: Locale;
+  onClose: () => void;
+  onPage: (offset: number) => void;
+  onOpen: (path: string) => void;
+}) {
+  const { page } = inventory;
+  const title = inventory.kind === "documents" ? t.indexedDocuments : inventory.kind === "chunks" ? t.indexedChunks : t.failedFiles;
+  const emptyText = inventory.kind === "documents" ? t.noDocuments : inventory.kind === "chunks" ? t.noChunks : t.noFailures;
+  const start = page.total === 0 ? 0 : page.offset + 1;
+  const end = Math.min(page.offset + page.items.length, page.total);
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section className="modal inventory-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div>{inventory.kind === "failures" ? <AlertTriangle /> : <FileSearch />}<h2>{title}</h2></div>
+          <button className="icon-button" onClick={onClose} title={t.close}><X /></button>
+        </header>
+        <div className={`inventory-list ${loading ? "loading" : ""}`}>
+          {page.items.length === 0 && <p className="muted inventory-empty">{emptyText}</p>}
+          {inventory.kind === "documents" && inventory.page.items.map((document) => (
+            <button className="inventory-item" key={document.id} onClick={() => onOpen(document.path)}>
+              <FileBadge extension={document.extension} />
+              <span className="inventory-body">
+                <strong>{document.name}</strong>
+                <span className="inventory-path">{document.path}</span>
+                <small>{formatBytes(document.size)} · {formatTimestamp(document.modified_ms, locale)}</small>
+              </span>
+              <ExternalLink />
+            </button>
+          ))}
+          {inventory.kind === "chunks" && inventory.page.items.map((chunk) => (
+            <button className="inventory-item chunk-item" key={chunk.id} onClick={() => onOpen(chunk.document_path)}>
+              <File aria-hidden="true" />
+              <span className="inventory-body">
+                <strong>{chunk.document_name} · #{chunk.position + 1}</strong>
+                <span className="inventory-path">{chunk.document_path}</span>
+                <p>{chunk.text}</p>
+              </span>
+              <ExternalLink />
+            </button>
+          ))}
+          {inventory.kind === "failures" && inventory.page.items.map((failure) => (
+            <div className="inventory-item failure-item" key={failure.path}>
+              <AlertTriangle />
+              <span className="inventory-body">
+                <strong>{failure.path}</strong>
+                <small className="failure-category">{failure.category}</small>
+                <p>{failure.reason}</p>
+              </span>
+            </div>
+          ))}
+        </div>
+        <footer className="inventory-footer">
+          <span>{t.listRange(start, end, page.total)}</span>
+          <div>
+            <button className="icon-button" disabled={loading || page.offset === 0} onClick={() => onPage(Math.max(0, page.offset - page.limit))} title={t.previous}><ChevronLeft /></button>
+            {loading && <RefreshCw className="spin" />}
+            <button className="icon-button" disabled={loading || page.offset + page.limit >= page.total} onClick={() => onPage(page.offset + page.limit)} title={t.next}><ChevronRight /></button>
+          </div>
+        </footer>
+      </section>
     </div>
   );
 }

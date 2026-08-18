@@ -1,4 +1,7 @@
-use crate::model::{IndexFailure, LegacyIndex, PreparedDocument, StoredChunk, StoredDocument};
+use crate::model::{
+    IndexFailure, IndexedChunk, IndexedDocument, LegacyIndex, PreparedDocument, StoredChunk,
+    StoredDocument,
+};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -178,6 +181,26 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    pub fn document_page(&self, offset: usize, limit: usize) -> Result<Vec<IndexedDocument>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, path, name, extension, modified_ms, size
+             FROM documents ORDER BY name COLLATE NOCASE, path LIMIT ? OFFSET ?",
+        )?;
+        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
+            Ok(IndexedDocument {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                extension: row.get(3)?,
+                modified_ms: row.get::<_, i64>(4)? as u64,
+                size: row.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn document_by_path(&self, path: &str) -> Result<Option<StoredDocument>> {
         let connection = self.connection.lock();
         connection
@@ -270,12 +293,51 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    pub fn chunk_page(&self, offset: usize, limit: usize) -> Result<Vec<IndexedChunk>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.document_id, d.name, d.path, c.position, c.text
+             FROM chunks c JOIN documents d ON d.id = c.document_id
+             ORDER BY d.name COLLATE NOCASE, d.path, c.position LIMIT ? OFFSET ?",
+        )?;
+        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
+            Ok(IndexedChunk {
+                id: row.get::<_, i64>(0)? as u64,
+                document_id: row.get(1)?,
+                document_name: row.get(2)?,
+                document_path: row.get(3)?,
+                position: row.get::<_, i64>(4)? as usize,
+                text: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
     pub fn failures(&self) -> Result<Vec<IndexFailure>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT path, category, reason FROM failures ORDER BY updated_at DESC, path",
         )?;
         let rows = statement.query_map([], |row| {
+            Ok(IndexFailure {
+                path: row.get(0)?,
+                category: row.get(1)?,
+                reason: row.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn failure_page(&self, offset: usize, limit: usize) -> Result<Vec<IndexFailure>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT path, category, reason FROM failures
+             ORDER BY updated_at DESC, path LIMIT ? OFFSET ?",
+        )?;
+        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
             Ok(IndexFailure {
                 path: row.get(0)?,
                 category: row.get(1)?,
@@ -389,6 +451,36 @@ mod tests {
     fn vectors_round_trip_as_compact_blobs() {
         let vector = vec![0.25, -0.5, 1.0];
         assert_eq!(blob_to_vector(&vector_to_blob(&vector)), vector);
+    }
+
+    #[test]
+    fn inventory_pages_return_documents_chunks_and_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        storage
+            .upsert_document(&PreparedDocument {
+                id: "doc-1".to_owned(),
+                root: "/inventory".to_owned(),
+                path: "/inventory/示例.txt".to_owned(),
+                name: "示例.txt".to_owned(),
+                extension: "txt".to_owned(),
+                modified_ms: 1,
+                size: 12,
+                chunks: vec!["第一段".to_owned(), "第二段".to_owned()],
+                embedding: fallback_embed("示例"),
+            })
+            .unwrap();
+        storage
+            .record_failure(&IndexFailure {
+                path: "/inventory/损坏.pdf".to_owned(),
+                category: "corrupt".to_owned(),
+                reason: "解析失败".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(storage.document_page(0, 50).unwrap().len(), 1);
+        assert_eq!(storage.chunk_page(0, 50).unwrap().len(), 2);
+        assert_eq!(storage.failure_page(0, 50).unwrap().len(), 1);
     }
 
     #[test]

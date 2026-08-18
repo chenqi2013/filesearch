@@ -38,3 +38,28 @@ export interface IndexFailure {
   category?: "encrypted" | "permission" | "offline" | "corrupt" | "parse" | "internal";
   reason: string;
 }
+
+export interface IndexedDocument {
+  id: string;
+  path: string;
+  name: string;
+  extension: string;
+  modified_ms: number;
+  size: number;
+}
+
+export interface IndexedChunk {
+  id: number;
+  document_id: string;
+  document_name: string;
+  document_path: string;
+  position: number;
+  text: string;
+}
+
+export interface Page<T> {
+  items: T[];
+  total: number;
+  offset: number;
+  limit: number;
+}

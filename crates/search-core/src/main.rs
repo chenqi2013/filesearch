@@ -7,14 +7,15 @@ mod storage;
 mod text_index;
 mod watcher;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use embedding::EmbeddingEngine;
 use model::{
-    IndexAccepted, IndexFailure, IndexRequest, SearchRequest, SearchResponse, ServiceStats,
+    IndexAccepted, IndexFailure, IndexRequest, IndexedChunk, IndexedDocument, Page, PageRequest,
+    SearchRequest, SearchResponse, ServiceStats,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -99,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/stats", get(stats))
+        .route("/documents", get(documents))
+        .route("/chunks", get(chunks))
         .route("/search", post(search_documents))
         .route("/index", post(start_index))
         .route("/failures", get(failures))
@@ -160,8 +163,58 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
     })
 }
 
-async fn failures(State(state): State<SharedState>) -> Json<Value> {
-    Json(json!({ "failures": state.storage.failures().unwrap_or_default() }))
+async fn documents(
+    State(state): State<SharedState>,
+    Query(request): Query<PageRequest>,
+) -> Result<Json<Page<IndexedDocument>>, (StatusCode, Json<Value>)> {
+    let request = request.bounded();
+    let counts = state.storage.counts().map_err(internal_error)?;
+    let items = state
+        .storage
+        .document_page(request.offset, request.limit)
+        .map_err(internal_error)?;
+    Ok(Json(Page {
+        items,
+        total: counts.documents,
+        offset: request.offset,
+        limit: request.limit,
+    }))
+}
+
+async fn chunks(
+    State(state): State<SharedState>,
+    Query(request): Query<PageRequest>,
+) -> Result<Json<Page<IndexedChunk>>, (StatusCode, Json<Value>)> {
+    let request = request.bounded();
+    let counts = state.storage.counts().map_err(internal_error)?;
+    let items = state
+        .storage
+        .chunk_page(request.offset, request.limit)
+        .map_err(internal_error)?;
+    Ok(Json(Page {
+        items,
+        total: counts.chunks,
+        offset: request.offset,
+        limit: request.limit,
+    }))
+}
+
+async fn failures(
+    State(state): State<SharedState>,
+    Query(request): Query<PageRequest>,
+) -> Result<Json<Page<IndexFailure>>, (StatusCode, Json<Value>)> {
+    let request = request.bounded();
+    let counts = state.storage.counts().map_err(internal_error)?;
+    let items = state
+        .storage
+        .failure_page(request.offset, request.limit)
+        .map_err(internal_error)?;
+    Ok(Json(Page {
+        items,
+        total: counts.failures,
+        offset: request.offset,
+        limit: request.limit,
+    }))
 }
 
 async fn search_documents(
