@@ -1,0 +1,8 @@
+[env]
+ORT_LIB_LOCATION = { value = "../.codex-tmp/onnxruntime-1.22.0/runtimes/win-x64/native", relative = true, force = false }
+
+[patch."https://github.com/quickwit-oss/tantivy.git"]
+tantivy = { path = ".codex-tmp/tantivy-0242-zip/tantivy-0.24.2" }
+
+[patch.crates-io]
+vswhom-sys = { path = ".codex-tmp/vswhom-sys-stub" }

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "本地知搜",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "identifier": "com.localfind.desktop",
   "build": {
     "beforeDevCommand": "pnpm prepare:sidecar && pnpm dev",
@@ -29,6 +29,14 @@
     "active": true,
     "targets": "all",
     "externalBin": ["binaries/search-core"],
+    "resources": {
+      "binaries/onnxruntime.dll": "onnxruntime.dll",
+      "binaries/vcruntime140.dll": "vcruntime140.dll",
+      "binaries/vcruntime140_1.dll": "vcruntime140_1.dll",
+      "binaries/msvcp140.dll": "msvcp140.dll",
+      "binaries/msvcp140_1.dll": "msvcp140_1.dll",
+      "../assets/models": "models"
+    },
     "windows": {
       "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true }
     }

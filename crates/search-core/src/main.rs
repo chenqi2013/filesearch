@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod embedding;
 mod extract;
 mod indexer;
@@ -37,6 +39,8 @@ struct Args {
     listen: String,
     #[arg(long, default_value = ".filesearch-data")]
     data_dir: PathBuf,
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
 }
 
 struct AppState {
@@ -75,7 +79,14 @@ async fn main() -> anyhow::Result<()> {
         );
         text_index.rebuild(&storage.list_documents()?, &storage.list_chunks()?)?;
     }
-    let embedder = Arc::new(EmbeddingEngine::new(args.data_dir.join("models")));
+    let model_dir = args.model_dir.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .map(|path| path.join("models").join("multilingual-e5-small"))
+            .unwrap_or_else(|| args.data_dir.join("models").join("multilingual-e5-small"))
+    });
+    let embedder = Arc::new(EmbeddingEngine::new(model_dir));
     let state = Arc::new(AppState {
         runtime: tokio::runtime::Handle::current(),
         storage,

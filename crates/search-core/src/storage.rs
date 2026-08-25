@@ -373,7 +373,10 @@ impl Storage {
         let connection = self.connection.lock();
         query_count(
             &connection,
-            "SELECT COUNT(*) FROM documents WHERE embedding IS NULL",
+            &format!(
+                "SELECT COUNT(*) FROM documents WHERE embedding IS NULL OR length(embedding) != {}",
+                crate::embedding::EMBEDDING_DIMENSION * std::mem::size_of::<f32>()
+            ),
         )
     }
 

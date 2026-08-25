@@ -9,7 +9,7 @@ anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-fastembed = { git = "https://github.com/Anush008/fastembed-rs.git", tag = "v5.7.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries"] }
+fastembed = { git = "https://github.com/Anush008/fastembed-rs.git", tag = "v5.7.0", default-features = false, features = ["ort-load-dynamic"] }
 notify = "6.1.1"
 parking_lot = "0.12"
 pdf-extract = "0.9"

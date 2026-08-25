@@ -1,4 +1,4 @@
-use crate::embedding::EmbeddingEngine;
+use crate::embedding::{EmbeddingEngine, EMBEDDING_DIMENSION};
 use crate::extract::{extract_text, is_supported};
 use crate::model::{IndexFailure, PreparedDocument};
 use crate::storage::Storage;
@@ -88,7 +88,10 @@ where
                         .is_some_and(|existing| {
                             existing.modified_ms == modified_ms
                                 && existing.size == size
-                                && existing.embedding.is_some()
+                                && existing
+                                    .embedding
+                                    .as_ref()
+                                    .is_some_and(|embedding| embedding.len() == EMBEDDING_DIMENSION)
                         })
                     {
                         processed += 1;
@@ -155,7 +158,7 @@ where
     let configured_roots = storage.directories()?;
     let mut candidates = HashSet::new();
     // Watcher updates are frequent. Keep this lookup lightweight instead of
-    // loading every document's 512-dimensional embedding for each event batch.
+    // loading every document embedding for each event batch.
     let document_paths = storage.list_document_paths()?;
 
     for path in paths {
@@ -212,7 +215,10 @@ where
                 .is_some_and(|existing| {
                     existing.modified_ms == modified_ms
                         && existing.size == size
-                        && existing.embedding.is_some()
+                        && existing
+                            .embedding
+                            .as_ref()
+                            .is_some_and(|embedding| embedding.len() == EMBEDDING_DIMENSION)
                 })
             {
                 return Ok(None);
@@ -289,9 +295,17 @@ fn persist_batch(
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
 ) -> Result<()> {
-    let inputs = pending.iter().map(semantic_source).collect::<Vec<_>>();
-    let embeddings = embedder.embed_batch(&inputs);
-    for (mut document, embedding) in pending.drain(..).zip(embeddings) {
+    let mut inputs = Vec::new();
+    let mut ranges = Vec::with_capacity(pending.len());
+    for document in pending.iter() {
+        let start = inputs.len();
+        let chunks = semantic_chunks(document);
+        inputs.extend(chunks);
+        ranges.push(start..inputs.len());
+    }
+    let chunk_embeddings = embedder.embed_passages(&inputs);
+    for (mut document, range) in pending.drain(..).zip(ranges) {
+        let embedding = mean_embedding(&chunk_embeddings[range]);
         document.embedding = embedding;
         let chunks = storage.upsert_document(&document)?;
         text_index.replace_document(&document.id, &document.name, &chunks)?;
@@ -300,17 +314,32 @@ fn persist_batch(
     Ok(())
 }
 
-fn semantic_source(document: &PreparedDocument) -> String {
-    let mut source = format!("{}\n", document.name);
-    for chunk in &document.chunks {
-        let remaining = 4_000usize.saturating_sub(source.chars().count());
-        if remaining == 0 {
-            break;
-        }
-        source.extend(chunk.chars().take(remaining));
-        source.push('\n');
+fn semantic_chunks(document: &PreparedDocument) -> Vec<String> {
+    const MAX_CHUNKS_PER_DOCUMENT: usize = 64;
+    let mut chunks = document
+        .chunks
+        .iter()
+        .take(MAX_CHUNKS_PER_DOCUMENT)
+        .map(|chunk| format!("{}\n{}", document.name, chunk))
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        chunks.push(document.name.clone());
     }
-    source
+    chunks
+}
+
+fn mean_embedding(embeddings: &[Vec<f32>]) -> Vec<f32> {
+    let mut mean = vec![0.0; crate::embedding::EMBEDDING_DIMENSION];
+    for embedding in embeddings {
+        if embedding.len() != mean.len() {
+            continue;
+        }
+        for (target, value) in mean.iter_mut().zip(embedding) {
+            *target += value;
+        }
+    }
+    crate::embedding::normalize(&mut mean);
+    mean
 }
 
 fn metadata(path: &Path) -> Result<(u64, u64)> {
@@ -427,6 +456,22 @@ mod tests {
         let output = split_chunks(&"本".repeat(1700));
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].chars().count(), 800);
+    }
+
+    #[test]
+    fn semantic_chunks_include_document_name() {
+        let document = PreparedDocument {
+            id: "id".to_owned(),
+            root: "root".to_owned(),
+            name: "流程.docx".to_owned(),
+            extension: "docx".to_owned(),
+            path: "流程.docx".to_owned(),
+            modified_ms: 0,
+            size: 0,
+            chunks: vec!["第一段".to_owned()],
+            embedding: Vec::new(),
+        };
+        assert_eq!(semantic_chunks(&document), vec!["流程.docx\n第一段"]);
     }
 
     #[test]

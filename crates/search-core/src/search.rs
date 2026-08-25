@@ -64,11 +64,7 @@ pub fn search(
     }
 
     if request.mode != SearchMode::Keyword {
-        let query_embedding = embedder
-            .embed_batch(std::slice::from_ref(&request.query))
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let query_embedding = embedder.embed_query(&request.query);
         let mut semantic = documents
             .iter()
             .filter_map(|document| {
