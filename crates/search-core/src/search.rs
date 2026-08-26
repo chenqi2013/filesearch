@@ -23,7 +23,7 @@ pub fn search(
         .as_deref()
         .filter(|value| !value.is_empty());
     let stored_documents = if request.mode == SearchMode::Keyword {
-        // Keyword-only searches do not need roughly 98 MB of vectors at the
+        // Keyword-only searches do not need roughly 146 MB of vectors at the
         // 50,000-document target size.
         storage.list_documents_without_embeddings()?
     } else {

@@ -56,10 +56,10 @@ function prepareMsvcRuntime() {
 }
 
 function prepareEmbeddingModel() {
-  const source = resolve(root, "assets", "models", "multilingual-e5-small");
-  const destination = resolve(root, "target", release ? "release" : "debug", "models", "multilingual-e5-small");
-  const modelFile = resolve(destination, "onnx", "model.onnx");
-  if (!existsSync(modelFile) || fileSize(modelFile) !== fileSize(resolve(source, "onnx", "model.onnx"))) {
+  const source = resolve(root, "assets", "models", "embedding-rwkv-tiny");
+  const destination = resolve(root, "target", release ? "release" : "debug", "models", "embedding-rwkv-tiny");
+  const modelFile = resolve(destination, "model.onnx");
+  if (!existsSync(modelFile) || fileSize(modelFile) !== fileSize(resolve(source, "model.onnx"))) {
     cpSync(source, destination, { recursive: true, force: true });
   }
 }

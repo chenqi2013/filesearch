@@ -83,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(PathBuf::from))
-            .map(|path| path.join("models").join("multilingual-e5-small"))
-            .unwrap_or_else(|| args.data_dir.join("models").join("multilingual-e5-small"))
+            .map(|path| path.join("models").join("embedding-rwkv-tiny"))
+            .unwrap_or_else(|| args.data_dir.join("models").join("embedding-rwkv-tiny"))
     });
     let embedder = Arc::new(EmbeddingEngine::new(model_dir));
     let state = Arc::new(AppState {
@@ -104,7 +104,13 @@ async fn main() -> anyhow::Result<()> {
     restart_watcher(&state);
 
     let directories = state.storage.directories()?;
-    if (migrated || state.storage.missing_embedding_count()? > 0) && !directories.is_empty() {
+    let profile_changed = !state.storage.embedding_profile_matches()?;
+    if profile_changed && !directories.is_empty() {
+        state.storage.clear_embeddings()?;
+    }
+    if (migrated || profile_changed || state.storage.missing_embedding_count()? > 0)
+        && !directories.is_empty()
+    {
         launch_full_index(Arc::clone(&state), directories);
     }
 

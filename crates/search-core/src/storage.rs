@@ -380,6 +380,22 @@ impl Storage {
         )
     }
 
+    pub fn embedding_profile_matches(&self) -> Result<bool> {
+        Ok(self.setting("embedding_profile")?.as_deref()
+            == Some(crate::embedding::EMBEDDING_PROFILE))
+    }
+
+    pub fn clear_embeddings(&self) -> Result<()> {
+        self.connection
+            .lock()
+            .execute("UPDATE documents SET embedding = NULL", [])?;
+        Ok(())
+    }
+
+    pub fn set_embedding_profile(&self) -> Result<()> {
+        self.set_setting("embedding_profile", crate::embedding::EMBEDDING_PROFILE)
+    }
+
     fn setting(&self, key: &str) -> Result<Option<String>> {
         self.connection
             .lock()

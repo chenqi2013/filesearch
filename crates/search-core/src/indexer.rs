@@ -136,6 +136,7 @@ where
     if changed {
         text_index.commit()?;
     }
+    storage.set_embedding_profile()?;
     storage.set_last_indexed_now()?;
     progress(ProgressUpdate {
         processed: total,
@@ -295,17 +296,9 @@ fn persist_batch(
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
 ) -> Result<()> {
-    let mut inputs = Vec::new();
-    let mut ranges = Vec::with_capacity(pending.len());
-    for document in pending.iter() {
-        let start = inputs.len();
-        let chunks = semantic_chunks(document);
-        inputs.extend(chunks);
-        ranges.push(start..inputs.len());
-    }
-    let chunk_embeddings = embedder.embed_passages(&inputs);
-    for (mut document, range) in pending.drain(..).zip(ranges) {
-        let embedding = mean_embedding(&chunk_embeddings[range]);
+    let inputs = pending.iter().map(semantic_source).collect::<Vec<_>>();
+    let embeddings = embedder.embed_passages(&inputs);
+    for (mut document, embedding) in pending.drain(..).zip(embeddings) {
         document.embedding = embedding;
         let chunks = storage.upsert_document(&document)?;
         text_index.replace_document(&document.id, &document.name, &chunks)?;
@@ -314,32 +307,19 @@ fn persist_batch(
     Ok(())
 }
 
-fn semantic_chunks(document: &PreparedDocument) -> Vec<String> {
+fn semantic_source(document: &PreparedDocument) -> String {
+    const MAX_SEMANTIC_CHARS: usize = 4_000;
     const MAX_CHUNKS_PER_DOCUMENT: usize = 64;
-    let mut chunks = document
-        .chunks
-        .iter()
-        .take(MAX_CHUNKS_PER_DOCUMENT)
-        .map(|chunk| format!("{}\n{}", document.name, chunk))
-        .collect::<Vec<_>>();
-    if chunks.is_empty() {
-        chunks.push(document.name.clone());
-    }
-    chunks
-}
-
-fn mean_embedding(embeddings: &[Vec<f32>]) -> Vec<f32> {
-    let mut mean = vec![0.0; crate::embedding::EMBEDDING_DIMENSION];
-    for embedding in embeddings {
-        if embedding.len() != mean.len() {
-            continue;
+    let mut source = format!("{}\n", document.name);
+    for chunk in document.chunks.iter().take(MAX_CHUNKS_PER_DOCUMENT) {
+        let remaining = MAX_SEMANTIC_CHARS.saturating_sub(source.chars().count());
+        if remaining == 0 {
+            break;
         }
-        for (target, value) in mean.iter_mut().zip(embedding) {
-            *target += value;
-        }
+        source.extend(chunk.chars().take(remaining));
+        source.push('\n');
     }
-    crate::embedding::normalize(&mut mean);
-    mean
+    source
 }
 
 fn metadata(path: &Path) -> Result<(u64, u64)> {
@@ -459,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_chunks_include_document_name() {
+    fn semantic_source_includes_document_name() {
         let document = PreparedDocument {
             id: "id".to_owned(),
             root: "root".to_owned(),
@@ -471,7 +451,7 @@ mod tests {
             chunks: vec!["第一段".to_owned()],
             embedding: Vec::new(),
         };
-        assert_eq!(semantic_chunks(&document), vec!["流程.docx\n第一段"]);
+        assert_eq!(semantic_source(&document), "流程.docx\n第一段\n");
     }
 
     #[test]
