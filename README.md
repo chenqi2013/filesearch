@@ -65,6 +65,8 @@ pnpm desktop:build
 
 完全离线环境可在启动前设置 `FILESEARCH_EMBEDDING_OFFLINE=1`，直接使用离线特征。
 
+Windows 安装包同时包含 CPU 和 NVIDIA CUDA 版 ONNX Runtime。启动时会检测 NVIDIA 驱动和 GPU，满足条件时启用 CUDA Execution Provider；没有 NVIDIA GPU、驱动不兼容或 CUDA/cuDNN 运行库缺失时自动回退 CPU，不影响使用。当前 ONNX 模型中的 `Rwkv7` 自定义 WKV 算子仍为 CPU 实现，因此 CUDA 版本只加速其余 ONNX 节点，完整 WKV CUDA kernel 尚未接入。
+
 ## 大数据量设计
 
 - SQLite 使用 WAL、批量 4 条 Embedding 和事务写入，索引过程内存有界。

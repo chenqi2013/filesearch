@@ -32,6 +32,11 @@
     "externalBin": ["binaries/search-core"],
     "resources": {
       "binaries/onnxruntime.dll": "onnxruntime.dll",
+      "binaries/onnxruntime-cuda.dll": "onnxruntime-cuda.dll",
+      "binaries/onnxruntime_providers_cuda.dll": "onnxruntime_providers_cuda.dll",
+      "binaries/onnxruntime_providers_shared.dll": "onnxruntime_providers_shared.dll",
+      "binaries/cuda-runtime": "cuda-runtime",
+      "binaries/cudnn-runtime": "cudnn-runtime",
       "binaries/vcruntime140.dll": "vcruntime140.dll",
       "binaries/vcruntime140_1.dll": "vcruntime140_1.dll",
       "binaries/msvcp140.dll": "msvcp140.dll",

@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Cpu,
   ExternalLink,
   File,
   FileSearch,
@@ -45,6 +46,7 @@ const EMPTY_STATS: ServiceStats = {
   processed_files: 0,
   total_files: 0,
   directories: [],
+  embedding_backend: "cpu",
 };
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -168,6 +170,12 @@ function App() {
     : stats.current_file
       ? `${t.processingFile}: ${basename(stats.current_file)}`
       : t.writingIndex;
+  const backend = stats.embedding_backend ?? "cpu";
+  const backendLabel = backend === "cuda"
+    ? t.nvidiaCuda
+    : backend === "fallback"
+      ? t.offlineEmbedding
+      : t.cpu;
 
   return (
     <div className="app-shell">
@@ -208,6 +216,10 @@ function App() {
 
           <div className="index-summary">
             <div className="status-line"><span className={`status-dot ${connected ? stats.status : "offline"}`} />{!connected ? t.unavailable : stats.status === "indexing" ? operation : t.ready}</div>
+            <div className={`backend-status ${backend}`} title={stats.embedding_model ?? undefined}>
+              <Cpu aria-hidden="true" />
+              <span>{t.embeddingBackend}: <strong>{backendLabel}</strong></span>
+            </div>
             {stats.status === "indexing" && (
               <div className="progress-block">
                 <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>

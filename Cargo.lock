@@ -3743,6 +3743,7 @@ dependencies = [
  "chrono",
  "clap",
  "fastembed",
+ "libloading 0.8.9",
  "notify",
  "ort",
  "parking_lot",

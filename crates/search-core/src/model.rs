@@ -188,5 +188,6 @@ pub struct ServiceStats {
     pub last_indexed: Option<String>,
     pub storage_backend: String,
     pub embedding_model: String,
+    pub embedding_backend: String,
     pub watcher_status: String,
 }

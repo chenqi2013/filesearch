@@ -10,8 +10,9 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 fastembed = { git = "https://github.com/Anush008/fastembed-rs.git", tag = "v5.7.0", default-features = false, features = ["ort-load-dynamic"] }
+libloading = "0.8"
 notify = "6.1.1"
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda", "load-dynamic", "ndarray"] }
 parking_lot = "0.12"
 pdf-extract = "0.9"
 quick-xml = "0.37"

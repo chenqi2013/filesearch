@@ -150,6 +150,7 @@ async fn health(State(state): State<SharedState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "storage": "sqlite+tantivy",
         "embedding": state.embedder.status(),
+        "embedding_backend": state.embedder.backend(),
     }))
 }
 
@@ -176,6 +177,7 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
         last_indexed: state.storage.last_indexed().unwrap_or_default(),
         storage_backend: "SQLite WAL + Tantivy BM25".to_owned(),
         embedding_model: state.embedder.status(),
+        embedding_backend: state.embedder.backend(),
         watcher_status: state.watcher_status.read().clone(),
     })
 }

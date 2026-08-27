@@ -7,6 +7,12 @@ dist
 .vite
 src-tauri/binaries/search-core-*
 src-tauri/binaries/onnxruntime.dll
+src-tauri/binaries/onnxruntime-cuda.dll
+src-tauri/binaries/onnxruntime_providers_*.dll
+src-tauri/binaries/cublas*.dll
+src-tauri/binaries/cufft*.dll
+src-tauri/binaries/cudart*.dll
+src-tauri/binaries/cudnn*.dll
 *.local.json
 .DS_Store
 

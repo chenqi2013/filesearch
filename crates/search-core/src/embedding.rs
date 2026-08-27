@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ort::execution_providers::CUDAExecutionProvider;
 use ort::operator::{
     io::{OperatorInput, OperatorOutput},
     kernel::{Kernel, KernelAttributes, KernelContext},
@@ -191,6 +192,29 @@ fn rwkv7_forward_batch(
 struct RwkvModel {
     session: Session,
     tokenizer: RwkvTokenizer,
+    backend: RuntimeBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeBackend {
+    Cpu,
+    Cuda,
+}
+
+impl RuntimeBackend {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "NVIDIA CUDA（ONNX 节点，WKV CPU）",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -211,17 +235,19 @@ enum ModelState {
 
 pub struct EmbeddingEngine {
     model_dir: PathBuf,
+    preferred_backend: RuntimeBackend,
     state: Mutex<ModelState>,
     status: RwLock<String>,
 }
 
 impl EmbeddingEngine {
     pub fn new(model_dir: PathBuf) -> Self {
-        configure_onnx_runtime();
+        let preferred_backend = configure_onnx_runtime();
         let force_offline = std::env::var("FILESEARCH_EMBEDDING_OFFLINE")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"));
         Self {
             model_dir,
+            preferred_backend,
             state: Mutex::new(if force_offline {
                 ModelState::Fallback
             } else {
@@ -229,14 +255,25 @@ impl EmbeddingEngine {
             }),
             status: RwLock::new(if force_offline {
                 format!("{MODEL_NAME}（强制离线特征）")
+            } else if preferred_backend == RuntimeBackend::Cuda {
+                format!("{MODEL_NAME}（检测到 NVIDIA CUDA，待加载）")
             } else {
-                format!("{MODEL_NAME}（内置模型待加载）")
+                format!("{MODEL_NAME}（CPU，内置模型待加载）")
             }),
         }
     }
 
     pub fn status(&self) -> String {
         self.status.read().clone()
+    }
+
+    pub fn backend(&self) -> String {
+        let state = self.state.lock();
+        match &*state {
+            ModelState::Ready(model) => model.backend.code().to_owned(),
+            ModelState::Fallback => "fallback".to_owned(),
+            ModelState::Uninitialized => self.preferred_backend.code().to_owned(),
+        }
     }
 
     pub fn embed_query(&self, query: &str) -> Vec<f32> {
@@ -259,7 +296,8 @@ impl EmbeddingEngine {
             *self.status.write() = format!("{MODEL_NAME}（正在加载内置模型）");
             match self.load_model() {
                 Ok(model) => {
-                    *self.status.write() = format!("{MODEL_NAME}（内置 ONNX）");
+                    *self.status.write() =
+                        format!("{MODEL_NAME}（内置 ONNX，{}）", model.backend.label());
                     *state = ModelState::Ready(Box::new(model));
                 }
                 Err(error) => {
@@ -287,19 +325,54 @@ impl EmbeddingEngine {
         let model_path = self.model_dir.join("model.onnx");
         let vocab_path = self.model_dir.join("rwkv_vocab.bin");
         let tokenizer = RwkvTokenizer::load(&vocab_path)?;
+        if self.preferred_backend == RuntimeBackend::Cuda {
+            match self.build_session(&model_path, RuntimeBackend::Cuda) {
+                Ok(session) => {
+                    return Ok(RwkvModel {
+                        session,
+                        tokenizer,
+                        backend: RuntimeBackend::Cuda,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format_args!("{error:#}"),
+                        "NVIDIA CUDA embedding backend unavailable; falling back to CPU"
+                    );
+                }
+            }
+        }
+        let session = self.build_session(&model_path, RuntimeBackend::Cpu)?;
+        Ok(RwkvModel {
+            session,
+            tokenizer,
+            backend: RuntimeBackend::Cpu,
+        })
+    }
+
+    fn build_session(
+        &self,
+        model_path: &std::path::Path,
+        backend: RuntimeBackend,
+    ) -> Result<Session> {
         let operators = OperatorDomain::new("com.localfind")
             .context("无法创建 EmbeddingRWKV 自定义算子域")?
             .add(Rwkv7Operator)
             .context("无法注册 EmbeddingRWKV WKV 算子")?;
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .context("无法初始化 ONNX Runtime")?
             .with_operators(operators)
             .context("无法配置 EmbeddingRWKV WKV 算子")?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("无法配置 ONNX 图优化")?
-            .commit_from_file(&model_path)
-            .with_context(|| format!("无法加载 EmbeddingRWKV 模型 {}", model_path.display()))?;
-        Ok(RwkvModel { session, tokenizer })
+            .context("无法配置 ONNX 图优化")?;
+        if backend == RuntimeBackend::Cuda {
+            builder = builder
+                .with_execution_providers([CUDAExecutionProvider::default().build()])
+                .context("无法启用 NVIDIA CUDA Execution Provider")?;
+        }
+        builder
+            .commit_from_file(model_path)
+            .with_context(|| format!("无法加载 EmbeddingRWKV 模型 {}", model_path.display()))
     }
 }
 
@@ -442,20 +515,77 @@ pub fn fallback_embed(text: &str) -> Vec<f32> {
     vector
 }
 
-fn configure_onnx_runtime() {
+fn configure_onnx_runtime() -> RuntimeBackend {
     if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-        return;
+        return RuntimeBackend::Cpu;
     }
     let Some(executable_dir) = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))
     else {
-        return;
+        return RuntimeBackend::Cpu;
     };
-    let runtime_path = executable_dir.join("onnxruntime.dll");
+    let cuda_runtime_path = executable_dir.join("onnxruntime-cuda.dll");
+    let use_cuda = cuda_runtime_path.is_file() && nvidia_cuda_available();
+    let runtime_path = if use_cuda {
+        prepare_cuda_library_search_path(&executable_dir);
+        cuda_runtime_path
+    } else {
+        executable_dir.join("onnxruntime.dll")
+    };
     if runtime_path.is_file() {
         std::env::set_var("ORT_DYLIB_PATH", runtime_path);
     }
+    if use_cuda {
+        RuntimeBackend::Cuda
+    } else {
+        RuntimeBackend::Cpu
+    }
+}
+
+fn prepare_cuda_library_search_path(executable_dir: &std::path::Path) {
+    let mut paths = vec![
+        executable_dir.to_path_buf(),
+        executable_dir.join("cuda-runtime"),
+        executable_dir.join("cudnn-runtime"),
+    ];
+    if let Some(cuda_path) = std::env::var_os("CUDA_PATH") {
+        paths.push(PathBuf::from(cuda_path).join("bin"));
+    }
+    if let Some(cudnn_path) = std::env::var_os("CUDNN_PATH") {
+        paths.push(PathBuf::from(cudnn_path).join("bin"));
+    }
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let joined = std::env::join_paths(paths.into_iter().chain(std::env::split_paths(&existing)))
+        .unwrap_or(existing);
+    std::env::set_var("PATH", joined);
+}
+
+#[cfg(windows)]
+fn nvidia_cuda_available() -> bool {
+    type CuInit = unsafe extern "system" fn(u32) -> i32;
+    type CuDeviceGetCount = unsafe extern "system" fn(*mut i32) -> i32;
+    unsafe {
+        let Ok(library) = libloading::Library::new("nvcuda.dll") else {
+            return false;
+        };
+        let Ok(cu_init) = library.get::<CuInit>(b"cuInit\0") else {
+            return false;
+        };
+        let Ok(cu_device_get_count) = library.get::<CuDeviceGetCount>(b"cuDeviceGetCount\0") else {
+            return false;
+        };
+        if cu_init(0) != 0 {
+            return false;
+        }
+        let mut device_count = 0;
+        cu_device_get_count(&mut device_count) == 0 && device_count > 0
+    }
+}
+
+#[cfg(not(windows))]
+fn nvidia_cuda_available() -> bool {
+    false
 }
 
 pub fn lexical_terms(text: &str) -> Vec<String> {

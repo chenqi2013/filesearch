@@ -12,6 +12,7 @@ export interface ServiceStats {
   last_indexed?: string;
   storage_backend?: string;
   embedding_model?: string;
+  embedding_backend?: "cpu" | "cuda" | "fallback";
   watcher_status?: string;
 }
 

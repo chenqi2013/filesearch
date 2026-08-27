@@ -57,6 +57,11 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; flex: 0 0 auto; }
 .add-folder:hover { color: var(--accent-dark); border-color: var(--accent); background: rgba(255,255,255,.5); }
 .index-summary { margin-top: auto; padding: 14px 7px 4px; border-top: 1px solid #d7dbd5; }
 .status-line { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.backend-status { display: flex; align-items: center; gap: 7px; margin-top: 9px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+.backend-status svg { width: 14px; height: 14px; flex: 0 0 auto; color: #6e7671; }
+.backend-status strong { color: var(--ink); font-weight: 650; }
+.backend-status.cuda svg { color: #4b8f66; }
+.backend-status.fallback svg { color: #a56a2a; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(8,127,107,.12); }
 .status-dot.indexing { background: var(--amber); box-shadow: 0 0 0 3px rgba(181,107,18,.12); }
 .status-dot.offline { background: var(--danger); box-shadow: 0 0 0 3px rgba(180,72,60,.12); }

@@ -32,6 +32,72 @@ async function prepareOnnxRuntime() {
   mkdirSync(sidecarDir, { recursive: true });
   copyFileSync(runtimeDll, resolve(buildDir, "onnxruntime.dll"));
   copyFileSync(runtimeDll, resolve(sidecarDir, "onnxruntime.dll"));
+
+  const gpuPackageRoot = resolve(root, ".codex-tmp", "onnxruntime-gpu-windows-1.22.0");
+  const gpuArchive = resolve(root, ".codex-tmp", "onnxruntime-gpu-windows-1.22.0.nupkg");
+  const gpuNativeRoot = resolve(gpuPackageRoot, "runtimes", "win-x64", "native");
+  if (!existsSync(resolve(gpuNativeRoot, "onnxruntime.dll"))) {
+    mkdirSync(dirname(gpuArchive), { recursive: true });
+    if (!existsSync(gpuArchive)) {
+      const response = await fetch("https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.gpu.windows/1.22.0/microsoft.ml.onnxruntime.gpu.windows.1.22.0.nupkg");
+      if (!response.ok) throw new Error(`Unable to download ONNX Runtime CUDA package: ${response.status}`);
+      writeFileSync(gpuArchive, Buffer.from(await response.arrayBuffer()));
+    }
+    execFileSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `Expand-Archive -LiteralPath '${gpuArchive}' -DestinationPath '${gpuPackageRoot}' -Force`,
+    ], verbose);
+  }
+  const gpuFiles = [
+    ["onnxruntime.dll", "onnxruntime-cuda.dll"],
+    ["onnxruntime_providers_cuda.dll", "onnxruntime_providers_cuda.dll"],
+    ["onnxruntime_providers_shared.dll", "onnxruntime_providers_shared.dll"],
+  ];
+  for (const [sourceName, destinationName] of gpuFiles) {
+    const source = resolve(gpuNativeRoot, sourceName);
+    copyFileSync(source, resolve(buildDir, destinationName));
+    copyFileSync(source, resolve(sidecarDir, destinationName));
+  }
+}
+
+function prepareOptionalCudaLibraries() {
+  if (process.platform !== "win32") return;
+  const buildDir = resolve(root, "target", release ? "release" : "debug");
+  const sidecarDir = resolve(root, "src-tauri", "binaries");
+  const cudaRuntimeDir = resolve(sidecarDir, "cuda-runtime");
+  const cudnnRuntimeDir = resolve(sidecarDir, "cudnn-runtime");
+  mkdirSync(resolve(buildDir, "cuda-runtime"), { recursive: true });
+  mkdirSync(resolve(buildDir, "cudnn-runtime"), { recursive: true });
+  mkdirSync(cudaRuntimeDir, { recursive: true });
+  mkdirSync(cudnnRuntimeDir, { recursive: true });
+  const names = [
+    "cublasLt64_12.dll",
+    "cublas64_12.dll",
+    "cufft64_11.dll",
+    "cudart64_12.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_ops64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn64_9.dll",
+  ];
+  const roots = [];
+  if (process.env.CUDA_PATH) roots.push(resolve(process.env.CUDA_PATH, "bin"));
+  if (process.env.CUDNN_PATH) roots.push(resolve(process.env.CUDNN_PATH, "bin"));
+  for (const name of names) {
+    const source = roots.map((directory) => resolve(directory, name)).find(existsSync);
+    if (!source) continue;
+    const destinationDir = name.startsWith("cudnn") ? cudnnRuntimeDir : cudaRuntimeDir;
+    const buildDestinationDir = name.startsWith("cudnn")
+      ? resolve(buildDir, "cudnn-runtime")
+      : resolve(buildDir, "cuda-runtime");
+    copyFileSync(source, resolve(buildDestinationDir, name));
+    copyFileSync(source, resolve(destinationDir, name));
+  }
 }
 
 function prepareMsvcRuntime() {
@@ -69,6 +135,7 @@ function fileSize(path) {
 }
 
 await prepareOnnxRuntime();
+prepareOptionalCudaLibraries();
 prepareMsvcRuntime();
 prepareEmbeddingModel();
 execFileSync("cargo", ["build", "-p", "search-core", ...(release ? ["--release"] : [])], verbose);
