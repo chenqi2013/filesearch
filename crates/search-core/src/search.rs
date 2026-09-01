@@ -1,9 +1,9 @@
-use crate::embedding::{lexical_terms, EmbeddingEngine};
+use crate::embedding::EmbeddingEngine;
 use crate::model::{SearchMode, SearchRequest, SearchResult, StoredDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Default)]
 struct Candidate {
@@ -11,6 +11,8 @@ struct Candidate {
     semantic: f32,
     snippet: Option<String>,
 }
+
+const SEMANTIC_SNIPPET_SCAN_LIMIT: usize = 1;
 
 pub fn search(
     storage: &Storage,
@@ -32,22 +34,26 @@ pub fn search(
         .map(|document| (document.id.as_str(), document))
         .collect::<HashMap<_, _>>();
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
+    let mut keyword_snippets = HashMap::new();
     let candidate_limit = (request.limit.clamp(1, 100) * 20).clamp(200, 1_000);
 
-    if request.mode != SearchMode::Semantic {
-        let hits = text_index.search(&request.query, candidate_limit)?;
-        let max_score = hits
-            .first()
-            .map(|hit| hit.score)
-            .unwrap_or(1.0)
-            .max(f32::EPSILON);
-        for hit in hits {
-            let Some(chunk) = storage.chunk(hit.chunk_id)? else {
-                continue;
-            };
-            if !by_id.contains_key(chunk.document_id.as_str()) {
-                continue;
-            }
+    let hits = text_index.search(&request.query, candidate_limit)?;
+    let max_score = hits
+        .first()
+        .map(|hit| hit.score)
+        .unwrap_or(1.0)
+        .max(f32::EPSILON);
+    for hit in hits {
+        let Some(chunk) = storage.chunk(hit.chunk_id)? else {
+            continue;
+        };
+        if !by_id.contains_key(chunk.document_id.as_str()) {
+            continue;
+        }
+        keyword_snippets
+            .entry(chunk.document_id.clone())
+            .or_insert_with(|| chunk.text.clone());
+        if request.mode != SearchMode::Semantic {
             let normalized = (hit.score / max_score).clamp(0.0, 1.0);
             let candidate = candidates.entry(chunk.document_id).or_default();
             if normalized > candidate.keyword {
@@ -94,9 +100,9 @@ pub fn search(
     let mut results = Vec::with_capacity(ranked.len());
     for (document_id, score, matched_text) in ranked {
         let document = by_id[document_id.as_str()];
-        let text = match matched_text {
+        let text = match matched_text.or_else(|| keyword_snippets.get(&document_id).cloned()) {
             Some(text) => text,
-            None => best_semantic_snippet(storage, document, &request.query)?,
+            None => best_semantic_snippet(storage, document)?,
         };
         results.push(SearchResult {
             id: document.id.clone(),
@@ -112,23 +118,9 @@ pub fn search(
     Ok(results)
 }
 
-fn best_semantic_snippet(
-    storage: &Storage,
-    document: &StoredDocument,
-    query: &str,
-) -> Result<String> {
-    let query_terms = lexical_terms(query).into_iter().collect::<HashSet<_>>();
-    let mut chunks = storage.chunks_for_document(&document.id)?;
-    chunks.sort_by_key(|chunk| {
-        let terms = lexical_terms(&chunk.text);
-        std::cmp::Reverse(
-            terms
-                .iter()
-                .filter(|term| query_terms.contains(*term))
-                .count(),
-        )
-    });
-    Ok(chunks
+fn best_semantic_snippet(storage: &Storage, document: &StoredDocument) -> Result<String> {
+    Ok(storage
+        .chunks_for_document_limited(&document.id, SEMANTIC_SNIPPET_SCAN_LIMIT)?
         .into_iter()
         .next()
         .map(|chunk| chunk.text)

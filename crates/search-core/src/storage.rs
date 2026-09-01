@@ -359,6 +359,22 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    pub fn chunks_for_document_limited(
+        &self,
+        document_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredChunk>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, document_id, text FROM chunks
+             WHERE document_id = ? ORDER BY position LIMIT ?",
+        )?;
+        let rows =
+            statement.query_map(params![document_id, limit.max(1) as i64], chunk_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn chunk_page(&self, offset: usize, limit: usize) -> Result<Vec<IndexedChunk>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
