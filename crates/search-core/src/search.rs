@@ -1,4 +1,4 @@
-use crate::embedding::{cosine, lexical_terms, EmbeddingEngine};
+use crate::embedding::{lexical_terms, EmbeddingEngine};
 use crate::model::{SearchMode, SearchRequest, SearchResult, StoredDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
@@ -22,13 +22,7 @@ pub fn search(
         .extension
         .as_deref()
         .filter(|value| !value.is_empty());
-    let stored_documents = if request.mode == SearchMode::Keyword {
-        // Keyword-only searches do not need roughly 146 MB of vectors at the
-        // 50,000-document target size.
-        storage.list_documents_without_embeddings()?
-    } else {
-        storage.list_documents()?
-    };
+    let stored_documents = storage.list_documents_without_embeddings()?;
     let documents = stored_documents
         .into_iter()
         .filter(|document| extension.is_none_or(|value| value == document.extension))
@@ -65,16 +59,7 @@ pub fn search(
 
     if request.mode != SearchMode::Keyword {
         let query_embedding = embedder.embed_query(&request.query);
-        let mut semantic = documents
-            .iter()
-            .filter_map(|document| {
-                let embedding = document.embedding.as_deref()?;
-                let score = cosine(&query_embedding, embedding).max(0.0);
-                (score > 0.05).then(|| (document.id.clone(), score))
-            })
-            .collect::<Vec<_>>();
-        semantic.sort_by(|left, right| right.1.total_cmp(&left.1));
-        semantic.truncate(candidate_limit);
+        let semantic = storage.semantic_search(&query_embedding, extension, candidate_limit);
         for (document_id, score) in semantic {
             candidates.entry(document_id).or_default().semantic = score;
         }

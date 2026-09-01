@@ -52,10 +52,53 @@ struct AppState {
     processed: AtomicUsize,
     total: AtomicUsize,
     current_file: Mutex<Option<String>>,
+    index_timing: Mutex<IndexTimingState>,
     pending_changes: Mutex<HashSet<PathBuf>>,
     watcher_refresh_pending: AtomicBool,
     watcher: Mutex<Option<WatchService>>,
     watcher_status: RwLock<String>,
+}
+
+struct IndexTimingState {
+    stage: String,
+    index_started_at: Option<Instant>,
+    stage_started_at: Option<Instant>,
+    total_elapsed_ms: u128,
+    scan_ms: u128,
+    check_ms: u128,
+    parse_ms: u128,
+    embedding_ms: u128,
+    storage_ms: u128,
+    text_index_ms: u128,
+}
+
+impl Default for IndexTimingState {
+    fn default() -> Self {
+        Self {
+            stage: "ready".to_owned(),
+            index_started_at: None,
+            stage_started_at: None,
+            total_elapsed_ms: 0,
+            scan_ms: 0,
+            check_ms: 0,
+            parse_ms: 0,
+            embedding_ms: 0,
+            storage_ms: 0,
+            text_index_ms: 0,
+        }
+    }
+}
+
+struct IndexTimingSnapshot {
+    stage: String,
+    stage_elapsed_ms: u128,
+    total_elapsed_ms: u128,
+    scan_ms: u128,
+    check_ms: u128,
+    parse_ms: u128,
+    embedding_ms: u128,
+    storage_ms: u128,
+    text_index_ms: u128,
 }
 
 type SharedState = Arc<AppState>;
@@ -96,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         processed: AtomicUsize::new(0),
         total: AtomicUsize::new(0),
         current_file: Mutex::new(None),
+        index_timing: Mutex::new(IndexTimingState::default()),
         pending_changes: Mutex::new(HashSet::new()),
         watcher_refresh_pending: AtomicBool::new(false),
         watcher: Mutex::new(None),
@@ -160,19 +204,25 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
         chunks: 0,
         failures: 0,
     });
+    let indexing = state.indexing.load(Ordering::Relaxed);
+    let timing = index_timing_snapshot(&state, indexing);
     Json(ServiceStats {
-        status: if state.indexing.load(Ordering::Relaxed) {
-            "indexing"
-        } else {
-            "ready"
-        }
-        .to_owned(),
+        status: if indexing { "indexing" } else { "ready" }.to_owned(),
         document_count: counts.documents,
         chunk_count: counts.chunks,
         failed_count: counts.failures,
         processed_files: state.processed.load(Ordering::Relaxed),
         total_files: state.total.load(Ordering::Relaxed),
         current_file: state.current_file.lock().clone(),
+        index_stage: timing.stage,
+        index_stage_elapsed_ms: timing.stage_elapsed_ms,
+        index_total_elapsed_ms: timing.total_elapsed_ms,
+        index_scan_ms: timing.scan_ms,
+        index_check_ms: timing.check_ms,
+        index_parse_ms: timing.parse_ms,
+        index_embedding_ms: timing.embedding_ms,
+        index_storage_ms: timing.storage_ms,
+        index_text_index_ms: timing.text_index_ms,
         directories: state.storage.directories().unwrap_or_default(),
         last_indexed: state.storage.last_indexed().unwrap_or_default(),
         storage_backend: "SQLite WAL + Tantivy BM25".to_owned(),
@@ -300,6 +350,7 @@ fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
     }
     state.processed.store(0, Ordering::Relaxed);
     state.total.store(0, Ordering::Relaxed);
+    reset_index_timing(&state);
     let runtime = state.runtime.clone();
     runtime.spawn_blocking(move || {
         let result = indexer::build_index(
@@ -336,6 +387,7 @@ fn launch_pending_incremental(state: SharedState) {
     {
         return;
     }
+    reset_index_timing(&state);
     let runtime = state.runtime.clone();
     runtime.spawn_blocking(move || {
         loop {
@@ -358,6 +410,7 @@ fn launch_pending_incremental(state: SharedState) {
 }
 
 fn finish_index_task(state: &SharedState, refresh_watcher: bool) {
+    finish_index_timing(state);
     *state.current_file.lock() = None;
     state.indexing.store(false, Ordering::SeqCst);
     if refresh_watcher || state.watcher_refresh_pending.swap(false, Ordering::SeqCst) {
@@ -372,6 +425,67 @@ fn update_progress(state: &AppState, update: indexer::ProgressUpdate<'_>) {
     state.processed.store(update.processed, Ordering::Relaxed);
     state.total.store(update.total, Ordering::Relaxed);
     *state.current_file.lock() = update.current_file.map(ToOwned::to_owned);
+    let mut timing = state.index_timing.lock();
+    if timing.stage != update.stage {
+        timing.stage = update.stage.to_owned();
+        timing.stage_started_at = Some(Instant::now());
+    }
+    timing.scan_ms = update.scan_ms;
+    timing.check_ms = update.check_ms;
+    timing.parse_ms = update.parse_ms;
+    timing.embedding_ms = update.embedding_ms;
+    timing.storage_ms = update.storage_ms;
+    timing.text_index_ms = update.text_index_ms;
+}
+
+fn reset_index_timing(state: &AppState) {
+    let now = Instant::now();
+    *state.index_timing.lock() = IndexTimingState {
+        stage: "starting".to_owned(),
+        index_started_at: Some(now),
+        stage_started_at: Some(now),
+        ..IndexTimingState::default()
+    };
+}
+
+fn finish_index_timing(state: &AppState) {
+    let mut timing = state.index_timing.lock();
+    timing.total_elapsed_ms = timing
+        .index_started_at
+        .map(|started| started.elapsed().as_millis())
+        .unwrap_or(timing.total_elapsed_ms);
+    timing.stage = "ready".to_owned();
+    timing.index_started_at = None;
+    timing.stage_started_at = None;
+}
+
+fn index_timing_snapshot(state: &AppState, indexing: bool) -> IndexTimingSnapshot {
+    let timing = state.index_timing.lock();
+    IndexTimingSnapshot {
+        stage: timing.stage.clone(),
+        stage_elapsed_ms: if indexing {
+            timing
+                .stage_started_at
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or(0)
+        } else {
+            0
+        },
+        total_elapsed_ms: if indexing {
+            timing
+                .index_started_at
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or(timing.total_elapsed_ms)
+        } else {
+            timing.total_elapsed_ms
+        },
+        scan_ms: timing.scan_ms,
+        check_ms: timing.check_ms,
+        parse_ms: timing.parse_ms,
+        embedding_ms: timing.embedding_ms,
+        storage_ms: timing.storage_ms,
+        text_index_ms: timing.text_index_ms,
+    }
 }
 
 fn restart_watcher(state: &SharedState) {

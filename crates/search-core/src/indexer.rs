@@ -4,19 +4,56 @@ use crate::model::{IndexFailure, PreparedDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
 const EMBEDDING_BATCH_SIZE: usize = 32;
+const PARSE_BATCH_SIZE: usize = 16;
+const CHUNK_TARGET: usize = 800;
+const CHUNK_OVERLAP: usize = 100;
+
+#[derive(Default)]
+struct IndexTimings {
+    scan: Duration,
+    check: Duration,
+    parse: Duration,
+    embedding: Duration,
+    storage: Duration,
+    text_index: Duration,
+}
+
+struct ParseJob {
+    path: PathBuf,
+    root: String,
+    modified_ms: u64,
+    size: u64,
+}
+
+#[derive(Default)]
+struct PersistTimings {
+    embedding: Duration,
+    storage: Duration,
+    text_index: Duration,
+}
 
 pub struct ProgressUpdate<'a> {
     pub processed: usize,
     pub total: usize,
     pub current_file: Option<&'a str>,
+    pub stage: &'static str,
+    pub scan_ms: u128,
+    pub check_ms: u128,
+    pub parse_ms: u128,
+    pub embedding_ms: u128,
+    pub storage_ms: u128,
+    pub text_index_ms: u128,
 }
 
 struct ScannedRoot {
@@ -35,11 +72,13 @@ pub fn build_index<F>(
 where
     F: FnMut(ProgressUpdate<'_>),
 {
+    let started = Instant::now();
+    let mut timings = IndexTimings::default();
     let roots = normalize_roots(paths);
     storage.set_directories(&roots)?;
     storage.clear_failures()?;
 
-    let previous = storage.list_documents()?;
+    let previous = storage.list_documents_without_embeddings()?;
     let previous_by_path = previous
         .iter()
         .map(|document| (document.path.as_str(), document))
@@ -56,31 +95,36 @@ where
         changed = true;
     }
 
+    let scan_started = Instant::now();
+    report_progress(&mut progress, 0, 0, None, "scanning", &timings);
     let mut scans = Vec::with_capacity(roots.len());
     for root in &roots {
         scans.push(scan_root(root, storage));
     }
+    let scan_elapsed = scan_started.elapsed();
+    timings.scan = scan_elapsed;
     let total = scans.iter().map(|scan| scan.files.len()).sum::<usize>();
-    progress(ProgressUpdate {
-        processed: 0,
-        total,
-        current_file: None,
-    });
+    report_progress(&mut progress, 0, total, None, "checking", &timings);
 
     let mut processed = 0usize;
     let mut pending = Vec::with_capacity(EMBEDDING_BATCH_SIZE);
+    let mut parse_jobs = Vec::with_capacity(PARSE_BATCH_SIZE);
     let mut seen_by_root: HashMap<String, HashSet<String>> = HashMap::new();
 
     for scan in &scans {
         let seen = seen_by_root.entry(scan.path.clone()).or_default();
         for path in &scan.files {
             let path_string = path.to_string_lossy().into_owned();
-            progress(ProgressUpdate {
+            report_progress(
+                &mut progress,
                 processed,
                 total,
-                current_file: Some(&path_string),
-            });
+                Some(&path_string),
+                "checking",
+                &timings,
+            );
             seen.insert(path_string.clone());
+            let check_started = Instant::now();
             match metadata(path) {
                 Ok((modified_ms, size)) => {
                     if previous_by_path
@@ -88,33 +132,71 @@ where
                         .is_some_and(|existing| {
                             existing.modified_ms == modified_ms
                                 && existing.size == size
-                                && existing
-                                    .embedding
-                                    .as_ref()
-                                    .is_some_and(|embedding| embedding.len() == EMBEDDING_DIMENSION)
+                                && storage.has_embedding(&existing.id)
                         })
                     {
                         processed += 1;
+                        timings.check += check_started.elapsed();
                         continue;
                     }
-                    match prepare_document(path, &scan.path, modified_ms, size) {
-                        Ok(document) => pending.push(document),
-                        Err(error) => {
-                            storage.record_failure(&failure_for(path, &error))?;
-                        }
-                    }
+                    parse_jobs.push(ParseJob {
+                        path: path.clone(),
+                        root: scan.path.clone(),
+                        modified_ms,
+                        size,
+                    });
                 }
-                Err(error) => storage.record_failure(&failure_for(path, &error))?,
+                Err(error) => {
+                    storage.record_failure(&failure_for(path, &error))?;
+                    processed += 1;
+                }
             }
-            processed += 1;
-            if pending.len() >= EMBEDDING_BATCH_SIZE {
-                persist_batch(&mut pending, storage, text_index, embedder)?;
-                changed = true;
+            timings.check += check_started.elapsed();
+            if parse_jobs.len() >= PARSE_BATCH_SIZE {
+                let (completed, prepared) = flush_parse_jobs(
+                    &mut parse_jobs,
+                    &mut pending,
+                    storage,
+                    text_index,
+                    embedder,
+                    &mut timings,
+                    &mut progress,
+                    processed,
+                    total,
+                )?;
+                processed += completed;
+                changed |= prepared;
+                report_progress(&mut progress, processed, total, None, "checking", &timings);
             }
         }
     }
+    if !parse_jobs.is_empty() {
+        let (completed, prepared) = flush_parse_jobs(
+            &mut parse_jobs,
+            &mut pending,
+            storage,
+            text_index,
+            embedder,
+            &mut timings,
+            &mut progress,
+            processed,
+            total,
+        )?;
+        processed += completed;
+        changed |= prepared;
+    }
     if !pending.is_empty() {
-        persist_batch(&mut pending, storage, text_index, embedder)?;
+        let persisted = persist_batch(
+            &mut pending,
+            storage,
+            text_index,
+            embedder,
+            &mut progress,
+            processed,
+            total,
+            &timings,
+        )?;
+        add_persist_timings(&mut timings, persisted);
         changed = true;
     }
 
@@ -134,15 +216,32 @@ where
     }
 
     if changed {
+        report_progress(
+            &mut progress,
+            processed,
+            total,
+            None,
+            "committing",
+            &timings,
+        );
+        let commit_started = Instant::now();
         text_index.commit()?;
+        timings.text_index += commit_started.elapsed();
     }
     storage.set_embedding_profile()?;
     storage.set_last_indexed_now()?;
-    progress(ProgressUpdate {
-        processed: total,
-        total,
-        current_file: None,
-    });
+    report_progress(&mut progress, total, total, None, "ready", &timings);
+    tracing::info!(
+        files = total,
+        processed,
+        scan_ms = scan_elapsed.as_millis(),
+        parse_ms = timings.parse.as_millis(),
+        embedding_ms = timings.embedding.as_millis(),
+        storage_ms = timings.storage.as_millis(),
+        text_index_ms = timings.text_index.as_millis(),
+        total_ms = started.elapsed().as_millis(),
+        "completed full index"
+    );
     Ok(())
 }
 
@@ -156,6 +255,8 @@ pub fn update_paths<F>(
 where
     F: FnMut(ProgressUpdate<'_>),
 {
+    let started = Instant::now();
+    let mut timings = IndexTimings::default();
     let configured_roots = storage.directories()?;
     let mut candidates = HashSet::new();
     // Watcher updates are frequent. Keep this lookup lightweight instead of
@@ -191,25 +292,30 @@ where
     }
 
     let files = candidates.into_iter().collect::<Vec<_>>();
-    progress(ProgressUpdate {
-        processed: 0,
-        total: files.len(),
-        current_file: None,
-    });
+    report_progress(&mut progress, 0, files.len(), None, "checking", &timings);
     let mut pending = Vec::with_capacity(EMBEDDING_BATCH_SIZE);
+    let mut parse_jobs = Vec::with_capacity(PARSE_BATCH_SIZE);
+    let mut processed = 0usize;
     for (index, path) in files.iter().enumerate() {
         let path_string = path.to_string_lossy().into_owned();
-        progress(ProgressUpdate {
-            processed: index,
-            total: files.len(),
-            current_file: Some(&path_string),
-        });
+        report_progress(
+            &mut progress,
+            index,
+            files.len(),
+            Some(&path_string),
+            "checking",
+            &timings,
+        );
         let root = configured_roots
             .iter()
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.len())
             .cloned();
-        let Some(root) = root else { continue };
+        let Some(root) = root else {
+            processed += 1;
+            continue;
+        };
+        let check_started = Instant::now();
         match metadata(path).and_then(|(modified_ms, size)| {
             if storage
                 .document_by_path(&path_string)?
@@ -224,23 +330,93 @@ where
             {
                 return Ok(None);
             }
-            prepare_document(path, &root, modified_ms, size).map(Some)
+            Ok(Some(ParseJob {
+                path: path.clone(),
+                root,
+                modified_ms,
+                size,
+            }))
         }) {
-            Ok(Some(document)) => pending.push(document),
-            Ok(None) => {}
-            Err(error) => storage.record_failure(&failure_for(path, &error))?,
+            Ok(Some(job)) => parse_jobs.push(job),
+            Ok(None) => processed += 1,
+            Err(error) => {
+                storage.record_failure(&failure_for(path, &error))?;
+                processed += 1;
+            }
+        }
+        timings.check += check_started.elapsed();
+        if parse_jobs.len() >= PARSE_BATCH_SIZE {
+            let (completed, _) = flush_parse_jobs(
+                &mut parse_jobs,
+                &mut pending,
+                storage,
+                text_index,
+                embedder,
+                &mut timings,
+                &mut progress,
+                processed,
+                files.len(),
+            )?;
+            processed += completed;
         }
     }
-    if !pending.is_empty() {
-        persist_batch(&mut pending, storage, text_index, embedder)?;
+    if !parse_jobs.is_empty() {
+        let (completed, _) = flush_parse_jobs(
+            &mut parse_jobs,
+            &mut pending,
+            storage,
+            text_index,
+            embedder,
+            &mut timings,
+            &mut progress,
+            processed,
+            files.len(),
+        )?;
+        processed += completed;
     }
+    if !pending.is_empty() {
+        let persisted = persist_batch(
+            &mut pending,
+            storage,
+            text_index,
+            embedder,
+            &mut progress,
+            processed,
+            files.len(),
+            &timings,
+        )?;
+        add_persist_timings(&mut timings, persisted);
+    }
+    report_progress(
+        &mut progress,
+        processed,
+        files.len(),
+        None,
+        "committing",
+        &timings,
+    );
+    let commit_started = Instant::now();
     text_index.commit()?;
+    timings.text_index += commit_started.elapsed();
     storage.set_last_indexed_now()?;
-    progress(ProgressUpdate {
-        processed: files.len(),
-        total: files.len(),
-        current_file: None,
-    });
+    report_progress(
+        &mut progress,
+        files.len(),
+        files.len(),
+        None,
+        "ready",
+        &timings,
+    );
+    tracing::info!(
+        files = files.len(),
+        processed,
+        parse_ms = timings.parse.as_millis(),
+        embedding_ms = timings.embedding.as_millis(),
+        storage_ms = timings.storage.as_millis(),
+        text_index_ms = timings.text_index.as_millis(),
+        total_ms = started.elapsed().as_millis(),
+        "completed incremental index"
+    );
     Ok(())
 }
 
@@ -295,31 +471,258 @@ fn persist_batch(
     storage: &Storage,
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
-) -> Result<()> {
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    processed: usize,
+    total: usize,
+    accumulated: &IndexTimings,
+) -> Result<PersistTimings> {
+    let mut timings = PersistTimings::default();
     let inputs = pending.iter().map(semantic_source).collect::<Vec<_>>();
+    let embedding_file = pending
+        .iter()
+        .zip(&inputs)
+        .max_by_key(|(_, input)| input.chars().count())
+        .map(|(document, _)| document.path.as_str());
+    report_progress(
+        progress,
+        processed,
+        total,
+        embedding_file,
+        "embedding",
+        accumulated,
+    );
+    let started = Instant::now();
     let embeddings = embedder.embed_passages(&inputs);
-    for (mut document, embedding) in pending.drain(..).zip(embeddings) {
-        document.embedding = embedding;
-        let chunks = storage.upsert_document(&document)?;
-        text_index.replace_document(&document.id, &document.name, &chunks)?;
-        storage.remove_failure(&document.path)?;
-    }
-    Ok(())
+    timings.embedding = started.elapsed();
+    let documents = pending
+        .drain(..)
+        .zip(embeddings)
+        .map(|(mut document, embedding)| {
+            document.embedding = embedding;
+            document
+        })
+        .collect::<Vec<_>>();
+    let embedding_total = accumulated.embedding + timings.embedding;
+    report_progress_with(
+        progress,
+        processed,
+        total,
+        None,
+        "storage",
+        accumulated.scan,
+        accumulated.check,
+        accumulated.parse,
+        embedding_total,
+        accumulated.storage,
+        accumulated.text_index,
+    );
+    let started = Instant::now();
+    let chunks = storage.upsert_documents(&documents)?;
+    timings.storage = started.elapsed();
+    let updates = documents
+        .iter()
+        .zip(&chunks)
+        .map(|(document, chunks)| {
+            (
+                document.id.as_str(),
+                document.name.as_str(),
+                chunks.as_slice(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let storage_total = accumulated.storage + timings.storage;
+    report_progress_with(
+        progress,
+        processed,
+        total,
+        None,
+        "text_index",
+        accumulated.scan,
+        accumulated.check,
+        accumulated.parse,
+        embedding_total,
+        storage_total,
+        accumulated.text_index,
+    );
+    let started = Instant::now();
+    text_index.replace_documents(&updates)?;
+    timings.text_index = started.elapsed();
+    Ok(timings)
 }
 
 fn semantic_source(document: &PreparedDocument) -> String {
-    const MAX_SEMANTIC_CHARS: usize = 4_000;
-    const MAX_CHUNKS_PER_DOCUMENT: usize = 64;
+    const MAX_SEMANTIC_CHARS: usize = 2_000;
+    const PREFIX_CHARS: usize = 800;
+    const SAMPLE_COUNT: usize = 4;
     let mut source = format!("{}\n", document.name);
-    for chunk in document.chunks.iter().take(MAX_CHUNKS_PER_DOCUMENT) {
-        let remaining = MAX_SEMANTIC_CHARS.saturating_sub(source.chars().count());
+    let body = document_text_chars(&document.chunks);
+    let body_budget = MAX_SEMANTIC_CHARS.saturating_sub(source.chars().count());
+    if body.len() <= body_budget {
+        source.extend(body);
+        source.push('\n');
+        return source;
+    }
+
+    let separator_budget = SAMPLE_COUNT + 1;
+    let content_budget = body_budget.saturating_sub(separator_budget);
+    let prefix_length = PREFIX_CHARS.min(content_budget).min(body.len());
+    source.extend(&body[..prefix_length]);
+    let mut remaining = content_budget.saturating_sub(prefix_length);
+    let sample_length = remaining.div_ceil(SAMPLE_COUNT).min(300);
+    let span = body.len().saturating_sub(prefix_length + sample_length);
+    for sample_index in 0..SAMPLE_COUNT {
         if remaining == 0 {
             break;
         }
-        source.extend(chunk.chars().take(remaining));
+        let length = sample_length.min(remaining);
+        let start = prefix_length + span.saturating_mul(sample_index + 1) / SAMPLE_COUNT;
+        let end = (start + length).min(body.len());
         source.push('\n');
+        source.extend(&body[start..end]);
+        remaining = remaining.saturating_sub(end - start);
     }
+    source.push('\n');
     source
+}
+
+fn document_text_chars(chunks: &[String]) -> Vec<char> {
+    let mut output = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let chars = chunk.chars().collect::<Vec<_>>();
+        let skip = if index == 0 {
+            0
+        } else {
+            CHUNK_OVERLAP.min(chars.len())
+        };
+        output.extend_from_slice(&chars[skip..]);
+    }
+    output
+}
+
+fn flush_parse_jobs(
+    jobs: &mut Vec<ParseJob>,
+    pending: &mut Vec<PreparedDocument>,
+    storage: &Storage,
+    text_index: &TextIndex,
+    embedder: &EmbeddingEngine,
+    timings: &mut IndexTimings,
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    processed: usize,
+    total: usize,
+) -> Result<(usize, bool)> {
+    let jobs = std::mem::take(jobs);
+    let completed = jobs.len();
+    let current_file = jobs
+        .first()
+        .map(|job| job.path.to_string_lossy().into_owned());
+    report_progress(
+        progress,
+        processed,
+        total,
+        current_file.as_deref(),
+        "parsing",
+        timings,
+    );
+    let started = Instant::now();
+    let results = parse_pool().install(|| {
+        jobs.into_par_iter()
+            .map(|job| {
+                let result = prepare_document(&job.path, &job.root, job.modified_ms, job.size);
+                (job.path, result)
+            })
+            .collect::<Vec<_>>()
+    });
+    timings.parse += started.elapsed();
+    let mut prepared = false;
+    for (path, result) in results {
+        match result {
+            Ok(document) => {
+                pending.push(document);
+                prepared = true;
+            }
+            Err(error) => storage.record_failure(&failure_for(&path, &error))?,
+        }
+        if pending.len() >= EMBEDDING_BATCH_SIZE {
+            let mut batch = pending.drain(..EMBEDDING_BATCH_SIZE).collect::<Vec<_>>();
+            let persisted = persist_batch(
+                &mut batch, storage, text_index, embedder, progress, processed, total, timings,
+            )?;
+            add_persist_timings(timings, persisted);
+        }
+    }
+    Ok((completed, prepared))
+}
+
+fn report_progress(
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    processed: usize,
+    total: usize,
+    current_file: Option<&str>,
+    stage: &'static str,
+    timings: &IndexTimings,
+) {
+    report_progress_with(
+        progress,
+        processed,
+        total,
+        current_file,
+        stage,
+        timings.scan,
+        timings.check,
+        timings.parse,
+        timings.embedding,
+        timings.storage,
+        timings.text_index,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_progress_with(
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    processed: usize,
+    total: usize,
+    current_file: Option<&str>,
+    stage: &'static str,
+    scan: Duration,
+    check: Duration,
+    parse: Duration,
+    embedding: Duration,
+    storage: Duration,
+    text_index: Duration,
+) {
+    progress(ProgressUpdate {
+        processed,
+        total,
+        current_file,
+        stage,
+        scan_ms: scan.as_millis(),
+        check_ms: check.as_millis(),
+        parse_ms: parse.as_millis(),
+        embedding_ms: embedding.as_millis(),
+        storage_ms: storage.as_millis(),
+        text_index_ms: text_index.as_millis(),
+    });
+}
+
+fn parse_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let thread_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(1, 4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .thread_name(|index| format!("filesearch-parser-{index}"))
+            .build()
+            .expect("无法创建文档解析线程池")
+    })
+}
+
+fn add_persist_timings(timings: &mut IndexTimings, persisted: PersistTimings) {
+    timings.embedding += persisted.embedding;
+    timings.storage += persisted.storage;
+    timings.text_index += persisted.text_index;
 }
 
 fn metadata(path: &Path) -> Result<(u64, u64)> {
@@ -366,21 +769,19 @@ fn prepare_document(
 }
 
 pub fn split_chunks(text: &str) -> Vec<String> {
-    const TARGET: usize = 800;
-    const OVERLAP: usize = 100;
     let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= TARGET {
+    if chars.len() <= CHUNK_TARGET {
         return vec![text.to_owned()];
     }
     let mut output = Vec::new();
     let mut start = 0;
     while start < chars.len() {
-        let end = (start + TARGET).min(chars.len());
+        let end = (start + CHUNK_TARGET).min(chars.len());
         output.push(chars[start..end].iter().collect());
         if end == chars.len() {
             break;
         }
-        start = end - OVERLAP;
+        start = end - CHUNK_OVERLAP;
     }
     output
 }
@@ -452,6 +853,24 @@ mod tests {
             embedding: Vec::new(),
         };
         assert_eq!(semantic_source(&document), "流程.docx\n第一段\n");
+    }
+
+    #[test]
+    fn semantic_source_samples_the_end_of_long_documents() {
+        let document = PreparedDocument {
+            id: "id".to_owned(),
+            root: "root".to_owned(),
+            name: "长文档.docx".to_owned(),
+            extension: "docx".to_owned(),
+            path: "长文档.docx".to_owned(),
+            modified_ms: 0,
+            size: 0,
+            chunks: split_chunks(&format!("{}结尾关键内容", "前".repeat(6_000))),
+            embedding: Vec::new(),
+        };
+        let source = semantic_source(&document);
+        assert!(source.contains("结尾关键内容"));
+        assert!(source.chars().count() <= 2_000);
     }
 
     #[test]

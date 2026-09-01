@@ -9,15 +9,17 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::tensor::TensorElementType;
 use ort::value::Tensor;
 use parking_lot::{Mutex, RwLock};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 pub const EMBEDDING_DIMENSION: usize = 768;
-pub const EMBEDDING_PROFILE: &str = "rwkv-document-source-v2";
+pub const EMBEDDING_PROFILE: &str = "rwkv-document-source-v3";
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
 const EOS_TOKEN_ID: i64 = 65535;
-const INFERENCE_BATCH_SIZE: usize = 4;
+const INFERENCE_MAX_BATCH_SIZE: usize = 4;
+const INFERENCE_MAX_PADDED_TOKENS: usize = 8_192;
 const RWKV_HEAD_COUNT: usize = 12;
 const RWKV_HEAD_SIZE: usize = 64;
 
@@ -154,6 +156,48 @@ fn rwkv7_forward_batch(
     output: &mut [f32],
     state_size: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            rwkv7_forward_batch_avx2(
+                token_count,
+                receptance,
+                decay,
+                key,
+                value,
+                in_context_key,
+                in_context_value,
+                output,
+                state_size,
+            );
+        }
+        return;
+    }
+    rwkv7_forward_batch_scalar(
+        token_count,
+        receptance,
+        decay,
+        key,
+        value,
+        in_context_key,
+        in_context_value,
+        output,
+        state_size,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rwkv7_forward_batch_scalar(
+    token_count: usize,
+    receptance: &[f32],
+    decay: &[f32],
+    key: &[f32],
+    value: &[f32],
+    in_context_key: &[f32],
+    in_context_value: &[f32],
+    output: &mut [f32],
+    state_size: usize,
+) {
     let mut state = vec![0.0_f32; state_size];
     for token_index in 0..token_count {
         let token_offset = token_index * EMBEDDING_DIMENSION;
@@ -185,6 +229,114 @@ fn rwkv7_forward_batch(
                 }
                 output[vector_offset + row] = mixed;
             }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rwkv7_forward_batch_avx2(
+    token_count: usize,
+    receptance: &[f32],
+    decay: &[f32],
+    key: &[f32],
+    value: &[f32],
+    in_context_key: &[f32],
+    in_context_value: &[f32],
+    output: &mut [f32],
+    _state_size: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let mut head_outputs = (0..RWKV_HEAD_COUNT)
+        .map(|_| vec![0.0_f32; token_count * RWKV_HEAD_SIZE])
+        .collect::<Vec<_>>();
+    head_outputs
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(head_index, head_output)| {
+            let mut state = vec![0.0_f32; RWKV_HEAD_SIZE * RWKV_HEAD_SIZE];
+            let state_offset = 0;
+            for token_index in 0..token_count {
+                let token_offset = token_index * EMBEDDING_DIMENSION;
+                let vector_offset = token_offset + head_index * RWKV_HEAD_SIZE;
+                let mut projection = [0.0_f32; RWKV_HEAD_SIZE];
+                for row in 0..RWKV_HEAD_SIZE {
+                    let row_offset = state_offset + row * RWKV_HEAD_SIZE;
+                    let mut projected = _mm256_setzero_ps();
+                    for column in (0..RWKV_HEAD_SIZE).step_by(8) {
+                        let state_ptr = state.as_mut_ptr().add(row_offset + column);
+                        let decayed = _mm256_mul_ps(
+                            _mm256_loadu_ps(state_ptr),
+                            _mm256_loadu_ps(decay.as_ptr().add(vector_offset + column)),
+                        );
+                        _mm256_storeu_ps(state_ptr, decayed);
+                        projected = _mm256_add_ps(
+                            projected,
+                            _mm256_mul_ps(
+                                decayed,
+                                _mm256_loadu_ps(
+                                    in_context_key.as_ptr().add(vector_offset + column),
+                                ),
+                            ),
+                        );
+                    }
+                    let halves = _mm_add_ps(
+                        _mm256_castps256_ps128(projected),
+                        _mm256_extractf128_ps(projected, 1),
+                    );
+                    let pairs = _mm_hadd_ps(halves, halves);
+                    let singles = _mm_hadd_ps(pairs, pairs);
+                    projection[row] = _mm_cvtss_f32(singles);
+                }
+                for row in 0..RWKV_HEAD_SIZE {
+                    let row_offset = state_offset + row * RWKV_HEAD_SIZE;
+                    let projection_value = _mm256_set1_ps(projection[row]);
+                    let value_value = _mm256_set1_ps(value[vector_offset + row]);
+                    let mut mixed = _mm256_setzero_ps();
+                    for column in (0..RWKV_HEAD_SIZE).step_by(8) {
+                        let state_ptr = state.as_mut_ptr().add(row_offset + column);
+                        let updated = _mm256_add_ps(
+                            _mm256_loadu_ps(state_ptr),
+                            _mm256_add_ps(
+                                _mm256_mul_ps(
+                                    projection_value,
+                                    _mm256_loadu_ps(
+                                        in_context_value.as_ptr().add(vector_offset + column),
+                                    ),
+                                ),
+                                _mm256_mul_ps(
+                                    value_value,
+                                    _mm256_loadu_ps(key.as_ptr().add(vector_offset + column)),
+                                ),
+                            ),
+                        );
+                        _mm256_storeu_ps(state_ptr, updated);
+                        mixed = _mm256_add_ps(
+                            mixed,
+                            _mm256_mul_ps(
+                                updated,
+                                _mm256_loadu_ps(receptance.as_ptr().add(vector_offset + column)),
+                            ),
+                        );
+                    }
+                    let halves = _mm_add_ps(
+                        _mm256_castps256_ps128(mixed),
+                        _mm256_extractf128_ps(mixed, 1),
+                    );
+                    let pairs = _mm_hadd_ps(halves, halves);
+                    let singles = _mm_hadd_ps(pairs, pairs);
+                    head_output[token_index * RWKV_HEAD_SIZE + row] = _mm_cvtss_f32(singles);
+                }
+            }
+        });
+    for token_index in 0..token_count {
+        let output_offset = token_index * EMBEDDING_DIMENSION;
+        let head_offset = token_index * RWKV_HEAD_SIZE;
+        for (head_index, head_output) in head_outputs.iter().enumerate() {
+            let output_start = output_offset + head_index * RWKV_HEAD_SIZE;
+            output[output_start..output_start + RWKV_HEAD_SIZE]
+                .copy_from_slice(&head_output[head_offset..head_offset + RWKV_HEAD_SIZE]);
         }
     }
 }
@@ -378,21 +530,51 @@ impl EmbeddingEngine {
 
 impl RwkvModel {
     fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(INFERENCE_BATCH_SIZE) {
-            let mut token_batch = batch
+        let tokenized = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut tokens = self.tokenizer.encode(text);
+                tokens.push(EOS_TOKEN_ID);
+                (index, tokens)
+            })
+            .collect::<Vec<_>>();
+        let batches = plan_token_batches(&tokenized);
+        let total_tokens = tokenized
+            .iter()
+            .map(|(_, tokens)| tokens.len())
+            .sum::<usize>();
+        let padded_tokens = batches
+            .iter()
+            .map(|batch| {
+                batch.len()
+                    * batch
+                        .iter()
+                        .map(|index| tokenized[*index].1.len())
+                        .max()
+                        .unwrap_or(0)
+            })
+            .sum::<usize>();
+        tracing::debug!(
+            documents = texts.len(),
+            batches = batches.len(),
+            total_tokens,
+            padded_tokens,
+            "planned EmbeddingRWKV token batches"
+        );
+
+        let mut vectors = vec![None; texts.len()];
+        for batch in batches {
+            let max_length = batch
                 .iter()
-                .map(|text| {
-                    let mut tokens = self.tokenizer.encode(text).into_iter().collect::<Vec<_>>();
-                    tokens.push(EOS_TOKEN_ID);
-                    tokens
-                })
-                .collect::<Vec<_>>();
-            let max_length = token_batch.iter().map(Vec::len).max().unwrap_or(1);
+                .map(|index| tokenized[*index].1.len())
+                .max()
+                .unwrap_or(1);
             let mut flattened = Vec::with_capacity(batch.len() * max_length);
-            for tokens in &mut token_batch {
+            for index in &batch {
+                let tokens = &tokenized[*index].1;
                 flattened.extend(std::iter::repeat_n(0, max_length - tokens.len()));
-                flattened.append(tokens);
+                flattened.extend_from_slice(tokens);
             }
             let input = Tensor::<i64>::from_array(([batch.len(), max_length], flattened))
                 .context("无法创建 EmbeddingRWKV 输入")?;
@@ -406,14 +588,42 @@ impl RwkvModel {
             if shape.as_ref() != [batch.len() as i64, EMBEDDING_DIMENSION as i64] {
                 anyhow::bail!("EmbeddingRWKV 输出维度异常: {shape:?}");
             }
-            vectors.extend(values.chunks_exact(EMBEDDING_DIMENSION).map(|values| {
+            for (index, values) in batch.iter().zip(values.chunks_exact(EMBEDDING_DIMENSION)) {
                 let mut vector = values.to_vec();
                 normalize(&mut vector);
-                vector
-            }));
+                vectors[tokenized[*index].0] = Some(vector);
+            }
         }
-        Ok(vectors)
+        vectors
+            .into_iter()
+            .map(|vector| vector.context("EmbeddingRWKV 批处理结果缺失"))
+            .collect()
     }
+}
+
+fn plan_token_batches(tokenized: &[(usize, Vec<i64>)]) -> Vec<Vec<usize>> {
+    let mut order = (0..tokenized.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|index| tokenized[*index].1.len());
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_max_length = 0usize;
+    for index in order {
+        let length = tokenized[index].1.len();
+        let next_max_length = current_max_length.max(length);
+        let exceeds_batch = current.len() >= INFERENCE_MAX_BATCH_SIZE;
+        let exceeds_tokens = !current.is_empty()
+            && next_max_length * (current.len() + 1) > INFERENCE_MAX_PADDED_TOKENS;
+        if exceeds_batch || exceeds_tokens {
+            batches.push(std::mem::take(&mut current));
+            current_max_length = 0;
+        }
+        current_max_length = current_max_length.max(length);
+        current.push(index);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 impl RwkvTokenizer {
@@ -685,5 +895,80 @@ mod tests {
         let terms = lexical_terms("本地搜索 Rust");
         assert!(terms.contains(&"本地".to_owned()));
         assert!(terms.contains(&"rust".to_owned()));
+    }
+
+    #[test]
+    fn token_batches_group_similar_lengths_and_preserve_all_inputs() {
+        let tokenized = vec![
+            (0, vec![0; 3_000]),
+            (1, vec![0; 100]),
+            (2, vec![0; 120]),
+            (3, vec![0; 140]),
+            (4, vec![0; 160]),
+        ];
+        let batches = plan_token_batches(&tokenized);
+        let mut indexes = batches.iter().flatten().copied().collect::<Vec<_>>();
+        indexes.sort_unstable();
+        assert_eq!(indexes, (0..tokenized.len()).collect::<Vec<_>>());
+        assert!(batches
+            .iter()
+            .all(|batch| batch.len() <= INFERENCE_MAX_BATCH_SIZE));
+        assert_eq!(batches.last(), Some(&vec![0]));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_wkv_matches_scalar_kernel() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let token_count = 3;
+        let value_count = token_count * EMBEDDING_DIMENSION;
+        let values = |scale: f32, offset: usize| {
+            (0..value_count)
+                .map(|index| ((index + offset) % 29 + 1) as f32 * scale)
+                .collect::<Vec<_>>()
+        };
+        let receptance = values(0.003, 1);
+        let decay = (0..value_count)
+            .map(|index| 0.97 - (index % 7) as f32 * 0.001)
+            .collect::<Vec<_>>();
+        let key = values(0.002, 3);
+        let value = values(0.0025, 5);
+        let in_context_key = values(0.0015, 7);
+        let in_context_value = values(0.001, 11);
+        let mut scalar = vec![0.0; value_count];
+        let mut avx2 = vec![0.0; value_count];
+        let state_size = RWKV_HEAD_COUNT * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;
+        rwkv7_forward_batch_scalar(
+            token_count,
+            &receptance,
+            &decay,
+            &key,
+            &value,
+            &in_context_key,
+            &in_context_value,
+            &mut scalar,
+            state_size,
+        );
+        unsafe {
+            rwkv7_forward_batch_avx2(
+                token_count,
+                &receptance,
+                &decay,
+                &key,
+                &value,
+                &in_context_key,
+                &in_context_value,
+                &mut avx2,
+                state_size,
+            );
+        }
+        let max_difference = scalar
+            .iter()
+            .zip(&avx2)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_difference < 1e-5, "max difference: {max_difference}");
     }
 }

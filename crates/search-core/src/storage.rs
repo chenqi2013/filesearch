@@ -3,12 +3,20 @@ use crate::model::{
     StoredDocument,
 };
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct Storage {
     connection: Mutex<Connection>,
+    embeddings: RwLock<HashMap<String, CachedEmbedding>>,
+}
+
+struct CachedEmbedding {
+    extension: String,
+    vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,8 +74,10 @@ impl Storage {
                updated_at TEXT NOT NULL
              );",
         )?;
+        let embeddings = load_embedding_cache(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            embeddings: RwLock::new(embeddings),
         })
     }
 
@@ -215,51 +225,107 @@ impl Storage {
     }
 
     pub fn upsert_document(&self, document: &PreparedDocument) -> Result<Vec<StoredChunk>> {
+        Ok(self
+            .upsert_documents(std::slice::from_ref(document))?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    pub fn upsert_documents(
+        &self,
+        documents: &[PreparedDocument],
+    ) -> Result<Vec<Vec<StoredChunk>>> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM documents WHERE id = ? OR path = ?",
-            params![document.id, document.path],
-        )?;
-        let embedding =
-            (!document.embedding.is_empty()).then(|| vector_to_blob(&document.embedding));
-        transaction.execute(
-            "INSERT INTO documents(id, root, path, name, extension, modified_ms, size, embedding, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                document.id,
-                document.root,
-                document.path,
-                document.name,
-                document.extension,
-                document.modified_ms as i64,
-                document.size as i64,
-                embedding,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )?;
-        let mut chunks = Vec::with_capacity(document.chunks.len());
-        {
-            let mut statement = transaction
-                .prepare("INSERT INTO chunks(document_id, position, text) VALUES (?, ?, ?)")?;
-            for (position, text) in document.chunks.iter().enumerate() {
-                statement.execute(params![document.id, position as i64, text])?;
-                chunks.push(StoredChunk {
-                    id: transaction.last_insert_rowid() as u64,
-                    document_id: document.id.clone(),
-                    text: text.clone(),
-                });
+        let indexed_at = chrono::Utc::now().to_rfc3339();
+        let mut all_chunks = Vec::with_capacity(documents.len());
+        for document in documents {
+            transaction.execute(
+                "DELETE FROM documents WHERE id = ? OR path = ?",
+                params![document.id, document.path],
+            )?;
+            let embedding =
+                (!document.embedding.is_empty()).then(|| vector_to_blob(&document.embedding));
+            transaction.execute(
+                "INSERT INTO documents(id, root, path, name, extension, modified_ms, size, embedding, indexed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    document.id,
+                    document.root,
+                    document.path,
+                    document.name,
+                    document.extension,
+                    document.modified_ms as i64,
+                    document.size as i64,
+                    embedding,
+                    indexed_at,
+                ],
+            )?;
+            let mut chunks = Vec::with_capacity(document.chunks.len());
+            {
+                let mut statement = transaction
+                    .prepare("INSERT INTO chunks(document_id, position, text) VALUES (?, ?, ?)")?;
+                for (position, text) in document.chunks.iter().enumerate() {
+                    statement.execute(params![document.id, position as i64, text])?;
+                    chunks.push(StoredChunk {
+                        id: transaction.last_insert_rowid() as u64,
+                        document_id: document.id.clone(),
+                        text: text.clone(),
+                    });
+                }
             }
+            transaction.execute("DELETE FROM failures WHERE path = ?", [&document.path])?;
+            all_chunks.push(chunks);
         }
         transaction.commit()?;
-        Ok(chunks)
+        drop(connection);
+        let mut cache = self.embeddings.write();
+        for document in documents {
+            if document.embedding.is_empty() {
+                cache.remove(&document.id);
+            } else {
+                cache.insert(
+                    document.id.clone(),
+                    CachedEmbedding {
+                        extension: document.extension.clone(),
+                        vector: document.embedding.clone(),
+                    },
+                );
+            }
+        }
+        Ok(all_chunks)
     }
 
     pub fn delete_document(&self, id: &str) -> Result<()> {
         self.connection
             .lock()
             .execute("DELETE FROM documents WHERE id = ?", [id])?;
+        self.embeddings.write().remove(id);
         Ok(())
+    }
+
+    pub fn semantic_search(
+        &self,
+        query: &[f32],
+        extension: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, f32)> {
+        let cache = self.embeddings.read();
+        let mut scores = cache
+            .par_iter()
+            .filter(|(_, embedding)| extension.is_none_or(|value| value == embedding.extension))
+            .filter_map(|(document_id, embedding)| {
+                let score = crate::embedding::cosine(query, &embedding.vector).max(0.0);
+                (score > 0.05).then(|| (document_id.clone(), score))
+            })
+            .collect::<Vec<_>>();
+        scores.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        scores.truncate(limit);
+        scores
+    }
+
+    pub fn has_embedding(&self, document_id: &str) -> bool {
+        self.embeddings.read().contains_key(document_id)
     }
 
     pub fn list_chunks(&self) -> Result<Vec<StoredChunk>> {
@@ -362,13 +428,6 @@ impl Storage {
         Ok(())
     }
 
-    pub fn remove_failure(&self, path: &str) -> Result<()> {
-        self.connection
-            .lock()
-            .execute("DELETE FROM failures WHERE path = ?", [path])?;
-        Ok(())
-    }
-
     pub fn missing_embedding_count(&self) -> Result<usize> {
         let connection = self.connection.lock();
         query_count(
@@ -389,6 +448,7 @@ impl Storage {
         self.connection
             .lock()
             .execute("UPDATE documents SET embedding = NULL", [])?;
+        self.embeddings.write().clear();
         Ok(())
     }
 
@@ -414,6 +474,23 @@ impl Storage {
         )?;
         Ok(())
     }
+}
+
+fn load_embedding_cache(connection: &Connection) -> Result<HashMap<String, CachedEmbedding>> {
+    let mut statement = connection
+        .prepare("SELECT id, extension, embedding FROM documents WHERE embedding IS NOT NULL")?;
+    let rows = statement.query_map([], |row| {
+        let bytes: Vec<u8> = row.get(2)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            CachedEmbedding {
+                extension: row.get(1)?,
+                vector: blob_to_vector(&bytes),
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(Into::into)
 }
 
 fn query_count(connection: &Connection, sql: &str) -> Result<usize> {

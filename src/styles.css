@@ -159,6 +159,16 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; flex: 0 0 auto; }
 .muted { color: var(--muted); }.compact { padding: 5px 8px; font-size: 12px; }
 .spin { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 .progress-track.indeterminate span { width: 38%; animation: progress-slide 1.4s ease-in-out infinite; }
+.timing-panel { margin-top: 10px; padding-top: 9px; border-top: 1px solid #dfe3de; font-size: 10px; }
+.timing-panel header, .timing-current, .timing-list div { min-height: 23px; display: grid; align-items: center; }
+.timing-panel header { grid-template-columns: 1fr auto; color: var(--muted); }
+.timing-panel header strong { color: var(--ink); font-size: 11px; }
+.timing-current { grid-template-columns: auto minmax(0, 1fr) auto; gap: 6px; padding: 4px 6px; border-radius: 4px; background: #eef4ef; color: var(--muted); }
+.timing-current strong { min-width: 0; overflow: hidden; color: var(--accent-dark); text-overflow: ellipsis; white-space: nowrap; }
+.timing-panel time { color: #53615b; font-variant-numeric: tabular-nums; }
+.timing-list { margin-top: 4px; }
+.timing-list div { grid-template-columns: minmax(0, 1fr) auto; padding: 0 6px; color: var(--muted); }
+.timing-list div.active { color: var(--accent-dark); font-weight: 600; }
 @keyframes progress-slide { from { transform: translateX(-110%); } to { transform: translateX(280%); } }
 
 @media (max-width: 1050px) {

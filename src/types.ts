@@ -8,6 +8,15 @@ export interface ServiceStats {
   processed_files: number;
   total_files: number;
   current_file?: string;
+  index_stage?: "ready" | "starting" | "scanning" | "checking" | "parsing" | "embedding" | "storage" | "text_index" | "committing";
+  index_stage_elapsed_ms?: number;
+  index_total_elapsed_ms?: number;
+  index_scan_ms?: number;
+  index_check_ms?: number;
+  index_parse_ms?: number;
+  index_embedding_ms?: number;
+  index_storage_ms?: number;
+  index_text_index_ms?: number;
   directories: string[];
   last_indexed?: string;
   storage_backend?: string;

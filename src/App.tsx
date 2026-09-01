@@ -176,6 +176,26 @@ function App() {
     : backend === "fallback"
       ? t.offlineEmbedding
       : t.cpu;
+  const stageLabels: Record<string, string> = {
+    starting: t.indexing,
+    scanning: t.stageScanning,
+    checking: t.stageChecking,
+    parsing: t.stageParsing,
+    embedding: t.stageEmbedding,
+    storage: t.stageStorage,
+    text_index: t.stageTextIndex,
+    committing: t.stageCommitting,
+    ready: t.ready,
+  };
+  const timingRows = [
+    ["scanning", t.stageScanning, stats.index_scan_ms ?? 0],
+    ["checking", t.stageChecking, stats.index_check_ms ?? 0],
+    ["parsing", t.stageParsing, stats.index_parse_ms ?? 0],
+    ["embedding", t.stageEmbedding, stats.index_embedding_ms ?? 0],
+    ["storage", t.stageStorage, stats.index_storage_ms ?? 0],
+    ["text_index", t.stageTextIndex, stats.index_text_index_ms ?? 0],
+  ] as const;
+  const showTiming = stats.status === "indexing" || (stats.index_total_elapsed_ms ?? 0) > 0;
 
   return (
     <div className="app-shell">
@@ -225,6 +245,25 @@ function App() {
                 <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>
                 <small>{modelLoading ? stats.embedding_model : `${stats.processed_files} / ${stats.total_files}`}</small>
               </div>
+            )}
+            {showTiming && (
+              <section className="timing-panel">
+                <header><span>{t.timingTitle}</span><strong>{formatDuration(stats.index_total_elapsed_ms ?? 0)}</strong></header>
+                {stats.status === "indexing" && (
+                  <div className="timing-current">
+                    <span>{t.currentStage}</span>
+                    <strong>{stageLabels[stats.index_stage ?? "starting"]}</strong>
+                    <time>{formatDuration(stats.index_stage_elapsed_ms ?? 0)}</time>
+                  </div>
+                )}
+                <div className="timing-list">
+                  {timingRows.map(([stage, label, elapsed]) => (
+                    <div className={stats.status === "indexing" && stats.index_stage === stage ? "active" : ""} key={stage}>
+                      <span>{label}</span><time>{formatDuration(elapsed + (stats.status === "indexing" && stats.index_stage === stage ? stats.index_stage_elapsed_ms ?? 0 : 0))}</time>
+                    </div>
+                  ))}
+                </div>
+              </section>
             )}
             <div className="stat-grid">
               <button onClick={() => void showInventory("documents")}><strong>{stats.document_count}</strong>{t.documents}</button>
@@ -384,6 +423,11 @@ function Highlight({ text, query }: { text: string; query: string }) {
 
 const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 const formatBytes = (size: number) => size < 1024 ? `${size} B` : size < 1024 ** 2 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 ** 2).toFixed(1)} MB`;
+const formatDuration = (milliseconds: number) => milliseconds < 1_000
+  ? `${Math.round(milliseconds)} ms`
+  : milliseconds < 60_000
+    ? `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)} s`
+    : `${Math.floor(milliseconds / 60_000)}m ${Math.floor((milliseconds % 60_000) / 1_000)}s`;
 const formatTimestamp = (value: number, locale: Locale) => new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : locale === "ru" ? "ru-RU" : "en-US", { dateStyle: "medium" }).format(new Date(value));
 const formatDate = (value: string, locale: Locale) => formatTimestamp(new Date(value).getTime(), locale);
 

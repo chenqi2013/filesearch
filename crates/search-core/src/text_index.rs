@@ -54,31 +54,38 @@ impl TextIndex {
         })
     }
 
+    #[cfg(test)]
     pub fn replace_document(
         &self,
         document_id: &str,
         name: &str,
         chunks: &[StoredChunk],
     ) -> Result<()> {
+        self.replace_documents(&[(document_id, name, chunks)])
+    }
+
+    pub fn replace_documents(&self, documents: &[(&str, &str, &[StoredChunk])]) -> Result<()> {
         let writer = self.writer.lock();
-        writer.delete_term(Term::from_field_text(self.document_id, document_id));
-        for chunk in chunks {
-            let mut searchable = lexical_text(name);
-            if !searchable.is_empty() {
-                searchable = format!("{searchable} {searchable} {searchable}");
-            }
-            let body = lexical_text(&chunk.text);
-            if !body.is_empty() {
+        for (document_id, name, chunks) in documents {
+            writer.delete_term(Term::from_field_text(self.document_id, document_id));
+            for chunk in *chunks {
+                let mut searchable = lexical_text(name);
                 if !searchable.is_empty() {
-                    searchable.push(' ');
+                    searchable = format!("{searchable} {searchable} {searchable}");
                 }
-                searchable.push_str(&body);
+                let body = lexical_text(&chunk.text);
+                if !body.is_empty() {
+                    if !searchable.is_empty() {
+                        searchable.push(' ');
+                    }
+                    searchable.push_str(&body);
+                }
+                writer.add_document(doc!(
+                    self.chunk_id => chunk.id,
+                    self.document_id => *document_id,
+                    self.content => searchable,
+                ))?;
             }
-            writer.add_document(doc!(
-                self.chunk_id => chunk.id,
-                self.document_id => document_id,
-                self.content => searchable,
-            ))?;
         }
         Ok(())
     }
