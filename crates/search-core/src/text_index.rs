@@ -10,6 +10,7 @@ use tantivy::schema::{Field, Schema, Value, INDEXED, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 const WRITER_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+const REBUILD_COMMIT_BATCH_SIZE: usize = 2_000;
 
 #[derive(Debug, Clone)]
 pub struct KeywordHit {
@@ -43,7 +44,7 @@ impl TextIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
-        let writer = index.writer(WRITER_MEMORY_BYTES)?;
+        let writer = index.writer_with_num_threads(1, WRITER_MEMORY_BYTES)?;
         Ok(Self {
             index,
             reader,
@@ -109,7 +110,8 @@ impl TextIndex {
             .collect::<HashMap<_, _>>();
         let mut writer = self.writer.lock();
         writer.delete_all_documents()?;
-        for chunk in chunks {
+        writer.commit()?;
+        for (index, chunk) in chunks.iter().enumerate() {
             let name = names
                 .get(chunk.document_id.as_str())
                 .copied()
@@ -130,6 +132,9 @@ impl TextIndex {
                 self.document_id => chunk.document_id.as_str(),
                 self.content => searchable,
             ))?;
+            if (index + 1) % REBUILD_COMMIT_BATCH_SIZE == 0 {
+                writer.commit()?;
+            }
         }
         writer.commit()?;
         drop(writer);

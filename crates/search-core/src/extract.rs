@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use encoding_rs::{GB18030, UTF_16BE, UTF_16LE};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::fs::File;
@@ -28,7 +29,7 @@ pub fn extract_text(path: &Path) -> Result<String> {
         "txt" | "md" | "csv" | "json" | "log" | "rst" => {
             let bytes =
                 std::fs::read(path).with_context(|| format!("无法读取 {}", path.display()))?;
-            String::from_utf8_lossy(&bytes).into_owned()
+            decode_text_bytes(&bytes)
         }
         "pdf" => {
             if pdf_has_encrypt_marker(path)? {
@@ -48,6 +49,22 @@ pub fn extract_text(path: &Path) -> Result<String> {
         return Err(anyhow!("未提取到可索引文本"));
     }
     Ok(normalized)
+}
+
+fn decode_text_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return UTF_16LE.decode(&bytes[2..]).0.into_owned();
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return UTF_16BE.decode(&bytes[2..]).0.into_owned();
+    }
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return value.to_owned();
+    }
+    GB18030.decode(bytes).0.into_owned()
 }
 
 fn pdf_has_encrypt_marker(path: &Path) -> Result<bool> {
@@ -159,6 +176,23 @@ mod tests {
             .unwrap();
         assert!(value.contains("本地搜索"));
         assert!(value.contains("MVP"));
+    }
+
+    #[test]
+    fn decodes_utf8_and_legacy_chinese_text() {
+        let value = "本地文档搜索，支持中文";
+        assert_eq!(decode_text_bytes(value.as_bytes()), value);
+        let (encoded, _, had_errors) = GB18030.encode(value);
+        assert!(!had_errors);
+        assert_eq!(decode_text_bytes(&encoded), value);
+    }
+
+    #[test]
+    fn decodes_utf16_text_with_bom() {
+        let value = "本地文档搜索";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(decode_text_bytes(&bytes), value);
     }
 
     #[test]

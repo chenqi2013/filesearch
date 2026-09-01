@@ -3742,6 +3742,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "encoding_rs",
  "fastembed",
  "libloading 0.8.9",
  "notify",

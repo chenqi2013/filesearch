@@ -411,6 +411,9 @@ fn launch_pending_incremental(state: SharedState) {
 
 fn finish_index_task(state: &SharedState, refresh_watcher: bool) {
     finish_index_timing(state);
+    state
+        .processed
+        .store(state.total.load(Ordering::Relaxed), Ordering::Relaxed);
     *state.current_file.lock() = None;
     state.indexing.store(false, Ordering::SeqCst);
     if refresh_watcher || state.watcher_refresh_pending.swap(false, Ordering::SeqCst) {

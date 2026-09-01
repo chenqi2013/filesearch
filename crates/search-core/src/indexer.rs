@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
-const EMBEDDING_BATCH_SIZE: usize = 32;
+const EMBEDDING_BATCH_SIZE: usize = 4;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
@@ -634,7 +634,7 @@ fn flush_parse_jobs(
     });
     timings.parse += started.elapsed();
     let mut prepared = false;
-    for (path, result) in results {
+    for (job_index, (path, result)) in results.into_iter().enumerate() {
         match result {
             Ok(document) => {
                 pending.push(document);
@@ -645,7 +645,14 @@ fn flush_parse_jobs(
         if pending.len() >= EMBEDDING_BATCH_SIZE {
             let mut batch = pending.drain(..EMBEDDING_BATCH_SIZE).collect::<Vec<_>>();
             let persisted = persist_batch(
-                &mut batch, storage, text_index, embedder, progress, processed, total, timings,
+                &mut batch,
+                storage,
+                text_index,
+                embedder,
+                progress,
+                processed + job_index + 1,
+                total,
+                timings,
             )?;
             add_persist_timings(timings, persisted);
         }
