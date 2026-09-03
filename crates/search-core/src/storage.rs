@@ -140,6 +140,17 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    pub fn extensions(&self) -> Result<Vec<String>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT extension FROM documents
+             WHERE extension <> '' ORDER BY extension COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn set_directories(&self, paths: &[String]) -> Result<()> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;

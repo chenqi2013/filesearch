@@ -194,6 +194,7 @@ pub struct ServiceStats {
     pub index_storage_ms: u128,
     pub index_text_index_ms: u128,
     pub directories: Vec<String>,
+    pub extensions: Vec<String>,
     pub last_indexed: Option<String>,
     pub storage_backend: String,
     pub embedding_model: String,

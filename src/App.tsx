@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -46,6 +46,7 @@ const EMPTY_STATS: ServiceStats = {
   processed_files: 0,
   total_files: 0,
   directories: [],
+  extensions: [],
   embedding_backend: "cpu",
 };
 
@@ -66,6 +67,7 @@ function App() {
   const [inventory, setInventory] = useState<InventoryState | null>(null);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const searchRequestId = useRef(0);
 
   const refreshStats = useCallback(async () => {
     try {
@@ -115,21 +117,35 @@ function App() {
     }
   };
 
-  const submitSearch = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!query.trim()) return;
+  const runSearch = useCallback(async (searchQuery: string, searchMode: SearchMode, searchExtension: string, updateSubmittedQuery: boolean) => {
+    const requestId = ++searchRequestId.current;
     setSearching(true);
     try {
-      const result = await coreApi.search(query.trim(), mode, extension);
+      const result = await coreApi.search(searchQuery, searchMode, searchExtension);
+      if (requestId !== searchRequestId.current) return;
       setResponse(result);
-      setSubmittedQuery(query.trim());
+      if (updateSubmittedQuery) setSubmittedQuery(searchQuery);
       setSelected(result.results[0] ?? null);
     } catch (error) {
-      setNotice(`${t.error}: ${error instanceof Error ? error.message : String(error)}`);
+      if (requestId === searchRequestId.current) {
+        setNotice(`${t.error}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     } finally {
-      setSearching(false);
+      if (requestId === searchRequestId.current) setSearching(false);
     }
+  }, [t.error]);
+
+  const submitSearch = async (event: FormEvent) => {
+    event.preventDefault();
+    const searchQuery = query.trim();
+    if (!searchQuery) return;
+    await runSearch(searchQuery, mode, extension, true);
   };
+
+  useEffect(() => {
+    if (!submittedQuery.trim()) return;
+    void runSearch(submittedQuery, mode, extension, false);
+  }, [mode, extension, runSearch]);
 
   const showInventory = async (kind: InventoryKind, offset = 0) => {
     setInventoryLoading(true);
@@ -157,10 +173,7 @@ function App() {
     }
   };
 
-  const extensions = useMemo(
-    () => Array.from(new Set(response?.results.map((result) => result.extension) ?? [])),
-    [response],
-  );
+  const extensions = stats.extensions;
   const progress = stats.total_files ? Math.round((stats.processed_files / stats.total_files) * 100) : 0;
   const modelLoading = stats.embedding_model?.includes("正在加载") ?? false;
   const operation = modelLoading
@@ -287,7 +300,7 @@ function App() {
               </select>
               <div className="segmented" role="group">
                 {(["hybrid", "keyword", "semantic"] as SearchMode[]).map((item) => (
-                  <button className={mode === item ? "active" : ""} onClick={() => setMode(item)} key={item}>{t[item]}</button>
+                  <button type="button" className={mode === item ? "active" : ""} onClick={() => setMode(item)} key={item}>{t[item]}</button>
                 ))}
               </div>
             </div>

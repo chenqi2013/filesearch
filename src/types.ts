@@ -18,6 +18,7 @@ export interface ServiceStats {
   index_storage_ms?: number;
   index_text_index_ms?: number;
   directories: string[];
+  extensions: string[];
   last_indexed?: string;
   storage_backend?: string;
   embedding_model?: string;

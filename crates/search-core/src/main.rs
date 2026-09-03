@@ -237,6 +237,7 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
         index_storage_ms: timing.storage_ms,
         index_text_index_ms: timing.text_index_ms,
         directories: state.storage.directories().unwrap_or_default(),
+        extensions: state.storage.extensions().unwrap_or_default(),
         last_indexed: state.storage.last_indexed().unwrap_or_default(),
         storage_backend: "SQLite WAL + Tantivy BM25".to_owned(),
         embedding_model: state.embedder.status(),
