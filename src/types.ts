@@ -45,7 +45,7 @@ export interface SearchResponse {
 
 export interface IndexFailure {
   path: string;
-  category?: "encrypted" | "permission" | "offline" | "corrupt" | "parse" | "internal";
+  category?: "encrypted" | "permission" | "offline" | "corrupt" | "timeout" | "parse" | "internal";
   reason: string;
 }
 

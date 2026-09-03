@@ -44,6 +44,9 @@
       "../assets/models": "models"
     },
     "windows": {
+      "nsis": {
+        "installerHooks": "nsis-hooks.nsh"
+      },
       "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true }
     }
   }

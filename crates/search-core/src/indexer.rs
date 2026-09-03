@@ -9,8 +9,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+#[cfg(not(test))]
+use std::thread::sleep;
 use std::time::{Duration, Instant};
+#[cfg(not(test))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
@@ -18,6 +24,8 @@ const EMBEDDING_BATCH_SIZE: usize = 4;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
+#[cfg(not(test))]
+const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Default)]
 struct IndexTimings {
@@ -627,20 +635,37 @@ fn flush_parse_jobs(
     let results = parse_pool().install(|| {
         jobs.into_par_iter()
             .map(|job| {
-                let result = prepare_document(&job.path, &job.root, job.modified_ms, job.size);
-                (job.path, result)
+                let path = job.path;
+                let started = Instant::now();
+                let result = prepare_document(&path, &job.root, job.modified_ms, job.size);
+                (path, started.elapsed(), result)
             })
             .collect::<Vec<_>>()
     });
     timings.parse += started.elapsed();
     let mut prepared = false;
-    for (job_index, (path, result)) in results.into_iter().enumerate() {
+    for (job_index, (path, elapsed, result)) in results.into_iter().enumerate() {
+        if elapsed >= Duration::from_secs(2) {
+            tracing::info!(
+                path = %path.display(),
+                elapsed_ms = elapsed.as_millis(),
+                "slow document extraction"
+            );
+        }
         match result {
             Ok(document) => {
                 pending.push(document);
                 prepared = true;
             }
-            Err(error) => storage.record_failure(&failure_for(&path, &error))?,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    elapsed_ms = elapsed.as_millis(),
+                    error = %format_args!("{error:#}"),
+                    "document extraction failed"
+                );
+                storage.record_failure(&failure_for(&path, &error))?;
+            }
         }
         if pending.len() >= EMBEDDING_BATCH_SIZE {
             let mut batch = pending.drain(..EMBEDDING_BATCH_SIZE).collect::<Vec<_>>();
@@ -752,7 +777,13 @@ fn prepare_document(
     if size > MAX_FILE_BYTES {
         anyhow::bail!("文件超过 200 MB 单文件限制");
     }
-    let text = extract_text(path)?;
+    let started = Instant::now();
+    let text = extract_text_with_timeout(path)?;
+    tracing::debug!(
+        path = %path.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "document extracted"
+    );
     let path_string = path.to_string_lossy().into_owned();
     Ok(PreparedDocument {
         id: stable_id(&path_string),
@@ -773,6 +804,76 @@ fn prepare_document(
         chunks: split_chunks(&text),
         embedding: Vec::new(),
     })
+}
+
+fn extract_text_with_timeout(path: &Path) -> Result<String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "pdf" | "docx" | "xlsx" | "pptx") {
+        return extract_text(path);
+    }
+
+    #[cfg(test)]
+    {
+        return extract_text(path);
+    }
+
+    #[cfg(not(test))]
+    {
+        extract_text_in_worker(path)
+    }
+}
+
+#[cfg(not(test))]
+fn extract_text_in_worker(path: &Path) -> Result<String> {
+    let executable = std::env::current_exe().context("无法定位搜索服务程序")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "filesearch-extract-{}-{}-{}.txt",
+        std::process::id(),
+        nonce,
+        stable_id(&path.to_string_lossy())
+    ));
+    let mut child = Command::new(executable)
+        .arg("--extract-file")
+        .arg(path)
+        .arg("--extract-output")
+        .arg(&output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("无法启动文件解析 worker: {}", path.display()))?;
+    let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                let _ = std::fs::remove_file(&output);
+                anyhow::bail!("文档解析 worker 失败，退出码: {status}");
+            }
+            let text = std::fs::read_to_string(&output)
+                .with_context(|| format!("无法读取文件解析结果: {}", path.display()))?;
+            let _ = std::fs::remove_file(&output);
+            return Ok(text);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&output);
+            anyhow::bail!(
+                "文档解析超时（{} 秒），已跳过文件: {}",
+                FILE_EXTRACTION_TIMEOUT.as_secs(),
+                path.display()
+            );
+        }
+        sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn split_chunks(text: &str) -> Vec<String> {
@@ -829,6 +930,8 @@ pub(crate) fn classify_failure(reason: &str) -> &'static str {
         || lower.contains("解析失败")
     {
         "corrupt"
+    } else if lower.contains("超时") || lower.contains("timeout") {
+        "timeout"
     } else {
         "parse"
     }
@@ -886,6 +989,7 @@ mod tests {
         assert_eq!(classify_failure("Permission denied"), "permission");
         assert_eq!(classify_failure("network share offline"), "offline");
         assert_eq!(classify_failure("invalid zip archive"), "corrupt");
+        assert_eq!(classify_failure("文档解析超时（180 秒）"), "timeout");
     }
 
     #[test]

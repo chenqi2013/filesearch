@@ -41,6 +41,10 @@ struct Args {
     data_dir: PathBuf,
     #[arg(long)]
     model_dir: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    extract_file: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    extract_output: Option<PathBuf>,
 }
 
 struct AppState {
@@ -109,6 +113,15 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    if let Some(input) = args.extract_file.as_deref() {
+        let output = args
+            .extract_output
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("缺少提取结果输出路径"))?;
+        let text = extract::extract_text(input)?;
+        std::fs::write(output, text.as_bytes())?;
+        return Ok(());
+    }
     std::fs::create_dir_all(&args.data_dir)?;
 
     let storage = Arc::new(Storage::open(&sqlite_path(&args.data_dir))?);

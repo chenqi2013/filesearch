@@ -51,6 +51,7 @@ pnpm desktop:build
 ```
 
 安装包输出到 `target/release/bundle/`。`scripts/prepare-sidecar.mjs` 会根据当前 Rust target triple 生成 Tauri 所需的 sidecar 文件名。
+NSIS 安装器升级前会自动关闭旧版桌面进程和搜索核心，避免运行中的 DLL 导致覆盖失败。
 
 ## 数据位置
 
@@ -59,7 +60,7 @@ pnpm desktop:build
 - Windows：`%LOCALAPPDATA%\com.localfind.desktop\`
 - macOS：`~/Library/Application Support/com.localfind.desktop/`
 
-其中 `search.db` 保存文件元数据、失败记录和文档级向量，`tantivy/` 保存全文倒排索引。EmbeddingRWKV Tiny 文本 ONNX 模型随 Windows 安装包内置，应用只读取源文件，不会修改、移动或删除源文件。
+其中 `search.db` 保存文件元数据、失败记录和文档级向量，`tantivy/` 保存全文倒排索引。Windows 安装版的失败记录位于 `%LOCALAPPDATA%\\com.localfind.desktop\\search.db` 的 `failures` 表中，也可直接在界面点击“失败”查看；开发运行时对应项目目录下的 `.filesearch-data\\search.db`。EmbeddingRWKV Tiny 文本 ONNX 模型随 Windows 安装包内置，应用只读取源文件，不会修改、移动或删除源文件。
 
 语义索引使用内置的 `EmbeddingRWKV Tiny` 模型（768 维），采用官方 World Tokenizer、EOS 结尾标记和 `[RETR]` 检索头；每个文档只对文件名及最多约 2,000 字符代表内容编码一次，代表内容由正文开头和均匀分布的后续段落组成，正文分块仍由 Tantivy 提供关键词定位。模型和推理均在本机完成，文档内容不会上传，也不会从网络下载模型。模型文件缺失或推理失败时，会自动使用离线中文词项向量，关键词检索和索引服务仍可用。
 
@@ -85,6 +86,7 @@ cargo test -p search-core sqlite_wal_handles_fifty_thousand_documents -- --ignor
 
 - `.doc`、`.xls`、`.ppt` 旧版二进制格式尚未解析；可先另存为 OOXML 格式。
 - 扫描版 PDF 与图片 OCR、问答摘要尚未实现；加密 PDF 会明确列为失败文件。
+- PDF 和 Office 文档解析采用独立 worker，单文件默认 180 秒超时；超时文件会记录为 `timeout` 失败并继续处理后续文件。
 - 已完成 5 万条合成元数据容量测试；上线前仍建议在目标 Windows 机器和真实混合文档/共享盘环境进行长时间压力测试。
 
 详细设计见 [docs/architecture.md](docs/architecture.md)，测试记录见 [docs/test-report.md](docs/test-report.md)。
