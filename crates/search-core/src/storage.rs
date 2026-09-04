@@ -12,9 +12,16 @@ use std::path::{Path, PathBuf};
 pub struct Storage {
     connection: Mutex<Connection>,
     embeddings: RwLock<HashMap<String, CachedEmbedding>>,
+    chunk_embeddings: RwLock<HashMap<u64, CachedChunkEmbedding>>,
 }
 
 struct CachedEmbedding {
+    extension: String,
+    vector: Vec<f32>,
+}
+
+struct CachedChunkEmbedding {
+    document_id: String,
     extension: String,
     vector: Vec<f32>,
 }
@@ -67,6 +74,12 @@ impl Storage {
                UNIQUE(document_id, position)
              );
              CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
+             CREATE TABLE IF NOT EXISTS chunk_embeddings (
+               chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+               document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+               embedding BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_document ON chunk_embeddings(document_id);
              CREATE TABLE IF NOT EXISTS failures (
                path TEXT PRIMARY KEY,
                category TEXT NOT NULL,
@@ -75,9 +88,11 @@ impl Storage {
              );",
         )?;
         let embeddings = load_embedding_cache(&connection)?;
+        let chunk_embeddings = load_chunk_embedding_cache(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             embeddings: RwLock::new(embeddings),
+            chunk_embeddings: RwLock::new(chunk_embeddings),
         })
     }
 
@@ -290,6 +305,13 @@ impl Storage {
         }
         transaction.commit()?;
         drop(connection);
+        let document_ids = documents
+            .iter()
+            .map(|document| document.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.chunk_embeddings
+            .write()
+            .retain(|_, embedding| !document_ids.contains(embedding.document_id.as_str()));
         let mut cache = self.embeddings.write();
         for document in documents {
             if document.embedding.is_empty() {
@@ -312,6 +334,9 @@ impl Storage {
             .lock()
             .execute("DELETE FROM documents WHERE id = ?", [id])?;
         self.embeddings.write().remove(id);
+        self.chunk_embeddings
+            .write()
+            .retain(|_, embedding| embedding.document_id != id);
         Ok(())
     }
 
@@ -333,6 +358,72 @@ impl Storage {
         scores.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
         scores.truncate(limit);
         scores
+    }
+
+    pub fn semantic_chunk_search(
+        &self,
+        query: &[f32],
+        extension: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, u64, f32)> {
+        let cache = self.chunk_embeddings.read();
+        let mut scores = cache
+            .par_iter()
+            .filter(|(_, embedding)| extension.is_none_or(|value| value == embedding.extension))
+            .map(|(chunk_id, embedding)| {
+                (
+                    embedding.document_id.clone(),
+                    *chunk_id,
+                    crate::embedding::cosine(query, &embedding.vector).max(0.0),
+                )
+            })
+            .collect::<Vec<_>>();
+        scores.sort_unstable_by(|left, right| right.2.total_cmp(&left.2));
+        scores.truncate(limit);
+        scores
+    }
+
+    pub fn replace_chunk_embeddings(&self, embeddings: &[(u64, Vec<f32>)]) -> Result<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let mut cached = Vec::with_capacity(embeddings.len());
+        for (chunk_id, embedding) in embeddings {
+            let Some((document_id, extension)) = transaction
+                .query_row(
+                    "SELECT c.document_id, d.extension
+                     FROM chunks c JOIN documents d ON d.id = c.document_id
+                     WHERE c.id = ?",
+                    [*chunk_id as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            else {
+                continue;
+            };
+            transaction.execute(
+                "INSERT OR REPLACE INTO chunk_embeddings(chunk_id, document_id, embedding)
+                 VALUES (?, ?, ?)",
+                params![*chunk_id as i64, &document_id, vector_to_blob(embedding)],
+            )?;
+            cached.push((
+                *chunk_id,
+                CachedChunkEmbedding {
+                    document_id,
+                    extension,
+                    vector: embedding.clone(),
+                },
+            ));
+        }
+        transaction.commit()?;
+        drop(connection);
+        let mut cache = self.chunk_embeddings.write();
+        for (chunk_id, embedding) in cached {
+            cache.insert(chunk_id, embedding);
+        }
+        Ok(())
     }
 
     pub fn has_embedding(&self, document_id: &str) -> bool {
@@ -472,10 +563,12 @@ impl Storage {
     }
 
     pub fn clear_embeddings(&self) -> Result<()> {
-        self.connection
-            .lock()
-            .execute("UPDATE documents SET embedding = NULL", [])?;
+        self.connection.lock().execute_batch(
+            "UPDATE documents SET embedding = NULL;
+             DELETE FROM chunk_embeddings;",
+        )?;
         self.embeddings.write().clear();
+        self.chunk_embeddings.write().clear();
         Ok(())
     }
 
@@ -512,6 +605,28 @@ fn load_embedding_cache(connection: &Connection) -> Result<HashMap<String, Cache
             row.get::<_, String>(0)?,
             CachedEmbedding {
                 extension: row.get(1)?,
+                vector: blob_to_vector(&bytes),
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(Into::into)
+}
+
+fn load_chunk_embedding_cache(
+    connection: &Connection,
+) -> Result<HashMap<u64, CachedChunkEmbedding>> {
+    let mut statement = connection.prepare(
+        "SELECT ce.chunk_id, ce.document_id, d.extension, ce.embedding
+         FROM chunk_embeddings ce JOIN documents d ON d.id = ce.document_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let bytes: Vec<u8> = row.get(3)?;
+        Ok((
+            row.get::<_, i64>(0)? as u64,
+            CachedChunkEmbedding {
+                document_id: row.get(1)?,
+                extension: row.get(2)?,
                 vector: blob_to_vector(&bytes),
             },
         ))

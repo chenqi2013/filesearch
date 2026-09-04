@@ -1,4 +1,4 @@
-use crate::embedding::{EmbeddingEngine, EMBEDDING_DIMENSION};
+use crate::embedding::{normalize, EmbeddingEngine, EMBEDDING_DIMENSION};
 use crate::extract::{extract_text, is_supported};
 use crate::model::{IndexFailure, PreparedDocument};
 use crate::storage::Storage;
@@ -24,6 +24,8 @@ const EMBEDDING_BATCH_SIZE: usize = 4;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
+const MAX_SEMANTIC_CHUNKS_PER_DOCUMENT: usize = 4;
+const MAX_SEMANTIC_EMBED_CHARS: usize = 480;
 #[cfg(not(test))]
 const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -485,11 +487,23 @@ fn persist_batch(
     accumulated: &IndexTimings,
 ) -> Result<PersistTimings> {
     let mut timings = PersistTimings::default();
-    let inputs = pending.iter().map(semantic_source).collect::<Vec<_>>();
+    let semantic_chunks = pending
+        .iter()
+        .map(semantic_chunks_for_document)
+        .collect::<Vec<_>>();
+    let inputs = semantic_chunks
+        .iter()
+        .flat_map(|chunks| chunks.iter().map(|(_, text)| text.clone()))
+        .collect::<Vec<_>>();
     let embedding_file = pending
         .iter()
-        .zip(&inputs)
-        .max_by_key(|(_, input)| input.chars().count())
+        .zip(&semantic_chunks)
+        .max_by_key(|(_, chunks)| {
+            chunks
+                .iter()
+                .map(|(_, text)| text.chars().count())
+                .sum::<usize>()
+        })
         .map(|(document, _)| document.path.as_str());
     report_progress(
         progress,
@@ -502,11 +516,23 @@ fn persist_batch(
     let started = Instant::now();
     let embeddings = embedder.embed_passages(&inputs);
     timings.embedding = started.elapsed();
+    let mut embeddings = embeddings.into_iter();
+    let chunk_vectors = semantic_chunks
+        .iter()
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(|(position, _)| {
+                    embeddings.next().map(|embedding| (*position, embedding))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let documents = pending
         .drain(..)
-        .zip(embeddings)
-        .map(|(mut document, embedding)| {
-            document.embedding = embedding;
+        .zip(&chunk_vectors)
+        .map(|(mut document, vectors)| {
+            document.embedding = average_embedding(vectors);
             document
         })
         .collect::<Vec<_>>();
@@ -527,6 +553,18 @@ fn persist_batch(
     let started = Instant::now();
     let chunks = storage.upsert_documents(&documents)?;
     timings.storage = started.elapsed();
+    let chunk_embeddings = chunks
+        .iter()
+        .zip(&chunk_vectors)
+        .flat_map(|(stored_chunks, vectors)| {
+            vectors.iter().filter_map(|(position, embedding)| {
+                stored_chunks
+                    .get(*position)
+                    .map(|chunk| (chunk.id, embedding.clone()))
+            })
+        })
+        .collect::<Vec<_>>();
+    storage.replace_chunk_embeddings(&chunk_embeddings)?;
     let updates = documents
         .iter()
         .zip(&chunks)
@@ -558,53 +596,65 @@ fn persist_batch(
     Ok(timings)
 }
 
-fn semantic_source(document: &PreparedDocument) -> String {
-    const MAX_SEMANTIC_CHARS: usize = 2_000;
-    const PREFIX_CHARS: usize = 800;
-    const SAMPLE_COUNT: usize = 4;
-    let mut source = format!("{}\n", document.name);
-    let body = document_text_chars(&document.chunks);
-    let body_budget = MAX_SEMANTIC_CHARS.saturating_sub(source.chars().count());
-    if body.len() <= body_budget {
-        source.extend(body);
-        source.push('\n');
-        return source;
+fn semantic_chunks_for_document(document: &PreparedDocument) -> Vec<(usize, String)> {
+    let count = document.chunks.len();
+    if count == 0 {
+        return Vec::new();
     }
-
-    let separator_budget = SAMPLE_COUNT + 1;
-    let content_budget = body_budget.saturating_sub(separator_budget);
-    let prefix_length = PREFIX_CHARS.min(content_budget).min(body.len());
-    source.extend(&body[..prefix_length]);
-    let mut remaining = content_budget.saturating_sub(prefix_length);
-    let sample_length = remaining.div_ceil(SAMPLE_COUNT).min(300);
-    let span = body.len().saturating_sub(prefix_length + sample_length);
-    for sample_index in 0..SAMPLE_COUNT {
-        if remaining == 0 {
-            break;
-        }
-        let length = sample_length.min(remaining);
-        let start = prefix_length + span.saturating_mul(sample_index + 1) / SAMPLE_COUNT;
-        let end = (start + length).min(body.len());
-        source.push('\n');
-        source.extend(&body[start..end]);
-        remaining = remaining.saturating_sub(end - start);
-    }
-    source.push('\n');
-    source
+    let sample_count = count.min(MAX_SEMANTIC_CHUNKS_PER_DOCUMENT);
+    (0..sample_count)
+        .map(|sample_index| {
+            let position = if sample_count == 1 {
+                0
+            } else {
+                sample_index * (count - 1) / (sample_count - 1)
+            };
+            (
+                position,
+                semantic_chunk_text(&document.name, &document.chunks[position]),
+            )
+        })
+        .collect()
 }
 
-fn document_text_chars(chunks: &[String]) -> Vec<char> {
-    let mut output = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let chars = chunk.chars().collect::<Vec<_>>();
-        let skip = if index == 0 {
-            0
-        } else {
-            CHUNK_OVERLAP.min(chars.len())
-        };
-        output.extend_from_slice(&chars[skip..]);
+fn semantic_chunk_text(name: &str, text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= MAX_SEMANTIC_EMBED_CHARS {
+        return format!("{name}\n{text}");
     }
-    output
+    let head_length = MAX_SEMANTIC_EMBED_CHARS / 2;
+    let tail_length = MAX_SEMANTIC_EMBED_CHARS - head_length;
+    let head = chars[..head_length].iter().collect::<String>();
+    let tail = chars[chars.len() - tail_length..]
+        .iter()
+        .collect::<String>();
+    format!("{name}\n{head}\n{tail}")
+}
+
+fn average_embedding(vectors: &[(usize, Vec<f32>)]) -> Vec<f32> {
+    if vectors.is_empty() {
+        return Vec::new();
+    }
+    let mut average = vec![0.0; EMBEDDING_DIMENSION];
+    let mut count = 0;
+    for (_, vector) in vectors {
+        if vector.len() != EMBEDDING_DIMENSION {
+            continue;
+        }
+        for (target, value) in average.iter_mut().zip(vector) {
+            *target += value;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+    let divisor = count as f32;
+    for value in &mut average {
+        *value /= divisor;
+    }
+    normalize(&mut average);
+    average
 }
 
 fn flush_parse_jobs(
@@ -950,23 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_source_includes_document_name() {
-        let document = PreparedDocument {
-            id: "id".to_owned(),
-            root: "root".to_owned(),
-            name: "流程.docx".to_owned(),
-            extension: "docx".to_owned(),
-            path: "流程.docx".to_owned(),
-            modified_ms: 0,
-            size: 0,
-            chunks: vec!["第一段".to_owned()],
-            embedding: Vec::new(),
-        };
-        assert_eq!(semantic_source(&document), "流程.docx\n第一段\n");
-    }
-
-    #[test]
-    fn semantic_source_samples_the_end_of_long_documents() {
+    fn semantic_chunks_cover_document_positions_with_a_bound() {
         let document = PreparedDocument {
             id: "id".to_owned(),
             root: "root".to_owned(),
@@ -975,12 +1009,34 @@ mod tests {
             path: "长文档.docx".to_owned(),
             modified_ms: 0,
             size: 0,
-            chunks: split_chunks(&format!("{}结尾关键内容", "前".repeat(6_000))),
+            chunks: (0..20).map(|index| format!("片段 {index}")).collect(),
             embedding: Vec::new(),
         };
-        let source = semantic_source(&document);
-        assert!(source.contains("结尾关键内容"));
-        assert!(source.chars().count() <= 2_000);
+        let samples = semantic_chunks_for_document(&document);
+        assert_eq!(samples.len(), MAX_SEMANTIC_CHUNKS_PER_DOCUMENT);
+        assert_eq!(samples.first().map(|sample| sample.0), Some(0));
+        assert_eq!(samples.last().map(|sample| sample.0), Some(19));
+    }
+
+    #[test]
+    fn semantic_chunk_text_preserves_both_ends_within_embedding_budget() {
+        let text = format!("开头{}结尾", "中".repeat(800));
+        let value = semantic_chunk_text("测试.txt", &text);
+        assert!(value.chars().count() <= "测试.txt".chars().count() + MAX_SEMANTIC_EMBED_CHARS + 2);
+        assert!(value.starts_with("测试.txt\n开头"));
+        assert!(value.ends_with("结尾"));
+    }
+
+    #[test]
+    fn average_embedding_combines_and_normalizes_chunk_vectors() {
+        let first = vec![1.0; EMBEDDING_DIMENSION];
+        let second = vec![-1.0; EMBEDDING_DIMENSION];
+        let average = average_embedding(&[(0, first.clone()), (1, first)]);
+        assert!((average.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() < 0.0001);
+        assert!(average.iter().all(|value| *value > 0.0));
+        assert!(average_embedding(&[(0, second)])
+            .iter()
+            .all(|value| *value < 0.0));
     }
 
     #[test]

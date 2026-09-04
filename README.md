@@ -60,9 +60,9 @@ NSIS 安装器升级前会自动关闭旧版桌面进程和搜索核心，避免
 - Windows：`%LOCALAPPDATA%\com.localfind.desktop\`
 - macOS：`~/Library/Application Support/com.localfind.desktop/`
 
-其中 `search.db` 保存文件元数据、失败记录和文档级向量，`tantivy/` 保存全文倒排索引。Windows 安装版的失败记录位于 `%LOCALAPPDATA%\\com.localfind.desktop\\search.db` 的 `failures` 表中，也可直接在界面点击“失败”查看；开发运行时对应项目目录下的 `.filesearch-data\\search.db`。EmbeddingRWKV Tiny 文本 ONNX 模型随 Windows 安装包内置，应用只读取源文件，不会修改、移动或删除源文件。
+其中 `search.db` 保存文件元数据、失败记录、文档向量和有界片段向量，`tantivy/` 保存全文倒排索引。Windows 安装版的失败记录位于 `%LOCALAPPDATA%\\com.localfind.desktop\\search.db` 的 `failures` 表中，也可直接在界面点击“失败”查看；开发运行时对应项目目录下的 `.filesearch-data\\search.db`。EmbeddingRWKV Tiny 文本 ONNX 模型随 Windows 安装包内置，应用只读取源文件，不会修改、移动或删除源文件。
 
-语义索引使用内置的 `EmbeddingRWKV Tiny` 模型（768 维），采用官方 World Tokenizer、EOS 结尾标记和 `[RETR]` 检索头；每个文档只对文件名及最多约 2,000 字符代表内容编码一次，代表内容由正文开头和均匀分布的后续段落组成，正文分块仍由 Tantivy 提供关键词定位。模型和推理均在本机完成，文档内容不会上传，也不会从网络下载模型。模型文件缺失或推理失败时，会自动使用离线中文词项向量，关键词检索和索引服务仍可用。
+语义索引使用内置的 `EmbeddingRWKV Tiny` 模型（768 维），采用官方 World Tokenizer、EOS 结尾标记和 `[RETR]` 检索头；每个文档除代表内容向量外，最多对 4 个均匀覆盖首、中、尾部的正文片段生成向量。语义结果使用真正命中的片段作为摘要，并结合双字词覆盖度、文件名匹配和最低相关度门槛抑制高分噪声；混合模式仍以 BM25 为主。模型和推理均在本机完成，文档内容不会上传，也不会从网络下载模型。模型文件缺失或推理失败时，会自动使用离线中文词项向量，关键词检索和索引服务仍可用。
 
 完全离线环境可在启动前设置 `FILESEARCH_EMBEDDING_OFFLINE=1`，直接使用离线特征。
 
@@ -72,7 +72,7 @@ Windows 安装包同时包含 CPU 和 NVIDIA CUDA 版 ONNX Runtime。启动时�
 
 - SQLite 使用 WAL、动态 Token 批处理 Embedding 和批量事务写入，索引过程内存有界；文档解析使用最多 4 个工作线程。
 - Tantivy 只保存分段词项与定位 ID，正文和状态由 SQLite 管理，避免 JSON 全量读写。
-- 语义层保存每个文档一个 768 维向量；5 万文档约 146 MB 原始向量数据，服务启动时载入内存并行扫描，与 Tantivy 候选融合。
+- 语义层保存每个文档一个代表向量和最多 4 个片段向量；服务启动时载入内存并行扫描，与 Tantivy 候选融合。片段数量有上限，避免按全部正文片段生成向量导致存储与首次索引时间失控。
 - 文件监听自动合并短时间内的批量变化；共享盘断线时保留已有结果，恢复后自动补扫。
 - 关键词查询跳过向量读取，单文件增量事件只读取轻量路径映射，避免在 5 万文件规模下反复载入约 146 MB 向量。
 

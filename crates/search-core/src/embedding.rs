@@ -13,9 +13,10 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 pub const EMBEDDING_DIMENSION: usize = 768;
-pub const EMBEDDING_PROFILE: &str = "rwkv-document-source-v3";
+pub const EMBEDDING_PROFILE: &str = "rwkv-document-chunks-v1";
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
 const EOS_TOKEN_ID: i64 = 65535;
 const INFERENCE_MAX_BATCH_SIZE: usize = 4;
@@ -251,85 +252,89 @@ unsafe fn rwkv7_forward_batch_avx2(
     let mut head_outputs = (0..RWKV_HEAD_COUNT)
         .map(|_| vec![0.0_f32; token_count * RWKV_HEAD_SIZE])
         .collect::<Vec<_>>();
-    head_outputs
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(head_index, head_output)| {
-            let mut state = vec![0.0_f32; RWKV_HEAD_SIZE * RWKV_HEAD_SIZE];
-            let state_offset = 0;
-            for token_index in 0..token_count {
-                let token_offset = token_index * EMBEDDING_DIMENSION;
-                let vector_offset = token_offset + head_index * RWKV_HEAD_SIZE;
-                let mut projection = [0.0_f32; RWKV_HEAD_SIZE];
-                for row in 0..RWKV_HEAD_SIZE {
-                    let row_offset = state_offset + row * RWKV_HEAD_SIZE;
-                    let mut projected = _mm256_setzero_ps();
-                    for column in (0..RWKV_HEAD_SIZE).step_by(8) {
-                        let state_ptr = state.as_mut_ptr().add(row_offset + column);
-                        let decayed = _mm256_mul_ps(
-                            _mm256_loadu_ps(state_ptr),
-                            _mm256_loadu_ps(decay.as_ptr().add(vector_offset + column)),
-                        );
-                        _mm256_storeu_ps(state_ptr, decayed);
-                        projected = _mm256_add_ps(
-                            projected,
-                            _mm256_mul_ps(
-                                decayed,
-                                _mm256_loadu_ps(
-                                    in_context_key.as_ptr().add(vector_offset + column),
-                                ),
-                            ),
-                        );
-                    }
-                    let halves = _mm_add_ps(
-                        _mm256_castps256_ps128(projected),
-                        _mm256_extractf128_ps(projected, 1),
-                    );
-                    let pairs = _mm_hadd_ps(halves, halves);
-                    let singles = _mm_hadd_ps(pairs, pairs);
-                    projection[row] = _mm_cvtss_f32(singles);
-                }
-                for row in 0..RWKV_HEAD_SIZE {
-                    let row_offset = state_offset + row * RWKV_HEAD_SIZE;
-                    let projection_value = _mm256_set1_ps(projection[row]);
-                    let value_value = _mm256_set1_ps(value[vector_offset + row]);
-                    let mut mixed = _mm256_setzero_ps();
-                    for column in (0..RWKV_HEAD_SIZE).step_by(8) {
-                        let state_ptr = state.as_mut_ptr().add(row_offset + column);
-                        let updated = _mm256_add_ps(
-                            _mm256_loadu_ps(state_ptr),
-                            _mm256_add_ps(
+    rwkv_pool().install(|| {
+        head_outputs
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(head_index, head_output)| {
+                let mut state = vec![0.0_f32; RWKV_HEAD_SIZE * RWKV_HEAD_SIZE];
+                let state_offset = 0;
+                for token_index in 0..token_count {
+                    let token_offset = token_index * EMBEDDING_DIMENSION;
+                    let vector_offset = token_offset + head_index * RWKV_HEAD_SIZE;
+                    let mut projection = [0.0_f32; RWKV_HEAD_SIZE];
+                    for row in 0..RWKV_HEAD_SIZE {
+                        let row_offset = state_offset + row * RWKV_HEAD_SIZE;
+                        let mut projected = _mm256_setzero_ps();
+                        for column in (0..RWKV_HEAD_SIZE).step_by(8) {
+                            let state_ptr = state.as_mut_ptr().add(row_offset + column);
+                            let decayed = _mm256_mul_ps(
+                                _mm256_loadu_ps(state_ptr),
+                                _mm256_loadu_ps(decay.as_ptr().add(vector_offset + column)),
+                            );
+                            _mm256_storeu_ps(state_ptr, decayed);
+                            projected = _mm256_add_ps(
+                                projected,
                                 _mm256_mul_ps(
-                                    projection_value,
+                                    decayed,
                                     _mm256_loadu_ps(
-                                        in_context_value.as_ptr().add(vector_offset + column),
+                                        in_context_key.as_ptr().add(vector_offset + column),
                                     ),
                                 ),
-                                _mm256_mul_ps(
-                                    value_value,
-                                    _mm256_loadu_ps(key.as_ptr().add(vector_offset + column)),
-                                ),
-                            ),
+                            );
+                        }
+                        let halves = _mm_add_ps(
+                            _mm256_castps256_ps128(projected),
+                            _mm256_extractf128_ps(projected, 1),
                         );
-                        _mm256_storeu_ps(state_ptr, updated);
-                        mixed = _mm256_add_ps(
-                            mixed,
-                            _mm256_mul_ps(
-                                updated,
-                                _mm256_loadu_ps(receptance.as_ptr().add(vector_offset + column)),
-                            ),
-                        );
+                        let pairs = _mm_hadd_ps(halves, halves);
+                        let singles = _mm_hadd_ps(pairs, pairs);
+                        projection[row] = _mm_cvtss_f32(singles);
                     }
-                    let halves = _mm_add_ps(
-                        _mm256_castps256_ps128(mixed),
-                        _mm256_extractf128_ps(mixed, 1),
-                    );
-                    let pairs = _mm_hadd_ps(halves, halves);
-                    let singles = _mm_hadd_ps(pairs, pairs);
-                    head_output[token_index * RWKV_HEAD_SIZE + row] = _mm_cvtss_f32(singles);
+                    for row in 0..RWKV_HEAD_SIZE {
+                        let row_offset = state_offset + row * RWKV_HEAD_SIZE;
+                        let projection_value = _mm256_set1_ps(projection[row]);
+                        let value_value = _mm256_set1_ps(value[vector_offset + row]);
+                        let mut mixed = _mm256_setzero_ps();
+                        for column in (0..RWKV_HEAD_SIZE).step_by(8) {
+                            let state_ptr = state.as_mut_ptr().add(row_offset + column);
+                            let updated = _mm256_add_ps(
+                                _mm256_loadu_ps(state_ptr),
+                                _mm256_add_ps(
+                                    _mm256_mul_ps(
+                                        projection_value,
+                                        _mm256_loadu_ps(
+                                            in_context_value.as_ptr().add(vector_offset + column),
+                                        ),
+                                    ),
+                                    _mm256_mul_ps(
+                                        value_value,
+                                        _mm256_loadu_ps(key.as_ptr().add(vector_offset + column)),
+                                    ),
+                                ),
+                            );
+                            _mm256_storeu_ps(state_ptr, updated);
+                            mixed = _mm256_add_ps(
+                                mixed,
+                                _mm256_mul_ps(
+                                    updated,
+                                    _mm256_loadu_ps(
+                                        receptance.as_ptr().add(vector_offset + column),
+                                    ),
+                                ),
+                            );
+                        }
+                        let halves = _mm_add_ps(
+                            _mm256_castps256_ps128(mixed),
+                            _mm256_extractf128_ps(mixed, 1),
+                        );
+                        let pairs = _mm_hadd_ps(halves, halves);
+                        let singles = _mm_hadd_ps(pairs, pairs);
+                        head_output[token_index * RWKV_HEAD_SIZE + row] = _mm_cvtss_f32(singles);
+                    }
                 }
-            }
-        });
+            });
+    });
     for token_index in 0..token_count {
         let output_offset = token_index * EMBEDDING_DIMENSION;
         let head_offset = token_index * RWKV_HEAD_SIZE;
@@ -339,6 +344,21 @@ unsafe fn rwkv7_forward_batch_avx2(
                 .copy_from_slice(&head_output[head_offset..head_offset + RWKV_HEAD_SIZE]);
         }
     }
+}
+
+fn rwkv_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let thread_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(1, 8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .thread_name(|index| format!("filesearch-rwkv-{index}"))
+            .build()
+            .expect("无法创建 EmbeddingRWKV 线程池")
+    })
 }
 
 struct RwkvModel {
