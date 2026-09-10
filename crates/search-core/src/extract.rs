@@ -112,7 +112,10 @@ fn extract_ooxml(path: &Path, kind: OoxmlKind) -> Result<String> {
         let mut entry = archive.by_name(&name)?;
         let mut xml = String::new();
         entry.read_to_string(&mut xml)?;
-        let extracted = xml_text(&xml)?;
+        let extracted = match kind {
+            OoxmlKind::Word => word_xml_text(&xml)?,
+            _ => xml_text(&xml)?,
+        };
         if !extracted.is_empty() {
             output.push_str(&extracted);
             output.push('\n');
@@ -156,6 +159,39 @@ fn xml_text(xml: &str) -> Result<String> {
     Ok(output)
 }
 
+fn word_xml_text(xml: &str) -> Result<String> {
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    let mut output = String::new();
+    let mut in_text = false;
+    loop {
+        let (namespace, event) = reader.read_resolved_event()?;
+        let is_word = matches!(namespace, quick_xml::name::ResolveResult::Bound(namespace)
+            if matches!(namespace.as_ref(),
+                b"http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                | b"http://purl.oclc.org/ooxml/wordprocessingml/main"));
+        match event {
+            Event::Start(start) if is_word && start.local_name().as_ref() == b"t" => {
+                in_text = true;
+            }
+            Event::Text(text) if in_text => output.push_str(&text.unescape()?),
+            Event::End(end) if is_word => match end.local_name().as_ref() {
+                b"t" => in_text = false,
+                b"p" | b"tr" => output.push('\n'),
+                b"tc" => output.push(' '),
+                _ => {}
+            },
+            Event::Empty(start) if is_word => match start.local_name().as_ref() {
+                b"tab" => output.push(' '),
+                b"br" | b"cr" => output.push('\n'),
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(output)
+}
+
 fn normalize_text(value: &str) -> String {
     value
         .lines()
@@ -176,6 +212,46 @@ mod tests {
             .unwrap();
         assert!(value.contains("本地搜索"));
         assert!(value.contains("MVP"));
+    }
+
+    #[test]
+    fn word_fields_preserve_display_text_and_run_boundaries() {
+        let xml = r#"<x:document xmlns:x="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <x:p><x:r><x:instrText>TOC HYPERLINK PAGEREF _Toc123</x:instrText></x:r>
+          <x:hyperlink><x:r><x:t>目录标题</x:t></x:r></x:hyperlink>
+          <x:fldSimple x:instr="PAGE"><x:r><x:t>1</x:t></x:r></x:fldSimple></x:p>
+          <x:p><x:r><x:t>数据</x:t></x:r><x:r><x:t>备份</x:t></x:r>
+          <x:r><x:tab/><x:t xml:space="preserve"> TOC 是正文术语 &amp; 示例</x:t><x:br/><x:t>下一行</x:t></x:r></x:p>
+        </x:document>"#;
+        let text = word_xml_text(xml).unwrap();
+        assert!(text.contains("目录标题1\n"));
+        assert!(text.contains("数据备份"));
+        assert!(text.contains("TOC 是正文术语 & 示例\n下一行"));
+        assert!(!text.contains("PAGEREF"));
+        assert!(!text.contains("_Toc123"));
+    }
+
+    #[test]
+    fn docx_extraction_discards_instructions_but_keeps_field_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fields.docx");
+        let mut archive = zip::ZipWriter::new(File::create(&path).unwrap());
+        archive
+            .start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(
+                br#"<document xmlns="http://purl.oclc.org/ooxml/wordprocessingml/main">
+          <p><r><instrText>PAGEREF _Toc123</instrText></r><r><t>7</t></r></p>
+          <p><r><t>Data</t></r><r><t xml:space="preserve"> backup</t></r></p>
+        </document>"#,
+            )
+            .unwrap();
+        archive.finish().unwrap();
+        assert_eq!(extract_text(&path).unwrap(), "7\nData backup");
     }
 
     #[test]

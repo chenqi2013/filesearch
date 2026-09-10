@@ -1,4 +1,4 @@
-use crate::embedding::lexical_text;
+use crate::embedding::{lexical_text, query_terms};
 use crate::model::{StoredChunk, StoredDocument};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -143,7 +143,7 @@ impl TextIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<KeywordHit>> {
-        let query = lexical_text(query);
+        let query = query_terms(query).join(" ");
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -199,5 +199,8 @@ mod tests {
         index.commit().unwrap();
         let hits = index.search("本地搜索", 10).unwrap();
         assert_eq!(hits.first().map(|hit| hit.chunk_id), Some(1));
+        assert!(index.search("如何制作搜索引擎蛋糕", 10).is_ok());
+        assert!(index.search("本年度天气预报", 10).unwrap().is_empty());
+        assert!(!index.search("本", 10).unwrap().is_empty());
     }
 }

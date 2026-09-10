@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-unpadded-document-chunks-v3";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-unpadded-clean-word-v4";
 const MAX_SEQUENCE_LENGTH: usize = 1024;
 const INFERENCE_MAX_BATCH_SIZE: usize = 4;
 const INFERENCE_MAX_PADDED_TOKENS: usize = 2_048;
@@ -416,6 +416,38 @@ pub fn lexical_terms(text: &str) -> Vec<String> {
     let mut values = tokens(text).into_iter().collect::<Vec<_>>();
     values.sort_unstable();
     values
+}
+
+pub fn query_terms(text: &str) -> Vec<String> {
+    let single_character = text.trim().chars().count() == 1;
+    lexical_terms(text)
+        .into_iter()
+        .filter(|term| single_character || term.chars().count() >= 2)
+        .filter(|term| {
+            !matches!(
+                term.as_str(),
+                "什么"
+                    | "怎么"
+                    | "如何"
+                    | "哪些"
+                    | "哪个"
+                    | "是否"
+                    | "可以"
+                    | "需要"
+                    | "应该"
+                    | "为什么"
+                    | "有没有"
+                    | "这个"
+                    | "那个"
+                    | "the"
+                    | "is"
+                    | "are"
+                    | "of"
+                    | "to"
+                    | "and"
+            )
+        })
+        .collect()
 }
 
 pub fn lexical_text(text: &str) -> String {

@@ -1,4 +1,4 @@
-use crate::embedding::{lexical_terms, EmbeddingEngine};
+use crate::embedding::{query_terms, EmbeddingEngine};
 use crate::model::{SearchMode, SearchRequest, SearchResult, StoredDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
@@ -16,6 +16,8 @@ struct Candidate {
 const SEMANTIC_SNIPPET_SCAN_LIMIT: usize = 1;
 const RAW_SEMANTIC_MIN_SCORE: f32 = 0.24;
 const SEMANTIC_RESULT_MIN_SCORE: f32 = 0.36;
+const KEYWORD_MIN_COVERAGE: f32 = 0.25;
+const SEMANTIC_ONLY_MIN_SCORE: f32 = 0.50;
 
 pub fn search(
     storage: &Storage,
@@ -38,6 +40,7 @@ pub fn search(
         .collect::<HashMap<_, _>>();
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     let mut keyword_snippets = HashMap::new();
+    let terms = query_terms(&request.query);
     let candidate_limit = (request.limit.clamp(1, 100) * 20).clamp(200, 1_000);
 
     let hits = text_index.search(&request.query, candidate_limit)?;
@@ -50,7 +53,11 @@ pub fn search(
         let Some(chunk) = storage.chunk(hit.chunk_id)? else {
             continue;
         };
-        if !by_id.contains_key(chunk.document_id.as_str()) {
+        let Some(document) = by_id.get(chunk.document_id.as_str()) else {
+            continue;
+        };
+        let coverage = term_coverage(&terms, &format!("{} {}", document.name, chunk.text));
+        if !keyword_is_relevant(&terms, coverage) {
             continue;
         }
         keyword_snippets
@@ -117,11 +124,15 @@ pub fn search(
                 .semantic_snippet
                 .as_deref()
                 .unwrap_or(document.name.as_str());
-            let lexical_relevance = lexical_relevance(
-                &request.query,
-                &format!("{} {semantic_text}", document.name),
-            );
+            let lexical_relevance =
+                term_coverage(&terms, &format!("{} {semantic_text}", document.name));
             let calibrated_semantic = candidate.semantic * 0.72 + lexical_relevance * 0.28;
+            if candidate.keyword == 0.0
+                && filename_boost == 0.0
+                && candidate.semantic < SEMANTIC_ONLY_MIN_SCORE
+            {
+                return None;
+            }
             let score = match request.mode {
                 SearchMode::Keyword => candidate.keyword,
                 SearchMode::Semantic => calibrated_semantic + candidate.keyword * 0.18,
@@ -143,7 +154,12 @@ pub fn search(
             (score >= threshold).then_some((document_id, score, matched_text))
         })
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     ranked.truncate(request.limit.clamp(1, 100));
 
     let mut results = Vec::with_capacity(ranked.len());
@@ -167,21 +183,33 @@ pub fn search(
     Ok(results)
 }
 
-fn lexical_relevance(query: &str, text: &str) -> f32 {
-    let query_terms = lexical_terms(query)
-        .into_iter()
-        .filter(|term| term.chars().count() >= 2)
-        .collect::<Vec<_>>();
+fn keyword_is_relevant(terms: &[String], coverage: f32) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let minimum_matches = (terms.len() as f32 * KEYWORD_MIN_COVERAGE)
+        .ceil()
+        .min(4.0)
+        .max(terms.len().min(2) as f32);
+    (coverage * terms.len() as f32).round() >= minimum_matches
+}
+
+fn term_coverage(query_terms: &[String], text: &str) -> f32 {
     if query_terms.is_empty() {
         return 0.0;
     }
-    let text_terms = lexical_terms(text)
-        .into_iter()
-        .filter(|term| term.chars().count() >= 2)
-        .collect::<std::collections::HashSet<_>>();
+    let lower = text.to_lowercase();
     let matched = query_terms
         .iter()
-        .filter(|term| text_terms.contains(*term))
+        .filter(|term| {
+            if term.is_ascii() {
+                lower
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .any(|word| word == term.as_str())
+            } else {
+                lower.contains(term.as_str())
+            }
+        })
         .count();
     matched as f32 / query_terms.len() as f32
 }
@@ -231,9 +259,88 @@ mod tests {
 
     #[test]
     fn lexical_relevance_rewards_matching_semantic_snippets() {
-        let related = lexical_relevance("软件需求规格说明书", "项目软件需求规格说明书模板");
-        let unrelated = lexical_relevance("软件需求规格说明书", "新能源功率预测模型");
+        let terms = query_terms("软件需求规格说明书");
+        let related = term_coverage(&terms, "项目软件需求规格说明书模板");
+        let unrelated = term_coverage(&terms, "新能源功率预测模型");
         assert!(related > 0.9);
         assert_eq!(unrelated, 0.0);
+    }
+
+    #[test]
+    fn weak_keywords_do_not_become_relevant_by_normalization() {
+        let terms = query_terms("深海潜水装备保养步骤");
+        let coverage = term_coverage(&terms, "软件安装步骤");
+        assert!(!keyword_is_relevant(&terms, coverage));
+        assert!(!keyword_is_relevant(&[], 0.0));
+        let terms = query_terms("时间");
+        assert!(keyword_is_relevant(
+            &terms,
+            term_coverage(&terms, "完成时间")
+        ));
+        let terms = query_terms("电");
+        assert!(keyword_is_relevant(
+            &terms,
+            term_coverage(&terms, "电力系统")
+        ));
+        let terms = query_terms("数据备份 恢复");
+        assert!(keyword_is_relevant(
+            &terms,
+            term_coverage(&terms, "数据库备份和恢复")
+        ));
+    }
+
+    #[test]
+    fn keyword_search_filters_noise_without_losing_short_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let document = crate::model::PreparedDocument {
+            id: "backup".to_owned(),
+            root: "/test".to_owned(),
+            path: "/test/备份.txt".to_owned(),
+            name: "数据库备份.txt".to_owned(),
+            extension: "txt".to_owned(),
+            modified_ms: 1,
+            size: 100,
+            chunks: vec!["数据库备份操作步骤与恢复时间，每日定时执行。".to_owned()],
+            embedding: crate::embedding::fallback_embed("数据库备份"),
+        };
+        let chunks = storage.upsert_document(&document).unwrap();
+        index
+            .replace_document(&document.id, &document.name, &chunks)
+            .unwrap();
+        index.commit().unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("unused-model"));
+        for (query, expected) in [
+            ("深海潜水装备保养步骤", 0),
+            ("", 0),
+            ("时间", 1),
+            ("备", 1),
+            ("数据库备份", 1),
+        ] {
+            let request = SearchRequest {
+                query: query.to_owned(),
+                mode: SearchMode::Keyword,
+                extension: None,
+                limit: 50,
+            };
+            assert_eq!(
+                search(&storage, &index, &engine, &request).unwrap().len(),
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_preserves_token_boundaries_and_long_question_recall() {
+        assert_eq!(term_coverage(&query_terms("cat"), "concatenate"), 0.0);
+        assert_eq!(term_coverage(&query_terms("cat"), "CAT.txt"), 1.0);
+        assert_eq!(term_coverage(&query_terms("备份"), "备 份"), 0.0);
+        let terms = (0..30)
+            .map(|index| format!("term{index}"))
+            .collect::<Vec<_>>();
+        assert!(keyword_is_relevant(&terms, 4.0 / 30.0));
+        assert!(!keyword_is_relevant(&terms, 1.0 / 30.0));
     }
 }
