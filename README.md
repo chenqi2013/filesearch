@@ -7,7 +7,7 @@
 - 添加、移除一个或多个本地索引目录
 - PDF、DOCX、XLSX、PPTX、TXT、MD、CSV、JSON、LOG、RST 文本抽取
 - SQLite WAL 文件元数据 + Tantivy BM25 分段倒排索引，可面向 5,000–50,000 个文件
-- Qwen3-Embedding-0.6B INT8 本地 ONNX Embedding，支持关键词、语义、混合三种检索模式
+- EmbeddingRWKV Tiny 本地 ONNX Embedding，支持关键词、语义、混合三种检索模式
 - 按文件大小和修改时间增量重建，文件变化 900 ms 去抖后后台自动更新
 - 文件类型过滤、命中片段、相关度、大小和修改时间
 - 打开原文件、在资源管理器中定位文件
@@ -60,9 +60,9 @@ NSIS 安装器升级前会自动关闭旧版桌面进程和搜索核心，避免
 - Windows：`%LOCALAPPDATA%\com.localfind.desktop\`
 - macOS：`~/Library/Application Support/com.localfind.desktop/`
 
-其中 `search.db` 保存文件元数据、失败记录、文档向量和有界片段向量，`tantivy/` 保存全文倒排索引。Windows 安装版的失败记录位于 `%LOCALAPPDATA%\\com.localfind.desktop\\search.db` 的 `failures` 表中，也可直接在界面点击“失败”查看；开发运行时对应项目目录下的 `.filesearch-data\\search.db`。Qwen3-Embedding-0.6B INT8 ONNX 模型随 Windows 安装包内置，应用只读取源文件，不会修改、移动或删除源文件。
+其中 `search.db` 保存文件元数据、失败记录、文档向量和有界片段向量，`tantivy/` 保存全文倒排索引。Windows 安装版的失败记录位于 `%LOCALAPPDATA%\\com.localfind.desktop\\search.db` 的 `failures` 表中，也可直接在界面点击“失败”查看；开发运行时对应项目目录下的 `.filesearch-data\\search.db`。EmbeddingRWKV Tiny ONNX 模型随 Windows 安装包内置，应用只读取源文件，不会修改、移动或删除源文件。
 
-语义索引使用内置的 `Qwen3-Embedding-0.6B INT8` 模型（1024 维），采用官方 tokenizer、查询指令模板和 last-token pooling；每个文档除代表内容向量外，最多对 4 个均匀覆盖首、中、尾部的正文片段生成向量。语义结果使用真正命中的片段作为摘要，并结合双字词覆盖度、文件名匹配和最低相关度门槛抑制高分噪声；混合模式仍以 BM25 为主。模型和推理均在本机完成，文档内容不会上传，也不会从网络下载模型。模型文件缺失或推理失败时，会自动使用离线中文词项向量，关键词检索和索引服务仍可用。
+语义索引使用内置的 `EmbeddingRWKV Tiny` 模型（RWKV7、768 维），采用官方 World 词表、单个 EOS 和 L2 归一化；查询不添加指令，输入最多 1024 tokens（包含 EOS）。桌面端与基准测试共用已校正的 Rust WKV 实现，仅将相同 token 长度的文本组批，避免补零污染循环状态。每个文档除代表内容向量外，最多对 4 个均匀覆盖首、中、尾部的正文片段生成向量。语义结果使用真正命中的片段作为摘要，并结合双字词覆盖度、文件名匹配和最低相关度门槛抑制高分噪声；混合模式仍以 BM25 为主。首次切换模型启动时，应用会清除不兼容的旧向量并为已添加目录自动重建索引。模型和推理均在本机完成，文档内容不会上传，也不会从网络下载模型。模型文件缺失或推理失败时，会自动使用离线中文词项向量，关键词检索和索引服务仍可用。
 
 完全离线环境可在启动前设置 `FILESEARCH_EMBEDDING_OFFLINE=1`，直接使用离线特征。
 

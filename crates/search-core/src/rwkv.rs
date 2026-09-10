@@ -370,12 +370,27 @@ pub struct RwkvModel {
 
 impl RwkvModel {
     pub fn load(model_path: &Path) -> Result<Self> {
+        Self::load_backend(model_path, false)
+    }
+
+    pub fn load_with_cuda(model_path: &Path) -> Result<Self> {
+        Self::load_backend(model_path, true)
+    }
+
+    fn load_backend(model_path: &Path, use_cuda: bool) -> Result<Self> {
         let operators = OperatorDomain::new("com.localfind")?.add(Rwkv7Operator)?;
-        let session = Session::builder()?
+        let mut builder = Session::builder()?
             .with_operators(operators)?
             .with_intra_threads(4)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path)?;
+            .with_optimization_level(GraphOptimizationLevel::Level3)?;
+        if use_cuda {
+            builder = builder.with_execution_providers([
+                ort::execution_providers::CUDAExecutionProvider::default()
+                    .build()
+                    .error_on_failure(),
+            ])?;
+        }
+        let session = builder.commit_from_file(model_path)?;
         Ok(Self { session })
     }
 

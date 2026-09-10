@@ -122,10 +122,11 @@ function prepareMsvcRuntime() {
 }
 
 function prepareEmbeddingModel() {
-  const source = resolve(root, "assets", "models", "qwen3-embedding-0.6b");
-  const destination = resolve(root, "target", release ? "release" : "debug", "models", "qwen3-embedding-0.6b");
-  const modelFile = resolve(destination, "model_int8.onnx");
-  if (!existsSync(modelFile) || fileSize(modelFile) !== fileSize(resolve(source, "model_int8.onnx"))) {
+  const source = resolve(root, "assets", "models", "embedding-rwkv-tiny");
+  const destination = resolve(root, "target", release ? "release" : "debug", "models", "embedding-rwkv-tiny");
+  const modelFile = resolve(destination, "model.onnx");
+  if (!existsSync(modelFile) || fileSize(modelFile) !== fileSize(resolve(source, "model.onnx"))
+    || !existsSync(resolve(destination, "rwkv_vocab.bin"))) {
     cpSync(source, destination, { recursive: true, force: true });
   }
 }

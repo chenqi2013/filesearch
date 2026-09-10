@@ -4,6 +4,7 @@ mod embedding;
 mod extract;
 mod indexer;
 mod model;
+mod rwkv;
 mod search;
 mod storage;
 mod text_index;
@@ -139,8 +140,8 @@ async fn main() -> anyhow::Result<()> {
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(PathBuf::from))
-            .map(|path| path.join("models").join("qwen3-embedding-0.6b"))
-            .unwrap_or_else(|| args.data_dir.join("models").join("qwen3-embedding-0.6b"))
+            .map(|path| path.join("models").join("embedding-rwkv-tiny"))
+            .unwrap_or_else(|| args.data_dir.join("models").join("embedding-rwkv-tiny"))
     });
     let embedder = Arc::new(EmbeddingEngine::new(model_dir));
     let state = Arc::new(AppState {
@@ -162,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
 
     let directories = state.storage.directories()?;
     let profile_changed = !state.storage.embedding_profile_matches()?;
-    if profile_changed && !directories.is_empty() {
+    if profile_changed {
         state.storage.clear_embeddings()?;
     }
     if (migrated || profile_changed || state.storage.missing_embedding_count()? > 0)

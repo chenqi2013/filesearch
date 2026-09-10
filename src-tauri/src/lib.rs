@@ -27,7 +27,7 @@ async fn ensure_search_core(app: AppHandle, state: State<'_, CoreProcess>) -> Re
         .resource_dir()
         .map_err(|error| error.to_string())?
         .join("models")
-        .join("qwen3-embedding-0.6b");
+        .join("embedding-rwkv-tiny");
     let sidecar_path = std::env::current_exe()
         .map_err(|error| error.to_string())?
         .parent()
