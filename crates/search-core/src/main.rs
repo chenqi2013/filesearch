@@ -139,8 +139,8 @@ async fn main() -> anyhow::Result<()> {
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(PathBuf::from))
-            .map(|path| path.join("models").join("embedding-rwkv-tiny"))
-            .unwrap_or_else(|| args.data_dir.join("models").join("embedding-rwkv-tiny"))
+            .map(|path| path.join("models").join("qwen3-embedding-0.6b"))
+            .unwrap_or_else(|| args.data_dir.join("models").join("qwen3-embedding-0.6b"))
     });
     let embedder = Arc::new(EmbeddingEngine::new(model_dir));
     let state = Arc::new(AppState {

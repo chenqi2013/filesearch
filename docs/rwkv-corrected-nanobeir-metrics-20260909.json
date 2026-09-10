@@ -1,0 +1,126 @@
+{
+  "sentence_transformers_revision": "7d52a069e0b37d976b3ed3f674a6180436c27574",
+  "source_url": "https://raw.githubusercontent.com/UKPLab/sentence-transformers/7d52a069e0b37d976b3ed3f674a6180436c27574/sentence_transformers/evaluation/InformationRetrievalEvaluator.py",
+  "source_sha256": "94e15da68f3dc5eeb318477f51e6000fe3151b8faf563d8715a91b3e60953910",
+  "results_sha256": "7991a452c3a79384bb62c065ca8d80a4f48f2acd4b89238237902a5c9c4c26dc",
+  "complete_benchmark": true,
+  "comparisons": [
+    {
+      "name": "SciFact",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "ArguAna",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "ClimateFEVER",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 5.551115123125783e-17,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "DBPedia",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 5.551115123125783e-17,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "FEVER",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 1.1102230246251565e-16,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "FiQA2018",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "HotpotQA",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "MSMARCO",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "NFCorpus",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "NQ",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "QuoraRetrieval",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "SCIDOCS",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 0.0,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    },
+    {
+      "name": "Touche2020",
+      "differences": {
+        "ndcg@10": 0.0,
+        "recall@10": 2.7755575615628914e-17,
+        "accuracy@1": 0.0,
+        "hit_rate@10": 0.0
+      }
+    }
+  ]
+}

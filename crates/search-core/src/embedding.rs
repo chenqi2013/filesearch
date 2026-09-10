@@ -1,369 +1,34 @@
 use anyhow::{Context, Result};
 use ort::execution_providers::CUDAExecutionProvider;
-use ort::operator::{
-    io::{OperatorInput, OperatorOutput},
-    kernel::{Kernel, KernelAttributes, KernelContext},
-    Operator, OperatorDomain,
+use ort::memory::Allocator;
+use ort::session::{
+    builder::GraphOptimizationLevel,
+    run_options::{OutputSelector, RunOptions},
+    Session, SessionInputValue,
 };
-use ort::session::{builder::GraphOptimizationLevel, Session};
-use ort::tensor::TensorElementType;
 use ort::value::Tensor;
 use parking_lot::{Mutex, RwLock};
-use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use tokenizers::{Tokenizer, TruncationParams};
 
-pub const EMBEDDING_DIMENSION: usize = 768;
-pub const EMBEDDING_PROFILE: &str = "rwkv-document-chunks-v1";
-const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
-const EOS_TOKEN_ID: i64 = 65535;
-const INFERENCE_MAX_BATCH_SIZE: usize = 4;
-const INFERENCE_MAX_PADDED_TOKENS: usize = 8_192;
-const RWKV_HEAD_COUNT: usize = 12;
-const RWKV_HEAD_SIZE: usize = 64;
+pub const EMBEDDING_DIMENSION: usize = 1024;
+pub const EMBEDDING_PROFILE: &str = "qwen3-embedding-0.6b-int8-document-chunks-v1";
+const MODEL_NAME: &str = "Qwen3-Embedding-0.6B INT8";
+const QUERY_INSTRUCTION: &str =
+    "Given a user query, retrieve relevant passages from local documents that answer the query";
+const MAX_SEQUENCE_LENGTH: usize = 512;
+const INFERENCE_MAX_BATCH_SIZE: usize = 8;
+const INFERENCE_MAX_PADDED_TOKENS: usize = 2_048;
+const PAD_TOKEN_ID: i64 = 151_643;
+const QWEN_LAYER_COUNT: usize = 28;
+const QWEN_KV_HEAD_COUNT: usize = 8;
+const QWEN_HEAD_SIZE: usize = 128;
 
-struct Rwkv7Operator;
-
-impl Operator for Rwkv7Operator {
-    fn name(&self) -> &str {
-        "Rwkv7"
-    }
-
-    fn inputs(&self) -> Vec<OperatorInput> {
-        (0..6)
-            .map(|_| OperatorInput::required(TensorElementType::Float32))
-            .collect()
-    }
-
-    fn outputs(&self) -> Vec<OperatorOutput> {
-        vec![OperatorOutput::required(TensorElementType::Float32)]
-    }
-
-    fn create_kernel(&self, _: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
-        Ok(Box::new(|context: &KernelContext| {
-            let inputs = (0..6)
-                .map(|index| {
-                    context
-                        .input(index)?
-                        .ok_or_else(|| ort::Error::new("EmbeddingRWKV WKV 输入缺失"))
-                })
-                .collect::<ort::Result<Vec<_>>>()?;
-            let (shape, receptance) = inputs[0].try_extract_tensor::<f32>()?;
-            if shape.len() != 3 || shape[2] != EMBEDDING_DIMENSION as i64 {
-                return Err(ort::Error::new("EmbeddingRWKV WKV 输入维度无效"));
-            }
-            let batch_size = shape[0] as usize;
-            let token_count = shape[1] as usize;
-            let expected_values = batch_size * token_count * EMBEDDING_DIMENSION;
-            let tensors = inputs[1..]
-                .iter()
-                .map(|input| input.try_extract_tensor::<f32>().map(|(_, values)| values))
-                .collect::<ort::Result<Vec<_>>>()?;
-            if tensors.iter().any(|values| values.len() != expected_values) {
-                return Err(ort::Error::new("EmbeddingRWKV WKV 输入长度不一致"));
-            }
-            let decay = tensors[0];
-            let key = tensors[1];
-            let value = tensors[2];
-            let in_context_key = tensors[3];
-            let in_context_value = tensors[4];
-            let mut output = context
-                .output(0, shape.to_vec())?
-                .ok_or_else(|| ort::Error::new("EmbeddingRWKV WKV 输出缺失"))?;
-            let (_, output_values) = output.try_extract_tensor_mut::<f32>()?;
-            rwkv7_forward(
-                batch_size,
-                token_count,
-                receptance,
-                decay,
-                key,
-                value,
-                in_context_key,
-                in_context_value,
-                output_values,
-            );
-            Ok(())
-        }))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rwkv7_forward(
-    batch_size: usize,
-    token_count: usize,
-    receptance: &[f32],
-    decay: &[f32],
-    key: &[f32],
-    value: &[f32],
-    in_context_key: &[f32],
-    in_context_value: &[f32],
-    output: &mut [f32],
-) {
-    let state_size = RWKV_HEAD_COUNT * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;
-    let batch_stride = token_count * EMBEDDING_DIMENSION;
-    if batch_size == 1 {
-        rwkv7_forward_batch(
-            token_count,
-            receptance,
-            decay,
-            key,
-            value,
-            in_context_key,
-            in_context_value,
-            output,
-            state_size,
-        );
-        return;
-    }
-    std::thread::scope(|scope| {
-        let output_batches = output.chunks_exact_mut(batch_stride);
-        for (batch_index, output_batch) in output_batches.enumerate() {
-            let start = batch_index * batch_stride;
-            let end = start + batch_stride;
-            let receptance_batch = &receptance[start..end];
-            let decay_batch = &decay[start..end];
-            let key_batch = &key[start..end];
-            let value_batch = &value[start..end];
-            let in_context_key_batch = &in_context_key[start..end];
-            let in_context_value_batch = &in_context_value[start..end];
-            scope.spawn(move || {
-                rwkv7_forward_batch(
-                    token_count,
-                    receptance_batch,
-                    decay_batch,
-                    key_batch,
-                    value_batch,
-                    in_context_key_batch,
-                    in_context_value_batch,
-                    output_batch,
-                    state_size,
-                );
-            });
-        }
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rwkv7_forward_batch(
-    token_count: usize,
-    receptance: &[f32],
-    decay: &[f32],
-    key: &[f32],
-    value: &[f32],
-    in_context_key: &[f32],
-    in_context_value: &[f32],
-    output: &mut [f32],
-    state_size: usize,
-) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        unsafe {
-            rwkv7_forward_batch_avx2(
-                token_count,
-                receptance,
-                decay,
-                key,
-                value,
-                in_context_key,
-                in_context_value,
-                output,
-                state_size,
-            );
-        }
-        return;
-    }
-    rwkv7_forward_batch_scalar(
-        token_count,
-        receptance,
-        decay,
-        key,
-        value,
-        in_context_key,
-        in_context_value,
-        output,
-        state_size,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rwkv7_forward_batch_scalar(
-    token_count: usize,
-    receptance: &[f32],
-    decay: &[f32],
-    key: &[f32],
-    value: &[f32],
-    in_context_key: &[f32],
-    in_context_value: &[f32],
-    output: &mut [f32],
-    state_size: usize,
-) {
-    let mut state = vec![0.0_f32; state_size];
-    for token_index in 0..token_count {
-        let token_offset = token_index * EMBEDDING_DIMENSION;
-        for head_index in 0..RWKV_HEAD_COUNT {
-            let vector_offset = token_offset + head_index * RWKV_HEAD_SIZE;
-            let state_offset = head_index * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;
-            let mut projection = [0.0_f32; RWKV_HEAD_SIZE];
-            for row in 0..RWKV_HEAD_SIZE {
-                let row_offset = state_offset + row * RWKV_HEAD_SIZE;
-                let mut projected = 0.0_f32;
-                for column in 0..RWKV_HEAD_SIZE {
-                    let state_index = row_offset + column;
-                    let decayed = state[state_index] * decay[vector_offset + column];
-                    state[state_index] = decayed;
-                    projected += decayed * in_context_key[vector_offset + column];
-                }
-                projection[row] = projected;
-            }
-            for row in 0..RWKV_HEAD_SIZE {
-                let row_offset = state_offset + row * RWKV_HEAD_SIZE;
-                let mut mixed = 0.0_f32;
-                for column in 0..RWKV_HEAD_SIZE {
-                    let state_index = row_offset + column;
-                    let updated = state[state_index]
-                        + projection[row] * in_context_value[vector_offset + column]
-                        + value[vector_offset + row] * key[vector_offset + column];
-                    state[state_index] = updated;
-                    mixed += updated * receptance[vector_offset + column];
-                }
-                output[vector_offset + row] = mixed;
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn rwkv7_forward_batch_avx2(
-    token_count: usize,
-    receptance: &[f32],
-    decay: &[f32],
-    key: &[f32],
-    value: &[f32],
-    in_context_key: &[f32],
-    in_context_value: &[f32],
-    output: &mut [f32],
-    _state_size: usize,
-) {
-    use std::arch::x86_64::*;
-
-    let mut head_outputs = (0..RWKV_HEAD_COUNT)
-        .map(|_| vec![0.0_f32; token_count * RWKV_HEAD_SIZE])
-        .collect::<Vec<_>>();
-    rwkv_pool().install(|| {
-        head_outputs
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(head_index, head_output)| {
-                let mut state = vec![0.0_f32; RWKV_HEAD_SIZE * RWKV_HEAD_SIZE];
-                let state_offset = 0;
-                for token_index in 0..token_count {
-                    let token_offset = token_index * EMBEDDING_DIMENSION;
-                    let vector_offset = token_offset + head_index * RWKV_HEAD_SIZE;
-                    let mut projection = [0.0_f32; RWKV_HEAD_SIZE];
-                    for row in 0..RWKV_HEAD_SIZE {
-                        let row_offset = state_offset + row * RWKV_HEAD_SIZE;
-                        let mut projected = _mm256_setzero_ps();
-                        for column in (0..RWKV_HEAD_SIZE).step_by(8) {
-                            let state_ptr = state.as_mut_ptr().add(row_offset + column);
-                            let decayed = _mm256_mul_ps(
-                                _mm256_loadu_ps(state_ptr),
-                                _mm256_loadu_ps(decay.as_ptr().add(vector_offset + column)),
-                            );
-                            _mm256_storeu_ps(state_ptr, decayed);
-                            projected = _mm256_add_ps(
-                                projected,
-                                _mm256_mul_ps(
-                                    decayed,
-                                    _mm256_loadu_ps(
-                                        in_context_key.as_ptr().add(vector_offset + column),
-                                    ),
-                                ),
-                            );
-                        }
-                        let halves = _mm_add_ps(
-                            _mm256_castps256_ps128(projected),
-                            _mm256_extractf128_ps(projected, 1),
-                        );
-                        let pairs = _mm_hadd_ps(halves, halves);
-                        let singles = _mm_hadd_ps(pairs, pairs);
-                        projection[row] = _mm_cvtss_f32(singles);
-                    }
-                    for row in 0..RWKV_HEAD_SIZE {
-                        let row_offset = state_offset + row * RWKV_HEAD_SIZE;
-                        let projection_value = _mm256_set1_ps(projection[row]);
-                        let value_value = _mm256_set1_ps(value[vector_offset + row]);
-                        let mut mixed = _mm256_setzero_ps();
-                        for column in (0..RWKV_HEAD_SIZE).step_by(8) {
-                            let state_ptr = state.as_mut_ptr().add(row_offset + column);
-                            let updated = _mm256_add_ps(
-                                _mm256_loadu_ps(state_ptr),
-                                _mm256_add_ps(
-                                    _mm256_mul_ps(
-                                        projection_value,
-                                        _mm256_loadu_ps(
-                                            in_context_value.as_ptr().add(vector_offset + column),
-                                        ),
-                                    ),
-                                    _mm256_mul_ps(
-                                        value_value,
-                                        _mm256_loadu_ps(key.as_ptr().add(vector_offset + column)),
-                                    ),
-                                ),
-                            );
-                            _mm256_storeu_ps(state_ptr, updated);
-                            mixed = _mm256_add_ps(
-                                mixed,
-                                _mm256_mul_ps(
-                                    updated,
-                                    _mm256_loadu_ps(
-                                        receptance.as_ptr().add(vector_offset + column),
-                                    ),
-                                ),
-                            );
-                        }
-                        let halves = _mm_add_ps(
-                            _mm256_castps256_ps128(mixed),
-                            _mm256_extractf128_ps(mixed, 1),
-                        );
-                        let pairs = _mm_hadd_ps(halves, halves);
-                        let singles = _mm_hadd_ps(pairs, pairs);
-                        head_output[token_index * RWKV_HEAD_SIZE + row] = _mm_cvtss_f32(singles);
-                    }
-                }
-            });
-    });
-    for token_index in 0..token_count {
-        let output_offset = token_index * EMBEDDING_DIMENSION;
-        let head_offset = token_index * RWKV_HEAD_SIZE;
-        for (head_index, head_output) in head_outputs.iter().enumerate() {
-            let output_start = output_offset + head_index * RWKV_HEAD_SIZE;
-            output[output_start..output_start + RWKV_HEAD_SIZE]
-                .copy_from_slice(&head_output[head_offset..head_offset + RWKV_HEAD_SIZE]);
-        }
-    }
-}
-
-fn rwkv_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let thread_count = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
-            .clamp(1, 8);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(thread_count)
-            .thread_name(|index| format!("filesearch-rwkv-{index}"))
-            .build()
-            .expect("无法创建 EmbeddingRWKV 线程池")
-    })
-}
-
-struct RwkvModel {
+struct QwenModel {
     session: Session,
-    tokenizer: RwkvTokenizer,
+    tokenizer: Tokenizer,
     backend: RuntimeBackend,
 }
 
@@ -384,24 +49,14 @@ impl RuntimeBackend {
     fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
-            Self::Cuda => "NVIDIA CUDA（ONNX 节点，WKV CPU）",
+            Self::Cuda => "NVIDIA CUDA",
         }
     }
 }
 
-#[derive(Default)]
-struct TokenNode {
-    children: HashMap<u8, usize>,
-    token_id: Option<i64>,
-}
-
-struct RwkvTokenizer {
-    nodes: Vec<TokenNode>,
-}
-
 enum ModelState {
     Uninitialized,
-    Ready(Box<RwkvModel>),
+    Ready(Box<QwenModel>),
     Fallback,
 }
 
@@ -449,10 +104,11 @@ impl EmbeddingEngine {
     }
 
     pub fn embed_query(&self, query: &str) -> Vec<f32> {
-        self.embed_batch(&[query.to_owned()])
+        let query = format!("Instruct: {QUERY_INSTRUCTION}\nQuery:{query}");
+        self.embed_batch(&[query.clone()])
             .into_iter()
             .next()
-            .unwrap_or_else(|| fallback_embed(query))
+            .unwrap_or_else(|| fallback_embed(query.as_str()))
     }
 
     pub fn embed_passages(&self, passages: &[String]) -> Vec<Vec<f32>> {
@@ -493,14 +149,14 @@ impl EmbeddingEngine {
         texts.iter().map(|text| fallback_embed(text)).collect()
     }
 
-    fn load_model(&self) -> Result<RwkvModel> {
-        let model_path = self.model_dir.join("model.onnx");
-        let vocab_path = self.model_dir.join("rwkv_vocab.bin");
-        let tokenizer = RwkvTokenizer::load(&vocab_path)?;
+    fn load_model(&self) -> Result<QwenModel> {
+        let model_path = self.model_dir.join("model_int8.onnx");
+        let tokenizer_path = self.model_dir.join("tokenizer.json");
+        let tokenizer = load_qwen_tokenizer(&tokenizer_path)?;
         if self.preferred_backend == RuntimeBackend::Cuda {
             match self.build_session(&model_path, RuntimeBackend::Cuda) {
                 Ok(session) => {
-                    return Ok(RwkvModel {
+                    return Ok(QwenModel {
                         session,
                         tokenizer,
                         backend: RuntimeBackend::Cuda,
@@ -515,7 +171,7 @@ impl EmbeddingEngine {
             }
         }
         let session = self.build_session(&model_path, RuntimeBackend::Cpu)?;
-        Ok(RwkvModel {
+        Ok(QwenModel {
             session,
             tokenizer,
             backend: RuntimeBackend::Cpu,
@@ -527,16 +183,16 @@ impl EmbeddingEngine {
         model_path: &std::path::Path,
         backend: RuntimeBackend,
     ) -> Result<Session> {
-        let operators = OperatorDomain::new("com.localfind")
-            .context("无法创建 EmbeddingRWKV 自定义算子域")?
-            .add(Rwkv7Operator)
-            .context("无法注册 EmbeddingRWKV WKV 算子")?;
+        let thread_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(1, 8);
         let mut builder = Session::builder()
             .context("无法初始化 ONNX Runtime")?
-            .with_operators(operators)
-            .context("无法配置 EmbeddingRWKV WKV 算子")?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("无法配置 ONNX 图优化")?;
+            .context("无法配置 ONNX 图优化")?
+            .with_intra_threads(thread_count)
+            .context("无法配置 Qwen CPU 推理线程")?;
         if backend == RuntimeBackend::Cuda {
             builder = builder
                 .with_execution_providers([CUDAExecutionProvider::default().build()])
@@ -544,81 +200,124 @@ impl EmbeddingEngine {
         }
         builder
             .commit_from_file(model_path)
-            .with_context(|| format!("无法加载 EmbeddingRWKV 模型 {}", model_path.display()))
+            .with_context(|| format!("无法加载 Qwen Embedding 模型 {}", model_path.display()))
     }
 }
 
-impl RwkvModel {
+impl QwenModel {
     fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let tokenized = texts
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|error| anyhow::anyhow!("Qwen tokenizer 编码失败: {error}"))?;
+        let tokenized = encodings
             .iter()
             .enumerate()
-            .map(|(index, text)| {
-                let mut tokens = self.tokenizer.encode(text);
-                tokens.push(EOS_TOKEN_ID);
-                (index, tokens)
+            .map(|(index, encoding)| {
+                (
+                    index,
+                    encoding
+                        .get_ids()
+                        .iter()
+                        .map(|token| i64::from(*token))
+                        .collect::<Vec<_>>(),
+                )
             })
             .collect::<Vec<_>>();
         let batches = plan_token_batches(&tokenized);
-        let total_tokens = tokenized
-            .iter()
-            .map(|(_, tokens)| tokens.len())
-            .sum::<usize>();
-        let padded_tokens = batches
-            .iter()
-            .map(|batch| {
-                batch.len()
-                    * batch
-                        .iter()
-                        .map(|index| tokenized[*index].1.len())
-                        .max()
-                        .unwrap_or(0)
-            })
-            .sum::<usize>();
-        tracing::debug!(
-            documents = texts.len(),
-            batches = batches.len(),
-            total_tokens,
-            padded_tokens,
-            "planned EmbeddingRWKV token batches"
-        );
-
         let mut vectors = vec![None; texts.len()];
+
         for batch in batches {
             let max_length = batch
                 .iter()
                 .map(|index| tokenized[*index].1.len())
                 .max()
                 .unwrap_or(1);
-            let mut flattened = Vec::with_capacity(batch.len() * max_length);
+            let mut input_ids = Vec::with_capacity(batch.len() * max_length);
+            let mut attention_mask = Vec::with_capacity(batch.len() * max_length);
+            let mut position_ids = Vec::with_capacity(batch.len() * max_length);
             for index in &batch {
                 let tokens = &tokenized[*index].1;
-                flattened.extend(std::iter::repeat_n(0, max_length - tokens.len()));
-                flattened.extend_from_slice(tokens);
+                let padding = max_length - tokens.len();
+                input_ids.extend(std::iter::repeat_n(PAD_TOKEN_ID, padding));
+                input_ids.extend_from_slice(tokens);
+                attention_mask.extend(std::iter::repeat_n(0_i64, padding));
+                attention_mask.extend(std::iter::repeat_n(1_i64, tokens.len()));
+                position_ids.extend(std::iter::repeat_n(0_i64, padding));
+                position_ids.extend((0..tokens.len()).map(|position| position as i64));
             }
-            let input = Tensor::<i64>::from_array(([batch.len(), max_length], flattened))
-                .context("无法创建 EmbeddingRWKV 输入")?;
+
+            let batch_size = batch.len();
+            let mut inputs: Vec<(String, SessionInputValue<'_>)> = vec![
+                (
+                    "input_ids".to_owned(),
+                    Tensor::<i64>::from_array(([batch_size, max_length], input_ids))?.into(),
+                ),
+                (
+                    "attention_mask".to_owned(),
+                    Tensor::<i64>::from_array(([batch_size, max_length], attention_mask))?.into(),
+                ),
+                (
+                    "position_ids".to_owned(),
+                    Tensor::<i64>::from_array(([batch_size, max_length], position_ids))?.into(),
+                ),
+            ];
+            for layer in 0..QWEN_LAYER_COUNT {
+                let shape = [batch_size, QWEN_KV_HEAD_COUNT, 0, QWEN_HEAD_SIZE];
+                inputs.push((
+                    format!("past_key_values.{layer}.key"),
+                    Tensor::<f32>::new(&Allocator::default(), shape)?.into(),
+                ));
+                inputs.push((
+                    format!("past_key_values.{layer}.value"),
+                    Tensor::<f32>::new(&Allocator::default(), shape)?.into(),
+                ));
+            }
+            let run_options = RunOptions::new()?
+                .with_outputs(OutputSelector::no_default().with("last_hidden_state"));
             let outputs = self
                 .session
-                .run(ort::inputs![input])
-                .context("EmbeddingRWKV ONNX 推理失败")?;
-            let (shape, values) = outputs[0]
+                .run_with_options(inputs, &run_options)
+                .context("Qwen Embedding ONNX 推理失败")?;
+            let (shape, values) = outputs["last_hidden_state"]
                 .try_extract_tensor::<f32>()
-                .context("EmbeddingRWKV 输出格式无效")?;
-            if shape.as_ref() != [batch.len() as i64, EMBEDDING_DIMENSION as i64] {
-                anyhow::bail!("EmbeddingRWKV 输出维度异常: {shape:?}");
+                .context("Qwen Embedding 输出格式无效")?;
+            if shape.as_ref()
+                != [
+                    batch_size as i64,
+                    max_length as i64,
+                    EMBEDDING_DIMENSION as i64,
+                ]
+            {
+                anyhow::bail!("Qwen Embedding 输出维度异常: {shape:?}");
             }
-            for (index, values) in batch.iter().zip(values.chunks_exact(EMBEDDING_DIMENSION)) {
-                let mut vector = values.to_vec();
+            let sequence_stride = max_length * EMBEDDING_DIMENSION;
+            let last_token_offset = (max_length - 1) * EMBEDDING_DIMENSION;
+            for (batch_position, index) in batch.iter().enumerate() {
+                let start = batch_position * sequence_stride + last_token_offset;
+                let mut vector = values[start..start + EMBEDDING_DIMENSION].to_vec();
                 normalize(&mut vector);
                 vectors[tokenized[*index].0] = Some(vector);
             }
         }
+
         vectors
             .into_iter()
-            .map(|vector| vector.context("EmbeddingRWKV 批处理结果缺失"))
+            .map(|vector| vector.context("Qwen Embedding 批处理结果缺失"))
             .collect()
     }
+}
+
+fn load_qwen_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
+    let mut tokenizer = Tokenizer::from_file(path)
+        .map_err(|error| anyhow::anyhow!("无法读取 Qwen tokenizer {}: {error}", path.display()))?;
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: MAX_SEQUENCE_LENGTH,
+            ..Default::default()
+        }))
+        .map_err(|error| anyhow::anyhow!("无法配置 Qwen tokenizer 截断: {error}"))?;
+    Ok(tokenizer)
 }
 
 fn plan_token_batches(tokenized: &[(usize, Vec<i64>)]) -> Vec<Vec<usize>> {
@@ -644,92 +343,6 @@ fn plan_token_batches(tokenized: &[(usize, Vec<i64>)]) -> Vec<Vec<usize>> {
         batches.push(current);
     }
     batches
-}
-
-impl RwkvTokenizer {
-    fn load(path: &std::path::Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("无法读取 EmbeddingRWKV 词表 {}", path.display()))?;
-        if bytes.get(..8) != Some(b"RWKVTOK1") {
-            anyhow::bail!("EmbeddingRWKV 词表格式无效");
-        }
-        let mut offset = 8;
-        let count = read_u32(&bytes, &mut offset)? as usize;
-        let mut tokenizer = Self {
-            nodes: vec![TokenNode::default()],
-        };
-        for token_id in 0..count {
-            let length = read_u16(&bytes, &mut offset)? as usize;
-            let end = offset
-                .checked_add(length)
-                .filter(|end| *end <= bytes.len())
-                .context("EmbeddingRWKV 词表数据不完整")?;
-            if token_id != 0 && length > 0 {
-                tokenizer.insert(&bytes[offset..end], token_id as i64);
-            }
-            offset = end;
-        }
-        Ok(tokenizer)
-    }
-
-    fn insert(&mut self, token: &[u8], token_id: i64) {
-        let mut node_index = 0;
-        for byte in token {
-            let next_index = if let Some(index) = self.nodes[node_index].children.get(byte) {
-                *index
-            } else {
-                let index = self.nodes.len();
-                self.nodes.push(TokenNode::default());
-                self.nodes[node_index].children.insert(*byte, index);
-                index
-            };
-            node_index = next_index;
-        }
-        self.nodes[node_index].token_id = Some(token_id);
-    }
-
-    fn encode(&self, text: &str) -> Vec<i64> {
-        let bytes = text.as_bytes();
-        let mut tokens = Vec::new();
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let mut node_index = 0;
-            let mut cursor = offset;
-            let mut longest = None;
-            while let Some(next_index) = bytes
-                .get(cursor)
-                .and_then(|byte| self.nodes[node_index].children.get(byte))
-            {
-                node_index = *next_index;
-                cursor += 1;
-                if let Some(token_id) = self.nodes[node_index].token_id {
-                    longest = Some((cursor, token_id));
-                }
-            }
-            let (next_offset, token_id) = longest.expect("RWKV 词表必须覆盖每个 UTF-8 字节");
-            tokens.push(token_id);
-            offset = next_offset;
-        }
-        tokens
-    }
-}
-
-fn read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
-    let end = *offset + 2;
-    let value = bytes
-        .get(*offset..end)
-        .context("EmbeddingRWKV 词表数据不完整")?;
-    *offset = end;
-    Ok(u16::from_le_bytes([value[0], value[1]]))
-}
-
-fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
-    let end = *offset + 4;
-    let value = bytes
-        .get(*offset..end)
-        .context("EmbeddingRWKV 词表数据不完整")?;
-    *offset = end;
-    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 pub fn fallback_embed(text: &str) -> Vec<f32> {
@@ -883,23 +496,83 @@ pub fn cosine(left: &[f32], right: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use std::time::Instant;
 
-    fn rwkv_tokenizer() -> RwkvTokenizer {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/models/embedding-rwkv-tiny/rwkv_vocab.bin");
-        RwkvTokenizer::load(&path).unwrap()
+    #[derive(Deserialize)]
+    struct RetrievalDocument {
+        id: String,
+        text: String,
     }
 
-    #[test]
-    fn rwkv_tokenizer_matches_official_world_tokenizer() {
-        assert_eq!(
-            rwkv_tokenizer().encode("本地文档搜索"),
-            [13205, 11459, 13012, 13351, 12877, 15325]
+    #[derive(Deserialize)]
+    struct RetrievalQuery {
+        text: String,
+        relevant: String,
+    }
+
+    #[derive(Deserialize)]
+    struct RetrievalDataset {
+        documents: Vec<RetrievalDocument>,
+        queries: Vec<RetrievalQuery>,
+    }
+
+    fn retrieval_dataset() -> RetrievalDataset {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.codex-tmp/semantic-retrieval-eval.json");
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn report_retrieval_metrics(
+        model: &str,
+        dataset: &RetrievalDataset,
+        document_vectors: &[Vec<f32>],
+        query_vectors: &[Vec<f32>],
+    ) {
+        let mut top1 = 0usize;
+        let mut recall3 = 0usize;
+        let mut reciprocal_rank3 = 0.0f32;
+        let mut failures = Vec::new();
+        for (query, query_vector) in dataset.queries.iter().zip(query_vectors) {
+            let mut ranking = dataset
+                .documents
+                .iter()
+                .zip(document_vectors)
+                .map(|(document, vector)| (document.id.as_str(), cosine(query_vector, vector)))
+                .collect::<Vec<_>>();
+            ranking.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+            let rank = ranking
+                .iter()
+                .position(|(id, _)| *id == query.relevant)
+                .map(|index| index + 1)
+                .unwrap();
+            top1 += usize::from(rank == 1);
+            recall3 += usize::from(rank <= 3);
+            if rank <= 3 {
+                reciprocal_rank3 += 1.0 / rank as f32;
+            }
+            if rank != 1 {
+                failures.push(format!(
+                    "query={:?} expected={} rank={} top3={:?}",
+                    query.text,
+                    query.relevant,
+                    rank,
+                    ranking.iter().take(3).collect::<Vec<_>>()
+                ));
+            }
+        }
+        let count = dataset.queries.len() as f32;
+        eprintln!(
+            "{model} retrieval: queries={}, top1={:.1}%, recall@3={:.1}%, mrr@3={:.3}, failures={}",
+            dataset.queries.len(),
+            top1 as f32 * 100.0 / count,
+            recall3 as f32 * 100.0 / count,
+            reciprocal_rank3 / count,
+            failures.len()
         );
-        assert_eq!(
-            rwkv_tokenizer().encode("EmbeddingRWKV Tiny test"),
-            [33071, 25139, 1413, 1184, 29906, 32223]
-        );
+        for failure in failures {
+            eprintln!("{model} {failure}");
+        }
     }
 
     #[test]
@@ -920,7 +593,7 @@ mod tests {
     #[test]
     fn token_batches_group_similar_lengths_and_preserve_all_inputs() {
         let tokenized = vec![
-            (0, vec![0; 3_000]),
+            (0, vec![0; 500]),
             (1, vec![0; 100]),
             (2, vec![0; 120]),
             (3, vec![0; 140]),
@@ -933,62 +606,285 @@ mod tests {
         assert!(batches
             .iter()
             .all(|batch| batch.len() <= INFERENCE_MAX_BATCH_SIZE));
-        assert_eq!(batches.last(), Some(&vec![0]));
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn avx2_wkv_matches_scalar_kernel() {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
-        let token_count = 3;
-        let value_count = token_count * EMBEDDING_DIMENSION;
-        let values = |scale: f32, offset: usize| {
-            (0..value_count)
-                .map(|index| ((index + offset) % 29 + 1) as f32 * scale)
+    fn qwen_tokenizer_adds_eos_without_early_padding() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/models/qwen3-embedding-0.6b/tokenizer.json");
+        let tokenizer = load_qwen_tokenizer(&path).unwrap();
+        let encodings = tokenizer
+            .encode_batch(vec!["短文本", "这是稍微长一些的文本"], true)
+            .unwrap();
+        assert!(encodings[0].len() < encodings[1].len());
+        assert_eq!(encodings[0].get_ids().last(), Some(&(PAD_TOKEN_ID as u32)));
+        assert_eq!(encodings[1].get_ids().last(), Some(&(PAD_TOKEN_ID as u32)));
+        assert!(encodings[0]
+            .get_attention_mask()
+            .iter()
+            .all(|value| *value == 1));
+    }
+
+    #[test]
+    #[ignore = "loads the bundled 600 MB Qwen model"]
+    fn qwen_model_produces_relevant_normalized_embeddings() {
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/models/qwen3-embedding-0.6b");
+        let engine = EmbeddingEngine::new(model_dir);
+        let started = Instant::now();
+        let mut model = engine.load_model().unwrap();
+        let query_text = format!(
+            "Instruct: {QUERY_INSTRUCTION}\nQuery:{}",
+            "系统如何防止网络攻击"
+        );
+        let query = model.embed(&[query_text]).unwrap().remove(0);
+        let load_and_query = started.elapsed();
+        let started = Instant::now();
+        let passages = model
+            .embed(&[
+                "系统采用防火墙、身份认证和入侵检测来保障网络安全。".to_owned(),
+                "员工出差的交通费用按财务制度报销。".to_owned(),
+                "The security platform detects and blocks cyber attacks.".to_owned(),
+            ])
+            .unwrap();
+        let passage_time = started.elapsed();
+        assert_eq!(query.len(), EMBEDDING_DIMENSION);
+        assert!((cosine(&query, &query) - 1.0).abs() < 0.001);
+        assert!(cosine(&query, &passages[0]) > cosine(&query, &passages[1]));
+        assert!(cosine(&query, &passages[2]) > cosine(&query, &passages[1]));
+        eprintln!(
+            "Qwen backend={}, first_query={load_and_query:?}, passages={passage_time:?}, scores={:?}",
+            model.backend.code(),
+            passages
+                .iter()
+                .map(|passage| cosine(&query, passage))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmarks the bundled 600 MB Qwen model"]
+    fn qwen_model_benchmarks_indexing_batch() {
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/models/qwen3-embedding-0.6b");
+        let engine = EmbeddingEngine::new(model_dir);
+        let load_started = Instant::now();
+        let mut model = engine.load_model().unwrap();
+        let load_elapsed = load_started.elapsed();
+        let texts = (0..16)
+            .map(|index| {
+                let body = "本地文档智能搜索需要支持中文语义检索、关键词匹配和索引性能统计。"
+                    .repeat(20)
+                    .chars()
+                    .take(480)
+                    .collect::<String>();
+                format!(
+                    "需求文档-{index}.docx\n{body}",
+                )
+            })
+            .collect::<Vec<_>>();
+        let token_lengths = model
+            .tokenizer
+            .encode_batch(texts.clone(), true)
+            .unwrap()
+            .iter()
+            .map(|encoding| encoding.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(model.embed(&texts).unwrap().len(), texts.len());
+        let elapsed = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                assert_eq!(model.embed(&texts).unwrap().len(), texts.len());
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "Qwen indexing batch: backend={}, load={load_elapsed:?}, texts={}, token_lengths={token_lengths:?}, elapsed={elapsed:?}",
+            model.backend.code(),
+            texts.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmarks the previous multilingual E5 model"]
+    fn e5_model_benchmarks_indexing_batch() {
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/models/multilingual-e5-small");
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+        let load_started = Instant::now();
+        let mut session = Session::builder()
+            .unwrap()
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .unwrap()
+            .with_intra_threads(8)
+            .unwrap()
+            .commit_from_file(model_dir.join("onnx/model.onnx"))
+            .unwrap();
+        let load_elapsed = load_started.elapsed();
+        let texts = (0..16)
+            .map(|index| {
+                let body = "本地文档智能搜索需要支持中文语义检索、关键词匹配和索引性能统计。"
+                    .repeat(20)
+                    .chars()
+                    .take(480)
+                    .collect::<String>();
+                format!("passage: 需求文档-{index}.docx\n{body}")
+            })
+            .collect::<Vec<_>>();
+        let encodings = tokenizer.encode_batch(texts, true).unwrap();
+        let max_length = encodings.iter().map(|encoding| encoding.len()).max().unwrap();
+        let token_lengths = encodings
+            .iter()
+            .map(|encoding| encoding.len())
+            .collect::<Vec<_>>();
+        let run = |session: &mut Session| {
+            let mut input_ids = Vec::with_capacity(encodings.len() * max_length);
+            let mut attention_mask = Vec::with_capacity(encodings.len() * max_length);
+            for encoding in &encodings {
+                let ids = encoding.get_ids();
+                input_ids.extend(ids.iter().map(|token| i64::from(*token)));
+                input_ids.extend(std::iter::repeat_n(0_i64, max_length - ids.len()));
+                attention_mask.extend(std::iter::repeat_n(1_i64, ids.len()));
+                attention_mask.extend(std::iter::repeat_n(0_i64, max_length - ids.len()));
+            }
+            let token_type_ids = vec![0_i64; encodings.len() * max_length];
+            let outputs = session
+                .run(ort::inputs![
+                    "input_ids" => Tensor::<i64>::from_array(([encodings.len(), max_length], input_ids)).unwrap(),
+                    "attention_mask" => Tensor::<i64>::from_array(([encodings.len(), max_length], attention_mask)).unwrap(),
+                    "token_type_ids" => Tensor::<i64>::from_array(([encodings.len(), max_length], token_type_ids)).unwrap(),
+                ])
+                .unwrap();
+            let (shape, _) = outputs["last_hidden_state"]
+                .try_extract_tensor::<f32>()
+                .unwrap();
+            assert_eq!(shape.as_ref(), [16, max_length as i64, 384]);
+        };
+
+        run(&mut session);
+        let elapsed = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                run(&mut session);
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "E5 indexing batch: load={load_elapsed:?}, texts={}, token_lengths={token_lengths:?}, elapsed={elapsed:?}",
+            encodings.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "evaluates bundled Qwen and previous E5 models"]
+    fn qwen_and_e5_retrieval_quality() {
+        let dataset = retrieval_dataset();
+        let qwen_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/models/qwen3-embedding-0.6b");
+        let qwen_engine = EmbeddingEngine::new(qwen_dir);
+        let mut qwen = qwen_engine.load_model().unwrap();
+        let qwen_documents = qwen
+            .embed(
+                &dataset
+                    .documents
+                    .iter()
+                    .map(|document| document.text.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let qwen_queries = qwen
+            .embed(
+                &dataset
+                    .queries
+                    .iter()
+                    .map(|query| format!("Instruct: {QUERY_INSTRUCTION}\nQuery:{}", query.text))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        report_retrieval_metrics(
+            "Qwen3-Embedding-0.6B INT8",
+            &dataset,
+            &qwen_documents,
+            &qwen_queries,
+        );
+
+        let e5_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/models/multilingual-e5-small");
+        let tokenizer = Tokenizer::from_file(e5_dir.join("tokenizer.json")).unwrap();
+        let mut session = Session::builder()
+            .unwrap()
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .unwrap()
+            .with_intra_threads(8)
+            .unwrap()
+            .commit_from_file(e5_dir.join("onnx/model.onnx"))
+            .unwrap();
+        let mut embed_e5 = |texts: Vec<String>| {
+            let encodings = tokenizer.encode_batch(texts, true).unwrap();
+            let max_length = encodings.iter().map(|encoding| encoding.len()).max().unwrap();
+            let mut input_ids = Vec::with_capacity(encodings.len() * max_length);
+            let mut attention_mask = Vec::with_capacity(encodings.len() * max_length);
+            for encoding in &encodings {
+                let ids = encoding.get_ids();
+                input_ids.extend(ids.iter().map(|token| i64::from(*token)));
+                input_ids.extend(std::iter::repeat_n(0_i64, max_length - ids.len()));
+                attention_mask.extend(std::iter::repeat_n(1_i64, ids.len()));
+                attention_mask.extend(std::iter::repeat_n(0_i64, max_length - ids.len()));
+            }
+            let token_type_ids = vec![0_i64; encodings.len() * max_length];
+            let outputs = session
+                .run(ort::inputs![
+                    "input_ids" => Tensor::<i64>::from_array(([encodings.len(), max_length], input_ids)).unwrap(),
+                    "attention_mask" => Tensor::<i64>::from_array(([encodings.len(), max_length], attention_mask.clone())).unwrap(),
+                    "token_type_ids" => Tensor::<i64>::from_array(([encodings.len(), max_length], token_type_ids)).unwrap(),
+                ])
+                .unwrap();
+            let (_, values) = outputs["last_hidden_state"]
+                .try_extract_tensor::<f32>()
+                .unwrap();
+            values
+                .chunks_exact(max_length * 384)
+                .zip(attention_mask.chunks_exact(max_length))
+                .map(|(tokens, mask)| {
+                    let mut vector = vec![0.0f32; 384];
+                    let mut count = 0.0f32;
+                    for (token, included) in tokens.chunks_exact(384).zip(mask) {
+                        if *included == 0 {
+                            continue;
+                        }
+                        count += 1.0;
+                        for (target, value) in vector.iter_mut().zip(token) {
+                            *target += *value;
+                        }
+                    }
+                    for value in &mut vector {
+                        *value /= count;
+                    }
+                    normalize(&mut vector);
+                    vector
+                })
                 .collect::<Vec<_>>()
         };
-        let receptance = values(0.003, 1);
-        let decay = (0..value_count)
-            .map(|index| 0.97 - (index % 7) as f32 * 0.001)
-            .collect::<Vec<_>>();
-        let key = values(0.002, 3);
-        let value = values(0.0025, 5);
-        let in_context_key = values(0.0015, 7);
-        let in_context_value = values(0.001, 11);
-        let mut scalar = vec![0.0; value_count];
-        let mut avx2 = vec![0.0; value_count];
-        let state_size = RWKV_HEAD_COUNT * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;
-        rwkv7_forward_batch_scalar(
-            token_count,
-            &receptance,
-            &decay,
-            &key,
-            &value,
-            &in_context_key,
-            &in_context_value,
-            &mut scalar,
-            state_size,
+        let e5_documents = embed_e5(
+            dataset
+                .documents
+                .iter()
+                .map(|document| format!("passage: {}", document.text))
+                .collect(),
         );
-        unsafe {
-            rwkv7_forward_batch_avx2(
-                token_count,
-                &receptance,
-                &decay,
-                &key,
-                &value,
-                &in_context_key,
-                &in_context_value,
-                &mut avx2,
-                state_size,
-            );
-        }
-        let max_difference = scalar
-            .iter()
-            .zip(&avx2)
-            .map(|(left, right)| (left - right).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(max_difference < 1e-5, "max difference: {max_difference}");
+        let e5_queries = embed_e5(
+            dataset
+                .queries
+                .iter()
+                .map(|query| format!("query: {}", query.text))
+                .collect(),
+        );
+        report_retrieval_metrics(
+            "multilingual-e5-small",
+            &dataset,
+            &e5_documents,
+            &e5_queries,
+        );
     }
 }

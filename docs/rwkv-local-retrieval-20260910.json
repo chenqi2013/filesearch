@@ -1,0 +1,798 @@
+{
+  "created_at": "2026-09-10T03:25:40.608667+00:00",
+  "model": "EmbeddingRWKV Tiny (corrected Rust WKV + ONNX)",
+  "dataset_sha256": "9fd28d2b0f8977dc5435acec4d6bda56d15e75754c6a2558261092cffb7671d6",
+  "onnx_sha256": "9d0985b53784997f07359a465d4e35da9d307265081bb69ac1eaf11c9b677b83",
+  "executable_sha256": "3ada569ee6c17dcdd60988d2de216602c1e02cf1e87dbf94c8b02bfcb7616654",
+  "runtime_sha256": "579b636403983254346a5c1d80bd28f1519cd1e284cd204f8d4ff41f8d711559",
+  "protocol": {
+    "device": "CPU",
+    "batch_size": 4,
+    "max_tokens": 1024,
+    "pooling": "single EOS",
+    "instruction": null,
+    "reranker": false,
+    "similarity": "normalized cosine",
+    "cached_vectors": false,
+    "relevant_documents_per_query": 1
+  },
+  "documents": 20,
+  "queries": 40,
+  "top1_hits": 40,
+  "top1": 1.0,
+  "top3_hits": 40,
+  "recall@3": 1.0,
+  "mrr@3": 1.0,
+  "document_timing": {
+    "tokenization_seconds": 0.0009588999964762479,
+    "inference_seconds": 2.0430793999985326,
+    "tokens": 1269
+  },
+  "query_timing": {
+    "tokenization_seconds": 0.0005587000050581992,
+    "inference_seconds": 0.550387099996442,
+    "tokens": 724
+  },
+  "details": [
+    {
+      "query": "怎样阻止黑客入侵公司的计算机系统？",
+      "relevant": "network_security",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "network_security",
+          "cosine": 0.6519785523414612
+        },
+        {
+          "document_id": "remote_work",
+          "cosine": 0.4860975742340088
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.3415685296058655
+        }
+      ]
+    },
+    {
+      "query": "检测到木马和可疑登录后系统会怎么做？",
+      "relevant": "network_security",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "network_security",
+          "cosine": 0.5363144874572754
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.3981843590736389
+        },
+        {
+          "document_id": "data_privacy",
+          "cosine": 0.30580365657806396
+        }
+      ]
+    },
+    {
+      "query": "员工出差住酒店的钱回来以后怎么申请返还？",
+      "relevant": "travel_reimbursement",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "travel_reimbursement",
+          "cosine": 0.6190044283866882
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.35326313972473145
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.2665656805038452
+        }
+      ]
+    },
+    {
+      "query": "差旅结束后最晚什么时候交车票和住宿票据？",
+      "relevant": "travel_reimbursement",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "travel_reimbursement",
+          "cosine": 0.608400285243988
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.3676353394985199
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.2979283332824707
+        }
+      ]
+    },
+    {
+      "query": "想休几天年假，需要提前多久提出？",
+      "relevant": "annual_leave",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.5889439582824707
+        },
+        {
+          "document_id": "travel_reimbursement",
+          "cosine": 0.3893023133277893
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.35675185918807983
+        }
+      ]
+    },
+    {
+      "query": "连续请一周假需要谁批准？",
+      "relevant": "annual_leave",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.6247544884681702
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.412308931350708
+        },
+        {
+          "document_id": "project_deadline",
+          "cosine": 0.3572418987751007
+        }
+      ]
+    },
+    {
+      "query": "生产库的数据被误删了，怎样找回来？",
+      "relevant": "backup_restore",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.6381740570068359
+        },
+        {
+          "document_id": "inventory",
+          "cosine": 0.36476433277130127
+        },
+        {
+          "document_id": "device_repair",
+          "cosine": 0.3231387436389923
+        }
+      ]
+    },
+    {
+      "query": "公司多久做一次完整的数据备份？",
+      "relevant": "backup_restore",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.6699738502502441
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.43943166732788086
+        },
+        {
+          "document_id": "device_repair",
+          "cosine": 0.3141181468963623
+        }
+      ]
+    },
+    {
+      "query": "候选人在正式上班前要经过哪些环节？",
+      "relevant": "recruitment",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "recruitment",
+          "cosine": 0.5687984228134155
+        },
+        {
+          "document_id": "training",
+          "cosine": 0.45434948801994324
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.4454260766506195
+        }
+      ]
+    },
+    {
+      "query": "简历筛选以后还要面试和背景调查吗？",
+      "relevant": "recruitment",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "recruitment",
+          "cosine": 0.6556432247161865
+        },
+        {
+          "document_id": "training",
+          "cosine": 0.4102134704589844
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.3472232222557068
+        }
+      ]
+    },
+    {
+      "query": "合作协议快到期了，应当什么时候启动续约？",
+      "relevant": "contract_renewal",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.6962178945541382
+        },
+        {
+          "document_id": "project_deadline",
+          "cosine": 0.344122976064682
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.3004440665245056
+        }
+      ]
+    },
+    {
+      "query": "修改合同责任条款需要哪个部门审核？",
+      "relevant": "contract_renewal",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.5568960905075073
+        },
+        {
+          "document_id": "inventory",
+          "cosine": 0.38241633772850037
+        },
+        {
+          "document_id": "purchase",
+          "cosine": 0.34414035081863403
+        }
+      ]
+    },
+    {
+      "query": "账号口令想不起来了，怎么重新设置？",
+      "relevant": "password_reset",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "password_reset",
+          "cosine": 0.3902233839035034
+        },
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.266213983297348
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.2589404582977295
+        }
+      ]
+    },
+    {
+      "query": "自助验证多次不通过应该联系谁？",
+      "relevant": "password_reset",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "password_reset",
+          "cosine": 0.5480954647064209
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.33455175161361694
+        },
+        {
+          "document_id": "customer_complaint",
+          "cosine": 0.33189940452575684
+        }
+      ]
+    },
+    {
+      "query": "开增值税专票要提供哪些企业资料？",
+      "relevant": "invoice_tax",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "invoice_tax",
+          "cosine": 0.5794215202331543
+        },
+        {
+          "document_id": "purchase",
+          "cosine": 0.3370082974433899
+        },
+        {
+          "document_id": "salary",
+          "cosine": 0.3324820399284363
+        }
+      ]
+    },
+    {
+      "query": "开票时是否需要银行账户和纳税识别号？",
+      "relevant": "invoice_tax",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "invoice_tax",
+          "cosine": 0.5818243026733398
+        },
+        {
+          "document_id": "data_privacy",
+          "cosine": 0.3179612159729004
+        },
+        {
+          "document_id": "remote_work",
+          "cosine": 0.2720608115196228
+        }
+      ]
+    },
+    {
+      "query": "项目赶不上原定验收日期该如何处理？",
+      "relevant": "project_deadline",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "project_deadline",
+          "cosine": 0.6426528692245483
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.5578458309173584
+        },
+        {
+          "document_id": "purchase",
+          "cosine": 0.4152999222278595
+        }
+      ]
+    },
+    {
+      "query": "交付计划延后时要说明哪些影响？",
+      "relevant": "project_deadline",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "project_deadline",
+          "cosine": 0.5040065050125122
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.33437255024909973
+        },
+        {
+          "document_id": "travel_reimbursement",
+          "cosine": 0.32856473326683044
+        }
+      ]
+    },
+    {
+      "query": "在哪里查看空闲房间并预约开会？",
+      "relevant": "meeting_room",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.6865253448486328
+        },
+        {
+          "document_id": "travel_reimbursement",
+          "cosine": 0.3124752938747406
+        },
+        {
+          "document_id": "document_index",
+          "cosine": 0.2991151213645935
+        }
+      ]
+    },
+    {
+      "query": "会议取消后应该怎么处理已经占用的场地？",
+      "relevant": "meeting_room",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.6090142726898193
+        },
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.3178703188896179
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.2917318344116211
+        }
+      ]
+    },
+    {
+      "query": "办公笔记本坏了该找哪个入口报修？",
+      "relevant": "device_repair",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "device_repair",
+          "cosine": 0.49703630805015564
+        },
+        {
+          "document_id": "remote_work",
+          "cosine": 0.3475300669670105
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.343947172164917
+        }
+      ]
+    },
+    {
+      "query": "打印机故障的维修单要填写什么信息？",
+      "relevant": "device_repair",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "device_repair",
+          "cosine": 0.46830037236213684
+        },
+        {
+          "document_id": "document_index",
+          "cosine": 0.43155890703201294
+        },
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.40793681144714355
+        }
+      ]
+    },
+    {
+      "query": "用户对产品质量不满意，客服应该如何登记？",
+      "relevant": "customer_complaint",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "customer_complaint",
+          "cosine": 0.5856763124465942
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.5410714745521545
+        },
+        {
+          "document_id": "purchase",
+          "cosine": 0.37372976541519165
+        }
+      ]
+    },
+    {
+      "query": "收到服务投诉后由哪个环节负责回访？",
+      "relevant": "customer_complaint",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "customer_complaint",
+          "cosine": 0.6777378916740417
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.34334444999694824
+        },
+        {
+          "document_id": "project_deadline",
+          "cosine": 0.3333761394023895
+        }
+      ]
+    },
+    {
+      "query": "仓库清点时发现系统数字和实物对不上怎么办？",
+      "relevant": "inventory",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "inventory",
+          "cosine": 0.5673349499702454
+        },
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.44024309515953064
+        },
+        {
+          "document_id": "network_security",
+          "cosine": 0.3522864580154419
+        }
+      ]
+    },
+    {
+      "query": "账面库存与现场数量存在差异如何处置？",
+      "relevant": "inventory",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "inventory",
+          "cosine": 0.5384374856948853
+        },
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.4518970847129822
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.35598719120025635
+        }
+      ]
+    },
+    {
+      "query": "如何防止普通员工看到完整身份证号码？",
+      "relevant": "data_privacy",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "data_privacy",
+          "cosine": 0.5544658899307251
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.5529375076293945
+        },
+        {
+          "document_id": "remote_work",
+          "cosine": 0.40529412031173706
+        }
+      ]
+    },
+    {
+      "query": "手机号等敏感资料导出时需要留下记录吗？",
+      "relevant": "data_privacy",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "data_privacy",
+          "cosine": 0.6463227868080139
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.3871678113937378
+        },
+        {
+          "document_id": "remote_work",
+          "cosine": 0.3189627528190613
+        }
+      ]
+    },
+    {
+      "query": "在家里怎样安全访问公司的内部系统？",
+      "relevant": "remote_work",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "remote_work",
+          "cosine": 0.6894775629043579
+        },
+        {
+          "document_id": "network_security",
+          "cosine": 0.6406159400939941
+        },
+        {
+          "document_id": "fire_emergency",
+          "cosine": 0.44448554515838623
+        }
+      ]
+    },
+    {
+      "query": "远程连接内网除了 VPN 还需要什么验证？",
+      "relevant": "remote_work",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "remote_work",
+          "cosine": 0.5924426317214966
+        },
+        {
+          "document_id": "network_security",
+          "cosine": 0.4230928122997284
+        },
+        {
+          "document_id": "password_reset",
+          "cosine": 0.38253939151763916
+        }
+      ]
+    },
+    {
+      "query": "刚入职的员工必须学习哪些课程？",
+      "relevant": "training",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "training",
+          "cosine": 0.5985895395278931
+        },
+        {
+          "document_id": "recruitment",
+          "cosine": 0.4436533451080322
+        },
+        {
+          "document_id": "fire_emergency",
+          "cosine": 0.38950175046920776
+        }
+      ]
+    },
+    {
+      "query": "新人试用期内需要通过什么考核？",
+      "relevant": "training",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "training",
+          "cosine": 0.570799708366394
+        },
+        {
+          "document_id": "recruitment",
+          "cosine": 0.43609505891799927
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.4164104163646698
+        }
+      ]
+    },
+    {
+      "query": "公司购买设备为什么要找三家供应商询价？",
+      "relevant": "purchase",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "purchase",
+          "cosine": 0.614604115486145
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.2603171467781067
+        },
+        {
+          "document_id": "customer_complaint",
+          "cosine": 0.2541906237602234
+        }
+      ]
+    },
+    {
+      "query": "采购专业服务在下单前要走什么审批？",
+      "relevant": "purchase",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "purchase",
+          "cosine": 0.7311824560165405
+        },
+        {
+          "document_id": "contract_renewal",
+          "cosine": 0.45753929018974304
+        },
+        {
+          "document_id": "inventory",
+          "cosine": 0.4086475372314453
+        }
+      ]
+    },
+    {
+      "query": "工资条里的社保和个人所得税是怎么扣的？",
+      "relevant": "salary",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "salary",
+          "cosine": 0.6289750337600708
+        },
+        {
+          "document_id": "travel_reimbursement",
+          "cosine": 0.27400150895118713
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.267873078584671
+        }
+      ]
+    },
+    {
+      "query": "每月薪酬由哪些项目组成？",
+      "relevant": "salary",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "salary",
+          "cosine": 0.4480352997779846
+        },
+        {
+          "document_id": "recruitment",
+          "cosine": 0.2625095248222351
+        },
+        {
+          "document_id": "annual_leave",
+          "cosine": 0.24875110387802124
+        }
+      ]
+    },
+    {
+      "query": "办公楼冒烟时员工应该从哪里撤离？",
+      "relevant": "fire_emergency",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "fire_emergency",
+          "cosine": 0.7564314603805542
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.42580103874206543
+        },
+        {
+          "document_id": "remote_work",
+          "cosine": 0.4238850772380829
+        }
+      ]
+    },
+    {
+      "query": "发生火情能不能乘电梯下楼？",
+      "relevant": "fire_emergency",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "fire_emergency",
+          "cosine": 0.590858519077301
+        },
+        {
+          "document_id": "network_security",
+          "cosine": 0.2428053319454193
+        },
+        {
+          "document_id": "meeting_room",
+          "cosine": 0.22810205817222595
+        }
+      ]
+    },
+    {
+      "query": "扫描件 PDF 为什么搜索不到里面的文字？",
+      "relevant": "document_index",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "document_index",
+          "cosine": 0.6698935627937317
+        },
+        {
+          "document_id": "inventory",
+          "cosine": 0.16282972693443298
+        },
+        {
+          "document_id": "network_security",
+          "cosine": 0.15449699759483337
+        }
+      ]
+    },
+    {
+      "query": "遇到加密文档时索引程序会不会卡住后续文件？",
+      "relevant": "document_index",
+      "rank": 1,
+      "top3": [
+        {
+          "document_id": "document_index",
+          "cosine": 0.512619137763977
+        },
+        {
+          "document_id": "network_security",
+          "cosine": 0.38948142528533936
+        },
+        {
+          "document_id": "backup_restore",
+          "cosine": 0.3759933412075043
+        }
+      ]
+    }
+  ]
+}

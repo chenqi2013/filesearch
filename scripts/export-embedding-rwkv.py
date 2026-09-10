@@ -44,8 +44,9 @@ class Rwkv7Function(torch.autograd.Function):
             vv = value[:, token_index].view(batch_size, 12, 64, 1)
             aa = in_context_key[:, token_index].view(batch_size, 12, 64, 1)
             bb = in_context_value[:, token_index].view(batch_size, 12, 1, 64)
-            state = state * ww
-            state = state + torch.matmul(torch.matmul(state, aa), bb) + torch.matmul(vv, kk)
+            decay_factor = torch.exp(-0.6065306597 * ww)
+            projection = torch.matmul(torch.matmul(state, aa), bb)
+            state = state * decay_factor + projection + torch.matmul(vv, kk)
             outputs.append(torch.matmul(state, rr).view(batch_size, hidden_size))
         return torch.stack(outputs, dim=1)
 
@@ -208,26 +209,16 @@ class EmbeddingRwkvTiny(nn.Module):
 
 
 def verify(wrapper: nn.Module, checkpoint: Path, repository: Path) -> None:
-    sys.path.insert(0, str(repository / "package" / "src"))
-    from rwkv_emb.model import EmbeddingRWKV
-    from rwkv_emb.tokenizer import RWKVTokenizer
+    import importlib.util
 
-    official = EmbeddingRWKV(str(checkpoint)).eval()
-    tokenizer = RWKVTokenizer()
-    texts = ["本地文档搜索", "EmbeddingRWKV Tiny test"]
-    token_batch = [tokenizer.encode(text, add_eos=True) for text in texts]
-    max_length = max(len(tokens) for tokens in token_batch)
-    token_batch = [[0] * (max_length - len(tokens)) + tokens for tokens in token_batch]
-    tokens = torch.tensor(token_batch, dtype=torch.long)
-    with torch.inference_mode():
-        expected, _ = official.forward_text_only(token_batch, None)
-        actual = wrapper(tokens)
-    maximum_error = (expected.float() - actual.float()).abs().max().item()
-    cosine = F.cosine_similarity(expected.float(), actual.float()).tolist()
-    print(f"Verification max error: {maximum_error:.6g}; cosine: {cosine}")
-    if minimum := min(cosine):
-        if minimum < 0.9999:
-            raise RuntimeError(f"Export wrapper does not match official implementation: {minimum}")
+    spec = importlib.util.spec_from_file_location(
+        "rwkv_audit", Path(__file__).with_name("audit-embedding-rwkv.py")
+    )
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    namespace, _ = audit.load_reference(repository)
+    state = torch.load(checkpoint, map_location="cpu", mmap=True, weights_only=True)
+    audit.verify(namespace, state, wrapper)
 
 
 def export_vocab(repository: Path, output: Path) -> None:

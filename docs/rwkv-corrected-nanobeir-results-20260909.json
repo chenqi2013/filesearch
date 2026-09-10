@@ -1,0 +1,397 @@
+{
+  "dataset_id": "sentence-transformers/NanoBEIR-en",
+  "dataset_revision": "beb106fbcfaa599c508c667041bf8c85fd78736b",
+  "upstream_revision": "13613c08d03c82b2fa4bd9b414e946132aa331b0",
+  "checkpoint_sha256": "9033eec92f163d1a710474977fa3fb68b7ee04697e0e961d83434743bd256a15",
+  "onnx_sha256": "9d0985b53784997f07359a465d4e35da9d307265081bb69ac1eaf11c9b677b83",
+  "executable_sha256": "3ada569ee6c17dcdd60988d2de216602c1e02cf1e87dbf94c8b02bfcb7616654",
+  "protocol": {
+    "profile": "rwkv7-tiny-corrected-single-eos-v2",
+    "device": "CPU",
+    "max_tokens": 1024,
+    "batch_size": 4,
+    "instruction": null,
+    "pooling": "single EOS",
+    "reranker": false,
+    "official_mteb_runner": false,
+    "qrels": "binary",
+    "similarity": "cosine"
+  },
+  "results": [
+    {
+      "ndcg@10": 0.7065929007230402,
+      "recall@10": 0.84,
+      "hit_rate@10": 0.84,
+      "accuracy@1": 0.56,
+      "name": "SciFact",
+      "documents": 2919,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.6931857999989006,
+        "inference_seconds": 650.5067990999996,
+        "tokens": 895524
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0016083999998954823,
+        "inference_seconds": 0.929307799999151,
+        "tokens": 1039
+      },
+      "retrieval_seconds": 0.01924950000102399,
+      "rust_process_peak_rss_mb": 1144.5859375,
+      "parquet_sha256": {
+        "corpus": "ece958f761f10a813a3ca17bfb63455629b110116abf00a3f51396b69664d358",
+        "queries": "0b621d5ea9ba032b88a52c4ea894f98114cc6eb5d6a999520ada0c6bee9c6f27",
+        "qrels": "0bfe8b38bac22fafab42cc3d9f0161ff57e50cd13c49757ade474e9acc675f55"
+      }
+    },
+    {
+      "ndcg@10": 0.5463210055850015,
+      "recall@10": 0.88,
+      "hit_rate@10": 0.88,
+      "accuracy@1": 0.18,
+      "name": "ArguAna",
+      "documents": 3635,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.6306536000010965,
+        "inference_seconds": 501.7930283000005,
+        "tokens": 754349
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.016918600000281003,
+        "inference_seconds": 8.468885799999043,
+        "tokens": 12320
+      },
+      "retrieval_seconds": 0.016313199999785866,
+      "rust_process_peak_rss_mb": 1144.5859375,
+      "parquet_sha256": {
+        "corpus": "9ae34836d485a4b1f83fd0605f444e8f3f0677a375cb6c8b542904a7b4c904a9",
+        "queries": "e0dfec4d3c90355e0d11bc8e50a54622a533ee1c8feeb89ece700a7134d8b237",
+        "qrels": "bb469a9580d0872c54d9f8ff118243f1b77abfe8809a033ce5817ecf25bd9370"
+      }
+    },
+    {
+      "ndcg@10": 0.2733472321997066,
+      "recall@10": 0.32,
+      "hit_rate@10": 0.64,
+      "accuracy@1": 0.26,
+      "name": "ClimateFEVER",
+      "documents": 3408,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.9238579999982903,
+        "inference_seconds": 733.1920045000006,
+        "tokens": 1122181
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0018254000005981652,
+        "inference_seconds": 1.1365042999987054,
+        "tokens": 1383
+      },
+      "retrieval_seconds": 0.01402109999980894,
+      "rust_process_peak_rss_mb": 1201.359375,
+      "parquet_sha256": {
+        "corpus": "01da7329c55ecc4a8e8a3544e3df99e6bea9f40aa511db18befcb10de39f2990",
+        "queries": "4cea2c60a71aca2efde3d2aa64e4e4a2441da8f460e0d6a43fe7657975edd3b7",
+        "qrels": "806b8b8f787b1f8f19c367512e92c73d933716d9f6b079999ba2b2ed442d8340"
+      }
+    },
+    {
+      "ndcg@10": 0.41037311083527855,
+      "recall@10": 0.25487981536507565,
+      "hit_rate@10": 0.88,
+      "accuracy@1": 0.42,
+      "name": "DBPedia",
+      "documents": 6045,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.36336040000060166,
+        "inference_seconds": 319.71160190000046,
+        "tokens": 478825
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0006772999986424111,
+        "inference_seconds": 0.5317606999997224,
+        "tokens": 416
+      },
+      "retrieval_seconds": 0.02505380000002333,
+      "rust_process_peak_rss_mb": 1237.1484375,
+      "parquet_sha256": {
+        "corpus": "fdaca6b15b4f2231c31ecd50569e31c4743bf2961598c577ce0f9a4a2ee4ac1f",
+        "queries": "d90da885f45533a77b7b671666afbe22fbba2a3a691ac06c044d990959b50b0a",
+        "qrels": "3090230e42a469717641985eccd839b78b1d54aa6cabbb0a83f08ee2f963068a"
+      }
+    },
+    {
+      "ndcg@10": 0.6954087750197718,
+      "recall@10": 0.8566666666666667,
+      "hit_rate@10": 0.9,
+      "accuracy@1": 0.5,
+      "name": "FEVER",
+      "documents": 4996,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 1.0609135999984574,
+        "inference_seconds": 867.1687302000028,
+        "tokens": 1338987
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.001044600001478102,
+        "inference_seconds": 0.6351528999985021,
+        "tokens": 617
+      },
+      "retrieval_seconds": 0.020750600000610575,
+      "rust_process_peak_rss_mb": 1246.3203125,
+      "parquet_sha256": {
+        "corpus": "44ba16cc807bab801c3e45df054c9b711a6b58260e3a18d76e91f3ef160d1c4e",
+        "queries": "bdaba371eb97e4ed2a8d7a59446197d708993402abef0a584791d2717c9b2a51",
+        "qrels": "32758317a399a6569b1325bbbf2259c397bb43b5fe4aa59e9993f52a3d071902"
+      }
+    },
+    {
+      "ndcg@10": 0.43319998624537776,
+      "recall@10": 0.5219365079365079,
+      "hit_rate@10": 0.66,
+      "accuracy@1": 0.36,
+      "name": "FiQA2018",
+      "documents": 4598,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.6502518999986933,
+        "inference_seconds": 595.8781662000001,
+        "tokens": 915877
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0009804000001167879,
+        "inference_seconds": 0.6589002000000619,
+        "tokens": 676
+      },
+      "retrieval_seconds": 0.018667600001208484,
+      "rust_process_peak_rss_mb": 1253.3828125,
+      "parquet_sha256": {
+        "corpus": "e6ff315a9fbd61e70c0f320c9ef04602b3d71794ee3ed422ea232ede87d314a0",
+        "queries": "0529ff05670678d9896ccb60d45c35ce730d1dc6d6fed522e66fdec7d1291a92",
+        "qrels": "21bc1504b6d5efb1bf78236d08b5b0a81c352fb1aadb02d8959ba94fbf01e8ba"
+      }
+    },
+    {
+      "ndcg@10": 0.5881690543323458,
+      "recall@10": 0.66,
+      "hit_rate@10": 0.9,
+      "accuracy@1": 0.58,
+      "name": "HotpotQA",
+      "documents": 5090,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.32987929999944754,
+        "inference_seconds": 282.5807834999978,
+        "tokens": 419794
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0013722000003326684,
+        "inference_seconds": 0.9234064999982365,
+        "tokens": 1039
+      },
+      "retrieval_seconds": 0.021428200001537334,
+      "rust_process_peak_rss_mb": 1253.46875,
+      "parquet_sha256": {
+        "corpus": "2b57b69da195e7349d210405fc4250d5ab20373aadf2cae6c15247eae30727e7",
+        "queries": "08a64060e167573c974a965a944effafa89e2aa9dd4d97a3411c82571e249387",
+        "qrels": "2bb77ea2883970e1a48b00e5c24a5a61206bf534f7f892e0b8070d7112de7a1b"
+      }
+    },
+    {
+      "ndcg@10": 0.34941499182545194,
+      "recall@10": 0.52,
+      "hit_rate@10": 0.52,
+      "accuracy@1": 0.18,
+      "name": "MSMARCO",
+      "documents": 5043,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.2795146999997087,
+        "inference_seconds": 250.78610520000075,
+        "tokens": 372087
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0005744999980379362,
+        "inference_seconds": 0.4894568999989133,
+        "tokens": 385
+      },
+      "retrieval_seconds": 0.020067800000106217,
+      "rust_process_peak_rss_mb": 1253.46875,
+      "parquet_sha256": {
+        "corpus": "685715c7e0a66d0219572dcd43c3905782868d1aae885259768431f7d7eda830",
+        "queries": "7cb9d7534660847f303211b9bdf84bcb3a3530f6e20e3c6050e77fc7ae77d0cd",
+        "qrels": "6cd84c97a6ed813ffccbbb0b7aacc3051641f40a5869e0a15415823caf65c0d1"
+      }
+    },
+    {
+      "ndcg@10": 0.22624804204470428,
+      "recall@10": 0.0981734511846565,
+      "hit_rate@10": 0.54,
+      "accuracy@1": 0.24,
+      "name": "NFCorpus",
+      "documents": 2953,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.775406100001419,
+        "inference_seconds": 631.9239009000012,
+        "tokens": 962152
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0005328000006556977,
+        "inference_seconds": 0.5829325999984576,
+        "tokens": 326
+      },
+      "retrieval_seconds": 0.03965339999922435,
+      "rust_process_peak_rss_mb": 1255.88671875,
+      "parquet_sha256": {
+        "corpus": "d50e7ac973d4367434b68c1e7eb54d7827b29d85aa54a1dde42883f05fbf7d95",
+        "queries": "e9a58c2e1f392a83b26eade3d9838f7448c8a6cdb34f7257f3475cb76024aec2",
+        "qrels": "d97ea8176db52aa04773f2459d02e20c582ed9aa694801201cd21e841a00f200"
+      }
+    },
+    {
+      "ndcg@10": 0.44096568753996224,
+      "recall@10": 0.65,
+      "hit_rate@10": 0.68,
+      "accuracy@1": 0.28,
+      "name": "NQ",
+      "documents": 5035,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.4702900000011141,
+        "inference_seconds": 398.07655220000015,
+        "tokens": 592016
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.000941999998758547,
+        "inference_seconds": 0.5966335000011895,
+        "tokens": 566
+      },
+      "retrieval_seconds": 0.019964399998571025,
+      "rust_process_peak_rss_mb": 1267.53125,
+      "parquet_sha256": {
+        "corpus": "85d306945cd09cb748ca5b198b281a4f1f034b8240f8c5ecacceb68e38a1db0a",
+        "queries": "3731f4ac7be9dc1054783ea700ee883d8fd8ad2283da259b1216fff0b4107a5e",
+        "qrels": "f08f73ba0246a9ec1282ca26b48faa24cffb7e1e223354b7fb14fa9f4339e112"
+      }
+    },
+    {
+      "ndcg@10": 0.9272740742908807,
+      "recall@10": 0.99,
+      "hit_rate@10": 1,
+      "accuracy@1": 0.88,
+      "name": "QuoraRetrieval",
+      "documents": 5046,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.04803700000047684,
+        "inference_seconds": 63.84597120000035,
+        "tokens": 68415
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.0008039000022108667,
+        "inference_seconds": 0.654262000000017,
+        "tokens": 614
+      },
+      "retrieval_seconds": 0.02170260000275448,
+      "rust_process_peak_rss_mb": 1267.53125,
+      "parquet_sha256": {
+        "corpus": "c1e1efd3ed13e3458788f973706ff0ef8cdaedd028ba8ca3454421a92eee0659",
+        "queries": "6c5d11240a0d3868bd4fd8c2d2dc76b4de0b21e777501832aae5ce659faaf633",
+        "qrels": "d7ea957c68ea0736465643ee388b37669e21b953aae715f7f22aeedbd0819b12"
+      }
+    },
+    {
+      "ndcg@10": 0.3656039695816164,
+      "recall@10": 0.38366666666666666,
+      "hit_rate@10": 0.84,
+      "accuracy@1": 0.42,
+      "name": "SCIDOCS",
+      "documents": 2210,
+      "queries": 50,
+      "document_timing": {
+        "tokenization_seconds": 0.33647039999777917,
+        "inference_seconds": 256.87614549999853,
+        "tokens": 384529
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.001266600000235485,
+        "inference_seconds": 0.6877934000003734,
+        "tokens": 748
+      },
+      "retrieval_seconds": 0.009214499998051906,
+      "rust_process_peak_rss_mb": 1274.7109375,
+      "parquet_sha256": {
+        "corpus": "4552d68895b1203ab2e01d79d8bd77b51815f0b41e798da0ca60273fa3157250",
+        "queries": "6dea625938502cb758fcf225bb45ecb00fe01c474ffecb266ed31fd3a123b548",
+        "qrels": "132c06c8315fd020d9573dd5b34d69dc276f057ebe1adc265ad62751c21a0265"
+      }
+    },
+    {
+      "ndcg@10": 0.3960932809194025,
+      "recall@10": 0.24547483928133562,
+      "hit_rate@10": 0.9795918367346939,
+      "accuracy@1": 0.42857142857142855,
+      "name": "Touche2020",
+      "documents": 5745,
+      "queries": 49,
+      "document_timing": {
+        "tokenization_seconds": 1.9144384999999602,
+        "inference_seconds": 1436.0225361000012,
+        "tokens": 2152617
+      },
+      "query_timing": {
+        "tokenization_seconds": 0.000778000001446344,
+        "inference_seconds": 0.5348412999992433,
+        "tokens": 447
+      },
+      "retrieval_seconds": 0.022794600001361687,
+      "rust_process_peak_rss_mb": 1274.7109375,
+      "parquet_sha256": {
+        "corpus": "5ae883dbf2cb6573672722741ad7b34761346bf99c2adaf85727ea69eb86b146",
+        "queries": "d1673ebd1175a1b135e8641092e2ad87b5e76a526853d1f75e3c1c16fc621cd3",
+        "qrels": "e1b7500589ed1356a38623d816e05073c5c7e48bcf6e9d263b22741b62940ed5"
+      }
+    }
+  ],
+  "complete": true,
+  "verification": {
+    "legacy": 0.021018043160438538,
+    "decay_only": 0.0027291011065244675,
+    "order_only": 0.02189910039305687,
+    "corrected": 7.450580596923828e-9,
+    "decay_identity_max_error": 5.960464477539063e-8,
+    "full_model_max_error": 0.0000034570693969726562,
+    "full_model_min_cosine": 1,
+    "stop_padding_max_error": 0.000004686415195465088,
+    "rust_onnx_max_error": 8.046627044677734e-7,
+    "rust_onnx_min_cosine": 1
+  },
+  "local_diagnostic": {
+    "ndcg@10": 1,
+    "recall@10": 1,
+    "hit_rate@10": 1,
+    "accuracy@1": 1,
+    "name": "ChineseDiagnostic",
+    "documents": 20,
+    "queries": 40,
+    "document_timing": {
+      "tokenization_seconds": 0.0008142000006046146,
+      "inference_seconds": 0.849867600001744,
+      "tokens": 1269
+    },
+    "query_timing": {
+      "tokenization_seconds": 0.0005920999974478036,
+      "inference_seconds": 0.6378417999985686,
+      "tokens": 724
+    },
+    "retrieval_seconds": 0.0007339999974647071,
+    "rust_process_peak_rss_mb": 1274.7109375,
+    "sha256": "9fd28d2b0f8977dc5435acec4d6bda56d15e75754c6a2558261092cffb7671d6"
+  },
+  "macro_ndcg@10": 0.4891547777801954,
+  "full_nanobeir": true
+}
