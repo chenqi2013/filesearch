@@ -35,6 +35,7 @@ export interface SearchResult {
   size: number;
   snippet: string;
   score: number;
+  duplicates?: IndexedDocument[];
 }
 
 export interface SearchResponse {

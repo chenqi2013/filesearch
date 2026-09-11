@@ -1,5 +1,5 @@
 use crate::embedding::{query_terms, EmbeddingEngine};
-use crate::model::{SearchMode, SearchRequest, SearchResult, StoredDocument};
+use crate::model::{IndexedDocument, SearchMode, SearchRequest, SearchResult, StoredDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
 use anyhow::Result;
@@ -9,6 +9,7 @@ use std::collections::HashMap;
 struct Candidate {
     keyword: f32,
     semantic: f32,
+    semantic_relevance: f32,
     snippet: Option<String>,
     semantic_snippet: Option<String>,
 }
@@ -84,20 +85,17 @@ pub fn search(
                 }
             }
         } else {
-            for (document_id, chunk_id, score) in semantic_chunks {
+            for (document_id, text, score) in semantic_chunks {
                 if score < RAW_SEMANTIC_MIN_SCORE {
                     continue;
                 }
-                let Some(chunk) = storage.chunk(chunk_id)? else {
-                    continue;
-                };
-                if !by_id.contains_key(chunk.document_id.as_str()) {
+                if !by_id.contains_key(document_id.as_str()) {
                     continue;
                 }
                 let candidate = candidates.entry(document_id).or_default();
                 if score > candidate.semantic {
                     candidate.semantic = score;
-                    candidate.semantic_snippet = Some(chunk.text);
+                    candidate.semantic_snippet = Some(text);
                 }
             }
         }
@@ -111,6 +109,38 @@ pub fn search(
             }
         }
     }
+    let fingerprints = storage.content_fingerprints();
+    for (document_id, candidate) in &mut candidates {
+        if let Some(document) = by_id.get(document_id.as_str()) {
+            let semantic_text = candidate
+                .semantic_snippet
+                .as_deref()
+                .unwrap_or(document.name.as_str());
+            let coverage = term_coverage(&terms, &format!("{} {semantic_text}", document.name));
+            candidate.semantic_relevance =
+                candidate.semantic * 0.72 + coverage * 0.28 + candidate.keyword * 0.18;
+        }
+    }
+    let keyword_ranks = channel_ranks(
+        candidates
+            .iter()
+            .filter(|(_, candidate)| candidate.keyword > 0.0)
+            .map(|(id, candidate)| (id.clone(), candidate.keyword))
+            .collect(),
+        &fingerprints,
+    );
+    let semantic_ranks = channel_ranks(
+        candidates
+            .iter()
+            .filter(|(_, candidate)| {
+                candidate.semantic >= RAW_SEMANTIC_MIN_SCORE
+                    && candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE
+                    && (candidate.keyword > 0.0 || candidate.semantic >= SEMANTIC_ONLY_MIN_SCORE)
+            })
+            .map(|(id, candidate)| (id.clone(), candidate.semantic_relevance))
+            .collect(),
+        &fingerprints,
+    );
     let mut ranked = candidates
         .into_iter()
         .filter_map(|(document_id, candidate)| {
@@ -120,13 +150,6 @@ pub fn search(
             } else {
                 0.0
             };
-            let semantic_text = candidate
-                .semantic_snippet
-                .as_deref()
-                .unwrap_or(document.name.as_str());
-            let lexical_relevance =
-                term_coverage(&terms, &format!("{} {semantic_text}", document.name));
-            let calibrated_semantic = candidate.semantic * 0.72 + lexical_relevance * 0.28;
             if candidate.keyword == 0.0
                 && filename_boost == 0.0
                 && candidate.semantic < SEMANTIC_ONLY_MIN_SCORE
@@ -135,8 +158,11 @@ pub fn search(
             }
             let score = match request.mode {
                 SearchMode::Keyword => candidate.keyword,
-                SearchMode::Semantic => calibrated_semantic + candidate.keyword * 0.18,
-                SearchMode::Hybrid => candidate.keyword * 0.62 + calibrated_semantic * 0.38,
+                SearchMode::Semantic => candidate.semantic_relevance,
+                SearchMode::Hybrid => reciprocal_rank_score(
+                    keyword_ranks.get(&document_id).copied(),
+                    semantic_ranks.get(&document_id).copied(),
+                ),
             } + filename_boost;
             let threshold = match request.mode {
                 SearchMode::Keyword => 0.01,
@@ -146,7 +172,16 @@ pub fn search(
             let matched_text = match request.mode {
                 SearchMode::Keyword => candidate.snippet,
                 SearchMode::Semantic => candidate.semantic_snippet.or(candidate.snippet),
-                SearchMode::Hybrid if candidate.semantic > candidate.keyword => {
+                SearchMode::Hybrid
+                    if semantic_ranks
+                        .get(&document_id)
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                        < keyword_ranks
+                            .get(&document_id)
+                            .copied()
+                            .unwrap_or(usize::MAX) =>
+                {
                     candidate.semantic_snippet.or(candidate.snippet)
                 }
                 SearchMode::Hybrid => candidate.snippet.or(candidate.semantic_snippet),
@@ -160,6 +195,8 @@ pub fn search(
             .total_cmp(&left.1)
             .then_with(|| left.0.cmp(&right.0))
     });
+    let mut seen = std::collections::HashSet::new();
+    ranked.retain(|(id, _, _)| seen.insert(fingerprints.get(id).unwrap_or(id).clone()));
     ranked.truncate(request.limit.clamp(1, 100));
 
     let mut results = Vec::with_capacity(ranked.len());
@@ -177,10 +214,56 @@ pub fn search(
             modified_ms: document.modified_ms,
             size: document.size,
             snippet: snippet(&text, &request.query),
+            duplicates: documents
+                .iter()
+                .filter(|other| {
+                    other.id != document.id
+                        && fingerprints.get(&document.id).is_some_and(|fingerprint| {
+                            fingerprints.get(&other.id) == Some(fingerprint)
+                        })
+                })
+                .map(|other| IndexedDocument {
+                    id: other.id.clone(),
+                    path: other.path.clone(),
+                    name: other.name.clone(),
+                    extension: other.extension.clone(),
+                    modified_ms: other.modified_ms,
+                    size: other.size,
+                })
+                .collect(),
             score: ((score.clamp(0.0, 1.0) * 100.0).round()) / 100.0,
         });
     }
     Ok(results)
+}
+
+fn channel_ranks(
+    mut scores: Vec<(String, f32)>,
+    fingerprints: &HashMap<String, String>,
+) -> HashMap<String, usize> {
+    scores.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut groups = HashMap::new();
+    let mut ranks = HashMap::new();
+    for (id, _) in scores {
+        let next_rank = groups.len() + 1;
+        let key = fingerprints.get(&id).unwrap_or(&id).clone();
+        let rank = *groups.entry(key).or_insert(next_rank);
+        ranks.insert(id, rank);
+    }
+    ranks
+}
+
+fn reciprocal_rank_score(keyword: Option<usize>, semantic: Option<usize>) -> f32 {
+    const RRF_OFFSET: f32 = 60.0;
+    let contribution = |rank: Option<usize>| {
+        rank.map_or(0.0, |rank| (RRF_OFFSET + 1.0) / (RRF_OFFSET + rank as f32))
+    };
+    (contribution(keyword) + contribution(semantic)) * 0.5
 }
 
 fn keyword_is_relevant(terms: &[String], coverage: f32) -> bool {
@@ -231,7 +314,13 @@ fn snippet(text: &str, query: &str) -> String {
     }
     let lower = text.to_lowercase();
     let query_lower = query.to_lowercase();
-    let byte_position = lower.find(&query_lower).unwrap_or(0);
+    let byte_position = lower.find(&query_lower).unwrap_or_else(|| {
+        query_terms(query)
+            .iter()
+            .filter_map(|term| lower.find(term))
+            .min()
+            .unwrap_or(0)
+    });
     let char_position = lower[..byte_position].chars().count();
     let start = char_position.saturating_sub(70);
     let end = (start + WINDOW).min(chars.len());
@@ -255,6 +344,98 @@ mod tests {
         let value = snippet(&text, "目标词");
         assert!(value.chars().count() <= 266);
         assert!(value.contains("目标词"));
+    }
+
+    #[test]
+    fn reciprocal_ranks_reward_agreement_without_duplicate_crowding() {
+        let fingerprints = HashMap::from([
+            ("first".to_owned(), "same".to_owned()),
+            ("copy".to_owned(), "same".to_owned()),
+        ]);
+        let ranks = channel_ranks(
+            vec![
+                ("first".to_owned(), 0.9),
+                ("copy".to_owned(), 0.8),
+                ("other".to_owned(), 0.7),
+            ],
+            &fingerprints,
+        );
+        assert_eq!(ranks["first"], 1);
+        assert_eq!(ranks["copy"], 1);
+        assert_eq!(ranks["other"], 2);
+        assert!(reciprocal_rank_score(Some(2), Some(2)) > reciprocal_rank_score(Some(1), None));
+        assert_eq!(reciprocal_rank_score(None, None), 0.0);
+        assert_eq!(reciprocal_rank_score(Some(1), Some(1)), 1.0);
+    }
+
+    #[test]
+    fn duplicate_folding_preserves_paths_limit_and_extension_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        for (id, extension, body) in [
+            ("first", "txt", "backup restore"),
+            ("copy", "txt", "backup restore"),
+            ("pdf", "pdf", "backup restore"),
+            ("other", "txt", "backup schedule details"),
+        ] {
+            let document = crate::model::PreparedDocument {
+                id: id.to_owned(),
+                root: "/test".to_owned(),
+                path: format!("/test/{id}.{extension}"),
+                name: format!("{id}.{extension}"),
+                extension: extension.to_owned(),
+                modified_ms: 1,
+                size: 12,
+                chunks: vec![body.to_owned()],
+                embedding: Vec::new(),
+            };
+            let chunks = storage.upsert_document(&document).unwrap();
+            index
+                .replace_document(&document.id, &document.name, &chunks)
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("unused-model"));
+        let mut request = SearchRequest {
+            query: "backup".to_owned(),
+            mode: SearchMode::Keyword,
+            extension: None,
+            limit: 2,
+        };
+        let results = search(&storage, &index, &engine, &request).unwrap();
+        assert_eq!(results.len(), 2);
+        let grouped = results
+            .iter()
+            .find(|result| !result.duplicates.is_empty())
+            .unwrap();
+        assert_eq!(grouped.duplicates.len(), 2);
+        let ids = std::iter::once(grouped.id.as_str())
+            .chain(
+                grouped
+                    .duplicates
+                    .iter()
+                    .map(|document| document.id.as_str()),
+            )
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["first", "copy", "pdf"])
+        );
+        request.extension = Some("txt".to_owned());
+        let results = search(&storage, &index, &engine, &request).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .flat_map(|result| &result.duplicates)
+            .all(|document| document.extension == "txt"));
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.duplicates.len())
+                .sum::<usize>(),
+            1
+        );
     }
 
     #[test]

@@ -73,6 +73,12 @@ def main():
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    modes = ("keyword", "semantic", "hybrid")
+    if args.cases:
+        if request(args.base_url, "/stats")["status"] != "ready":
+            raise RuntimeError("Wait for indexing to complete")
+        for mode in modes:
+            request(args.base_url, "/search", {"query": "初始化检索", "mode": mode, "limit": 50})
     before = snapshot(args.base_url)
     output = {"created_at": datetime.now(timezone.utc).isoformat(),
               "corpus_sha256": fingerprint(before), **before}
@@ -91,9 +97,6 @@ def main():
                 raise ValueError(f"Unknown document in case {case['id']}")
             if (case["kind"] == "negative") != (not expected):
                 raise ValueError(f"Invalid relevance labels in case {case['id']}")
-        modes = ("keyword", "semantic", "hybrid")
-        for mode in modes:
-            request(args.base_url, "/search", {"query": "初始化检索", "mode": mode, "limit": 50})
         rows = []
         for case_index, case in enumerate(queries):
             ordered_modes = modes[case_index % 3:] + modes[:case_index % 3]
@@ -104,7 +107,9 @@ def main():
                 })
                 expected = set(case["relevant_ids"])
                 rank = next((position for position, result in enumerate(response["results"], 1)
-                             if result["id"] in expected), None)
+                             if expected.intersection(
+                                 [result["id"], *[item["id"] for item in result.get("duplicates", [])]]
+                             )), None)
                 rows.append({**case, "mode": mode, "rank": rank,
                              "returned": len(response["results"]), "server_ms": response["elapsed_ms"],
                              "wall_ms": (time.perf_counter() - started) * 1000,
@@ -117,6 +122,7 @@ def main():
         ):
             raise RuntimeError("Corpus or model changed during evaluation")
         output.update({"cases_sha256": hashlib.sha256(cases_bytes).hexdigest(), "rows": rows,
+                       "relevance_unit": "result group including same-text duplicate files",
                        "summary": {mode: summarize([row for row in rows if row["mode"] == mode])
                                    for mode in modes},
                        "by_kind": {kind: {mode: summarize([row for row in rows if row["mode"] == mode

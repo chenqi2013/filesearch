@@ -24,8 +24,9 @@ const EMBEDDING_BATCH_SIZE: usize = 4;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
-const MAX_SEMANTIC_CHUNKS_PER_DOCUMENT: usize = 4;
+const MAX_SEMANTIC_CHUNKS_PER_DOCUMENT: usize = 16;
 const MAX_SEMANTIC_EMBED_CHARS: usize = 480;
+const SEMANTIC_WINDOW_STRIDE: usize = 400;
 #[cfg(not(test))]
 const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -487,84 +488,29 @@ fn persist_batch(
     accumulated: &IndexTimings,
 ) -> Result<PersistTimings> {
     let mut timings = PersistTimings::default();
-    let semantic_chunks = pending
+    let mut documents = std::mem::take(pending);
+    let semantic_chunks = documents
         .iter()
         .map(semantic_chunks_for_document)
         .collect::<Vec<_>>();
-    let inputs = semantic_chunks
-        .iter()
-        .flat_map(|chunks| chunks.iter().map(|(_, text)| text.clone()))
-        .collect::<Vec<_>>();
-    let embedding_file = pending
-        .iter()
-        .zip(&semantic_chunks)
-        .max_by_key(|(_, chunks)| {
-            chunks
-                .iter()
-                .map(|(_, text)| text.chars().count())
-                .sum::<usize>()
-        })
-        .map(|(document, _)| document.path.as_str());
-    report_progress(
-        progress,
-        processed,
-        total,
-        embedding_file,
-        "embedding",
-        accumulated,
-    );
+    report_progress(progress, processed, total, None, "storage", accumulated);
     let started = Instant::now();
-    let embeddings = embedder.embed_passages(&inputs);
-    timings.embedding = started.elapsed();
-    let mut embeddings = embeddings.into_iter();
-    let chunk_vectors = semantic_chunks
-        .iter()
-        .map(|chunks| {
-            chunks
-                .iter()
-                .filter_map(|(position, _)| {
-                    embeddings.next().map(|embedding| (*position, embedding))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let documents = pending
-        .drain(..)
-        .zip(&chunk_vectors)
-        .map(|(mut document, vectors)| {
-            document.embedding = average_embedding(vectors);
-            document
-        })
-        .collect::<Vec<_>>();
-    let embedding_total = accumulated.embedding + timings.embedding;
+    let chunks = storage.upsert_documents(&documents)?;
+    timings.storage += started.elapsed();
     report_progress_with(
         progress,
         processed,
         total,
         None,
-        "storage",
+        "text_index",
         accumulated.scan,
         accumulated.check,
         accumulated.parse,
-        embedding_total,
-        accumulated.storage,
+        accumulated.embedding,
+        accumulated.storage + timings.storage,
         accumulated.text_index,
     );
     let started = Instant::now();
-    let chunks = storage.upsert_documents(&documents)?;
-    timings.storage = started.elapsed();
-    let chunk_embeddings = chunks
-        .iter()
-        .zip(&chunk_vectors)
-        .flat_map(|(stored_chunks, vectors)| {
-            vectors.iter().filter_map(|(position, embedding)| {
-                stored_chunks
-                    .get(*position)
-                    .map(|chunk| (chunk.id, embedding.clone()))
-            })
-        })
-        .collect::<Vec<_>>();
-    storage.replace_chunk_embeddings(&chunk_embeddings)?;
     let updates = documents
         .iter()
         .zip(&chunks)
@@ -576,59 +522,156 @@ fn persist_batch(
             )
         })
         .collect::<Vec<_>>();
-    let storage_total = accumulated.storage + timings.storage;
+    text_index.replace_documents(&updates)?;
+    text_index.commit()?;
+    timings.text_index += started.elapsed();
+
+    let embedding_tasks = semantic_embedding_tasks(&semantic_chunks);
+    if !embedding_tasks.is_empty() {
+        let current_file = documents.first().map(|document| document.path.as_str());
+        report_progress_with(
+            progress,
+            processed,
+            total,
+            current_file,
+            "embedding",
+            accumulated.scan,
+            accumulated.check,
+            accumulated.parse,
+            accumulated.embedding + timings.embedding,
+            accumulated.storage + timings.storage,
+            accumulated.text_index + timings.text_index,
+        );
+        let inputs = embedding_tasks
+            .iter()
+            .map(|(document_index, _, text)| {
+                semantic_chunk_text(&documents[*document_index].name, text)
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let embeddings = embedder.embed_passages(&inputs);
+        timings.embedding += started.elapsed();
+        anyhow::ensure!(
+            embeddings.len() == embedding_tasks.len(),
+            "Missing semantic passage vectors"
+        );
+        let mut vectors_by_document = vec![Vec::new(); documents.len()];
+        let updates = embedding_tasks
+            .into_iter()
+            .zip(embeddings)
+            .map(|((document_index, position, text), embedding)| {
+                vectors_by_document[document_index].push((position, embedding.clone()));
+                (chunks[document_index][position].id, text, embedding)
+            })
+            .collect::<Vec<_>>();
+        report_progress_with(
+            progress,
+            processed,
+            total,
+            current_file,
+            "storage",
+            accumulated.scan,
+            accumulated.check,
+            accumulated.parse,
+            accumulated.embedding + timings.embedding,
+            accumulated.storage + timings.storage,
+            accumulated.text_index + timings.text_index,
+        );
+        let started = Instant::now();
+        storage.replace_chunk_embeddings(&updates)?;
+        timings.storage += started.elapsed();
+        for (document, vectors) in documents.iter_mut().zip(vectors_by_document) {
+            document.embedding = average_embedding(&vectors);
+        }
+    }
     report_progress_with(
         progress,
         processed,
         total,
         None,
-        "text_index",
+        "storage",
         accumulated.scan,
         accumulated.check,
         accumulated.parse,
-        embedding_total,
-        storage_total,
-        accumulated.text_index,
+        accumulated.embedding + timings.embedding,
+        accumulated.storage + timings.storage,
+        accumulated.text_index + timings.text_index,
     );
     let started = Instant::now();
-    text_index.replace_documents(&updates)?;
-    timings.text_index = started.elapsed();
+    storage.update_document_embeddings(&documents)?;
+    timings.storage += started.elapsed();
     Ok(timings)
 }
 
 fn semantic_chunks_for_document(document: &PreparedDocument) -> Vec<(usize, String)> {
-    let count = document.chunks.len();
-    if count == 0 {
-        return Vec::new();
-    }
-    let sample_count = count.min(MAX_SEMANTIC_CHUNKS_PER_DOCUMENT);
-    (0..sample_count)
-        .map(|sample_index| {
-            let position = if sample_count == 1 {
+    let lengths = document
+        .chunks
+        .iter()
+        .map(|text| text.chars().count())
+        .collect::<Vec<_>>();
+    let counts = lengths
+        .iter()
+        .map(|length| {
+            if *length == 0 {
+                0
+            } else if *length <= MAX_SEMANTIC_EMBED_CHARS {
+                1
+            } else {
+                (length - MAX_SEMANTIC_EMBED_CHARS).div_ceil(SEMANTIC_WINDOW_STRIDE) + 1
+            }
+        })
+        .collect::<Vec<_>>();
+    let window_count = counts.iter().sum::<usize>();
+    let sample_count = window_count.min(MAX_SEMANTIC_CHUNKS_PER_DOCUMENT);
+    let selected = (0..sample_count)
+        .map(|index| {
+            if sample_count <= 1 {
                 0
             } else {
-                sample_index * (count - 1) / (sample_count - 1)
-            };
-            (
-                position,
-                semantic_chunk_text(&document.name, &document.chunks[position]),
-            )
+                index * (window_count - 1) / (sample_count - 1)
+            }
         })
-        .collect()
+        .collect::<HashSet<_>>();
+    let mut offset = 0;
+    let mut seen = HashSet::new();
+    let mut passages = Vec::new();
+    for (position, count) in counts.into_iter().enumerate() {
+        let selected_windows = (0..count)
+            .filter(|index| selected.contains(&(offset + index)))
+            .collect::<Vec<_>>();
+        if !selected_windows.is_empty() {
+            let chars = document.chunks[position].chars().collect::<Vec<_>>();
+            for index in selected_windows {
+                let start = index * SEMANTIC_WINDOW_STRIDE;
+                let end = (start + MAX_SEMANTIC_EMBED_CHARS).min(chars.len());
+                let text = chars[start..end].iter().collect::<String>();
+                if seen.insert(text.clone()) {
+                    passages.push((position, text));
+                }
+            }
+        }
+        offset += count;
+    }
+    passages
 }
 
 fn semantic_chunk_text(name: &str, text: &str) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= MAX_SEMANTIC_EMBED_CHARS {
-        return format!("{name}\n{text}");
-    }
-    let head_length = MAX_SEMANTIC_EMBED_CHARS / 2;
-    let tail_length = MAX_SEMANTIC_EMBED_CHARS - head_length;
-    let head = chars[..head_length].iter().collect::<String>();
-    let tail = chars[chars.len() - tail_length..]
+    let name = name.chars().take(160).collect::<String>();
+    format!("{name}\n{text}")
+}
+
+fn semantic_embedding_tasks(
+    semantic_chunks: &[Vec<(usize, String)>],
+) -> Vec<(usize, usize, String)> {
+    semantic_chunks
         .iter()
-        .collect::<String>();
-    format!("{name}\n{head}\n{tail}")
+        .enumerate()
+        .flat_map(|(document_index, passages)| {
+            passages
+                .iter()
+                .map(move |(position, text)| (document_index, *position, text.clone()))
+        })
+        .collect()
 }
 
 fn average_embedding(vectors: &[(usize, Vec<f32>)]) -> Vec<f32> {
@@ -1019,12 +1062,51 @@ mod tests {
     }
 
     #[test]
-    fn semantic_chunk_text_preserves_both_ends_within_embedding_budget() {
-        let text = format!("开头{}结尾", "中".repeat(800));
+    fn semantic_chunk_text_preserves_contiguous_text() {
+        let text = format!("开头{}结尾", "中".repeat(400));
         let value = semantic_chunk_text("测试.txt", &text);
         assert!(value.chars().count() <= "测试.txt".chars().count() + MAX_SEMANTIC_EMBED_CHARS + 2);
         assert!(value.starts_with("测试.txt\n开头"));
         assert!(value.ends_with("结尾"));
+    }
+
+    #[test]
+    fn semantic_embedding_tasks_preserve_document_and_window_mapping() {
+        let passages = vec![
+            vec![(2, "first tail".to_owned()), (0, "first head".to_owned())],
+            vec![(1, "second middle".to_owned())],
+        ];
+        assert_eq!(
+            semantic_embedding_tasks(&passages),
+            vec![
+                (0, 2, "first tail".to_owned()),
+                (0, 0, "first head".to_owned()),
+                (1, 1, "second middle".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_windows_cover_middle_and_end_without_joining_distant_text() {
+        let text = format!("{}中心答案{}结尾", "前".repeat(500), "后".repeat(500));
+        let document = PreparedDocument {
+            id: "id".to_owned(),
+            root: "root".to_owned(),
+            name: "test.txt".to_owned(),
+            extension: "txt".to_owned(),
+            path: "test.txt".to_owned(),
+            modified_ms: 0,
+            size: 0,
+            chunks: vec![text.clone()],
+            embedding: Vec::new(),
+        };
+        let passages = semantic_chunks_for_document(&document);
+        assert_eq!(passages.len(), 3);
+        assert!(passages.iter().any(|(_, text)| text.contains("中心答案")));
+        assert!(passages.last().unwrap().1.ends_with("结尾"));
+        assert!(passages
+            .iter()
+            .all(|(_, passage)| text.contains(passage) && passage.chars().count() <= 480));
     }
 
     #[test]

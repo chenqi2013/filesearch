@@ -446,8 +446,8 @@ fn update_progress(state: &AppState, update: indexer::ProgressUpdate<'_>) {
     let mut timing = state.index_timing.lock();
     if timing.stage != update.stage {
         timing.stage = update.stage.to_owned();
-        timing.stage_started_at = Some(Instant::now());
     }
+    timing.stage_started_at = Some(Instant::now());
     timing.scan_ms = update.scan_ms;
     timing.check_ms = update.check_ms;
     timing.parse_ms = update.parse_ms;

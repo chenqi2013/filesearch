@@ -11,6 +11,10 @@ use std::path::PathBuf;
 struct Args {
     #[arg(long)]
     model: PathBuf,
+    #[arg(long)]
+    cpu_threads: Option<usize>,
+    #[arg(long)]
+    no_spinning: bool,
 }
 
 #[derive(Deserialize)]
@@ -20,7 +24,15 @@ struct Request {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut model = rwkv::RwkvModel::load(&args.model)?;
+    let mut model = if args.cpu_threads.is_some() || args.no_spinning {
+        rwkv::RwkvModel::load_cpu_config(
+            &args.model,
+            args.cpu_threads.unwrap_or(4),
+            !args.no_spinning,
+        )?
+    } else {
+        rwkv::RwkvModel::load(&args.model)?
+    };
     eprintln!("Loaded {}", rwkv::EMBEDDING_PROFILE);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();

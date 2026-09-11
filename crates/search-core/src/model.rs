@@ -113,6 +113,7 @@ pub struct SearchResult {
     pub size: u64,
     pub snippet: String,
     pub score: f32,
+    pub duplicates: Vec<IndexedDocument>,
 }
 
 #[derive(Debug, Deserialize)]

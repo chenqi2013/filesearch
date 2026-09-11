@@ -370,18 +370,40 @@ pub struct RwkvModel {
 
 impl RwkvModel {
     pub fn load(model_path: &Path) -> Result<Self> {
-        Self::load_backend(model_path, false)
+        let processors = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2);
+        let threads = if processors >= 12 {
+            6
+        } else {
+            processors.min(4)
+        };
+        Self::load_cpu_config(model_path, threads, processors < 12)
     }
 
     pub fn load_with_cuda(model_path: &Path) -> Result<Self> {
-        Self::load_backend(model_path, true)
+        Self::load_backend(model_path, true, 4, true)
     }
 
-    fn load_backend(model_path: &Path, use_cuda: bool) -> Result<Self> {
+    pub fn load_cpu_config(model_path: &Path, threads: usize, spinning: bool) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=32).contains(&threads),
+            "CPU thread count must be between 1 and 32"
+        );
+        Self::load_backend(model_path, false, threads, spinning)
+    }
+
+    fn load_backend(
+        model_path: &Path,
+        use_cuda: bool,
+        threads: usize,
+        spinning: bool,
+    ) -> Result<Self> {
         let operators = OperatorDomain::new("com.localfind")?.add(Rwkv7Operator)?;
         let mut builder = Session::builder()?
             .with_operators(operators)?
-            .with_intra_threads(4)?
+            .with_intra_threads(threads)?
+            .with_intra_op_spinning(spinning)?
             .with_optimization_level(GraphOptimizationLevel::Level3)?;
         if use_cuda {
             builder = builder.with_execution_providers([

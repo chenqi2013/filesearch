@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,7 @@ pub struct Storage {
     connection: Mutex<Connection>,
     embeddings: RwLock<HashMap<String, CachedEmbedding>>,
     chunk_embeddings: RwLock<HashMap<u64, CachedChunkEmbedding>>,
+    fingerprints: RwLock<HashMap<String, String>>,
 }
 
 struct CachedEmbedding {
@@ -24,6 +26,7 @@ struct CachedChunkEmbedding {
     document_id: String,
     extension: String,
     vector: Vec<f32>,
+    text: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +83,19 @@ impl Storage {
                embedding BLOB NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_document ON chunk_embeddings(document_id);
+             CREATE TABLE IF NOT EXISTS semantic_passages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+               document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+               text TEXT NOT NULL,
+               embedding BLOB NOT NULL,
+               UNIQUE(chunk_id, text)
+             );
+             CREATE INDEX IF NOT EXISTS idx_semantic_passages_document ON semantic_passages(document_id);
+             CREATE TABLE IF NOT EXISTS document_fingerprints (
+               document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+               fingerprint TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS failures (
                path TEXT PRIMARY KEY,
                category TEXT NOT NULL,
@@ -89,10 +105,17 @@ impl Storage {
         )?;
         let embeddings = load_embedding_cache(&connection)?;
         let chunk_embeddings = load_chunk_embedding_cache(&connection)?;
+        let fingerprints = {
+            let mut statement =
+                connection.prepare("SELECT document_id, fingerprint FROM document_fingerprints")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<HashMap<String, String>>>()?
+        };
         Ok(Self {
             connection: Mutex::new(connection),
             embeddings: RwLock::new(embeddings),
             chunk_embeddings: RwLock::new(chunk_embeddings),
+            fingerprints: RwLock::new(fingerprints),
         })
     }
 
@@ -301,6 +324,10 @@ impl Storage {
                 }
             }
             transaction.execute("DELETE FROM failures WHERE path = ?", [&document.path])?;
+            transaction.execute(
+                "INSERT INTO document_fingerprints(document_id, fingerprint) VALUES (?, ?)",
+                params![document.id, text_fingerprint(&document.chunks)],
+            )?;
             all_chunks.push(chunks);
         }
         transaction.commit()?;
@@ -314,6 +341,9 @@ impl Storage {
             .retain(|_, embedding| !document_ids.contains(embedding.document_id.as_str()));
         let mut cache = self.embeddings.write();
         for document in documents {
+            self.fingerprints
+                .write()
+                .insert(document.id.clone(), text_fingerprint(&document.chunks));
             if document.embedding.is_empty() {
                 cache.remove(&document.id);
             } else {
@@ -334,6 +364,7 @@ impl Storage {
             .lock()
             .execute("DELETE FROM documents WHERE id = ?", [id])?;
         self.embeddings.write().remove(id);
+        self.fingerprints.write().remove(id);
         self.chunk_embeddings
             .write()
             .retain(|_, embedding| embedding.document_id != id);
@@ -365,7 +396,7 @@ impl Storage {
         query: &[f32],
         extension: Option<&str>,
         limit: usize,
-    ) -> Vec<(String, u64, f32)> {
+    ) -> Vec<(String, String, f32)> {
         let cache = self.chunk_embeddings.read();
         let mut scores = cache
             .par_iter()
@@ -378,19 +409,31 @@ impl Storage {
                 )
             })
             .collect::<Vec<_>>();
-        scores.sort_unstable_by(|left, right| right.2.total_cmp(&left.2));
-        scores.truncate(limit);
+        scores.sort_unstable_by(|left, right| {
+            right
+                .2
+                .total_cmp(&left.2)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        let mut seen = std::collections::HashSet::new();
         scores
+            .into_iter()
+            .filter(|(document_id, _, _)| seen.insert(document_id.clone()))
+            .take(limit)
+            .map(|(document_id, passage_id, score)| {
+                (document_id, cache[&passage_id].text.clone(), score)
+            })
+            .collect()
     }
 
-    pub fn replace_chunk_embeddings(&self, embeddings: &[(u64, Vec<f32>)]) -> Result<()> {
+    pub fn replace_chunk_embeddings(&self, embeddings: &[(u64, String, Vec<f32>)]) -> Result<()> {
         if embeddings.is_empty() {
             return Ok(());
         }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let mut cached = Vec::with_capacity(embeddings.len());
-        for (chunk_id, embedding) in embeddings {
+        for (chunk_id, text, embedding) in embeddings {
             let Some((document_id, extension)) = transaction
                 .query_row(
                     "SELECT c.document_id, d.extension
@@ -404,16 +447,22 @@ impl Storage {
                 continue;
             };
             transaction.execute(
-                "INSERT OR REPLACE INTO chunk_embeddings(chunk_id, document_id, embedding)
-                 VALUES (?, ?, ?)",
-                params![*chunk_id as i64, &document_id, vector_to_blob(embedding)],
+                "INSERT INTO semantic_passages(chunk_id, document_id, text, embedding)
+                 VALUES (?, ?, ?, ?) ON CONFLICT(chunk_id, text) DO UPDATE SET embedding=excluded.embedding",
+                params![*chunk_id as i64, &document_id, text, vector_to_blob(embedding)],
+            )?;
+            let passage_id: i64 = transaction.query_row(
+                "SELECT id FROM semantic_passages WHERE chunk_id = ? AND text = ?",
+                params![*chunk_id as i64, text],
+                |row| row.get(0),
             )?;
             cached.push((
-                *chunk_id,
+                passage_id as u64,
                 CachedChunkEmbedding {
                     document_id,
                     extension,
                     vector: embedding.clone(),
+                    text: text.clone(),
                 },
             ));
         }
@@ -428,6 +477,33 @@ impl Storage {
 
     pub fn has_embedding(&self, document_id: &str) -> bool {
         self.embeddings.read().contains_key(document_id)
+    }
+
+    pub fn content_fingerprints(&self) -> HashMap<String, String> {
+        self.fingerprints.read().clone()
+    }
+
+    pub fn update_document_embeddings(&self, documents: &[PreparedDocument]) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        for document in documents {
+            transaction.execute(
+                "UPDATE documents SET embedding = ? WHERE id = ?",
+                params![vector_to_blob(&document.embedding), document.id],
+            )?;
+        }
+        transaction.commit()?;
+        let mut cache = self.embeddings.write();
+        for document in documents {
+            cache.insert(
+                document.id.clone(),
+                CachedEmbedding {
+                    extension: document.extension.clone(),
+                    vector: document.embedding.clone(),
+                },
+            );
+        }
+        Ok(())
     }
 
     pub fn list_chunks(&self) -> Result<Vec<StoredChunk>> {
@@ -565,7 +641,8 @@ impl Storage {
     pub fn clear_embeddings(&self) -> Result<()> {
         self.connection.lock().execute_batch(
             "UPDATE documents SET embedding = NULL;
-             DELETE FROM chunk_embeddings;",
+             DELETE FROM chunk_embeddings;
+             DELETE FROM semantic_passages;",
         )?;
         self.embeddings.write().clear();
         self.chunk_embeddings.write().clear();
@@ -617,8 +694,8 @@ fn load_chunk_embedding_cache(
     connection: &Connection,
 ) -> Result<HashMap<u64, CachedChunkEmbedding>> {
     let mut statement = connection.prepare(
-        "SELECT ce.chunk_id, ce.document_id, d.extension, ce.embedding
-         FROM chunk_embeddings ce JOIN documents d ON d.id = ce.document_id",
+        "SELECT ce.id, ce.document_id, d.extension, ce.embedding, ce.text
+         FROM semantic_passages ce JOIN documents d ON d.id = ce.document_id",
     )?;
     let rows = statement.query_map([], |row| {
         let bytes: Vec<u8> = row.get(3)?;
@@ -628,6 +705,7 @@ fn load_chunk_embedding_cache(
                 document_id: row.get(1)?,
                 extension: row.get(2)?,
                 vector: blob_to_vector(&bytes),
+                text: row.get(4)?,
             },
         ))
     })?;
@@ -637,6 +715,15 @@ fn load_chunk_embedding_cache(
 
 fn query_count(connection: &Connection, sql: &str) -> Result<usize> {
     Ok(connection.query_row(sql, [], |row| row.get::<_, i64>(0))? as usize)
+}
+
+fn text_fingerprint(chunks: &[String]) -> String {
+    let mut digest = Sha256::new();
+    for chunk in chunks {
+        digest.update((chunk.len() as u64).to_le_bytes());
+        digest.update(chunk.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDocument> {
@@ -689,6 +776,117 @@ mod tests {
     fn vectors_round_trip_as_compact_blobs() {
         let vector = vec![0.25, -0.5, 1.0];
         assert_eq!(blob_to_vector(&vector_to_blob(&vector)), vector);
+    }
+
+    #[test]
+    fn semantic_windows_survive_restart_and_follow_document_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("search.db");
+        let storage = Storage::open(&path).unwrap();
+        let mut document = PreparedDocument {
+            id: "first".to_owned(),
+            root: "/test".to_owned(),
+            path: "/test/first.txt".to_owned(),
+            name: "first.txt".to_owned(),
+            extension: "txt".to_owned(),
+            modified_ms: 1,
+            size: 12,
+            chunks: vec!["first window and second window".to_owned()],
+            embedding: Vec::new(),
+        };
+        let chunks = storage.upsert_document(&document).unwrap();
+        let fingerprint = storage.content_fingerprints()["first"].clone();
+        storage
+            .replace_chunk_embeddings(&[
+                (chunks[0].id, "first window".to_owned(), vec![1.0, 0.0]),
+                (chunks[0].id, "second window".to_owned(), vec![0.0, 1.0]),
+            ])
+            .unwrap();
+        assert!(!storage.has_embedding("first"));
+        document.embedding = vec![1.0, 0.0];
+        storage
+            .update_document_embeddings(std::slice::from_ref(&document))
+            .unwrap();
+        assert_eq!(
+            storage.chunk(chunks[0].id).unwrap().unwrap().text,
+            document.chunks[0]
+        );
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        assert!(storage.has_embedding("first"));
+        assert_eq!(storage.content_fingerprints()["first"], fingerprint);
+        assert_eq!(storage.chunk_embeddings.read().len(), 2);
+        assert_eq!(
+            storage.semantic_chunk_search(&[0.0, 1.0], None, 10)[0].1,
+            "second window"
+        );
+        assert_eq!(
+            storage.semantic_chunk_search(&[1.0, 0.0], None, 10).len(),
+            1
+        );
+        assert!(storage
+            .semantic_chunk_search(&[1.0, 0.0], Some("pdf"), 10)
+            .is_empty());
+        storage
+            .replace_chunk_embeddings(&[(chunks[0].id, "first window".to_owned(), vec![0.0, 1.0])])
+            .unwrap();
+        assert_eq!(storage.chunk_embeddings.read().len(), 2);
+
+        document.chunks = vec!["updated body".to_owned()];
+        document.embedding.clear();
+        let chunks = storage.upsert_document(&document).unwrap();
+        assert_ne!(storage.content_fingerprints()["first"], fingerprint);
+        assert!(!storage.has_embedding("first"));
+        assert!(storage
+            .semantic_chunk_search(&[1.0, 0.0], None, 10)
+            .is_empty());
+        storage
+            .replace_chunk_embeddings(&[(chunks[0].id, "updated body".to_owned(), vec![1.0, 0.0])])
+            .unwrap();
+        storage.delete_document("first").unwrap();
+        assert!(storage.content_fingerprints().is_empty());
+        assert!(storage.chunk_embeddings.read().is_empty());
+        drop(storage);
+        let storage = Storage::open(&path).unwrap();
+        assert!(storage.chunk_embeddings.read().is_empty());
+        assert!(storage.content_fingerprints().is_empty());
+    }
+
+    #[test]
+    fn semantic_candidates_include_distinct_documents_before_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        for (id, vector) in [("first", vec![1.0, 0.0]), ("second", vec![0.8, 0.6])] {
+            let chunks = storage
+                .upsert_document(&PreparedDocument {
+                    id: id.to_owned(),
+                    root: "/test".to_owned(),
+                    path: format!("/test/{id}.txt"),
+                    name: format!("{id}.txt"),
+                    extension: "txt".to_owned(),
+                    modified_ms: 1,
+                    size: 12,
+                    chunks: vec!["first window and second window".to_owned()],
+                    embedding: Vec::new(),
+                })
+                .unwrap();
+            storage
+                .replace_chunk_embeddings(&[
+                    (chunks[0].id, "first window".to_owned(), vector.clone()),
+                    (chunks[0].id, "second window".to_owned(), vector),
+                ])
+                .unwrap();
+        }
+        let hits = storage.semantic_chunk_search(&[1.0, 0.0], None, 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "first");
+        assert_eq!(hits[1].0, "second");
+        storage.clear_embeddings().unwrap();
+        assert!(storage
+            .semantic_chunk_search(&[1.0, 0.0], None, 2)
+            .is_empty());
+        assert_eq!(storage.content_fingerprints().len(), 2);
     }
 
     #[test]

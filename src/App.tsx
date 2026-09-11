@@ -320,7 +320,7 @@ function App() {
                       <span className="result-title"><strong>{result.name}</strong><em>{Math.round(result.score * 100)}%</em></span>
                       <span className="result-path">{result.path}</span>
                       <span className="snippet"><Highlight text={result.snippet} query={submittedQuery} /></span>
-                      <span className="result-meta">{formatBytes(result.size)} · {formatTimestamp(result.modified_ms, locale)}</span>
+                      <span className="result-meta">{formatBytes(result.size)} · {formatTimestamp(result.modified_ms, locale)}{Boolean(result.duplicates?.length) && <span className="duplicate-count">{t.duplicateCount(result.duplicates!.length)}</span>}</span>
                     </span>
                   </button>
                 ))}
@@ -420,7 +420,24 @@ function EmptyState({ hasFolders, title, action, onAdd }: { hasFolders: boolean;
 }
 
 function DetailPanel({ result, t, locale, onClose, onOpen }: { result: SearchResult; t: ReturnType<typeof getMessages>; locale: Locale; onClose: () => void; onOpen: (path: string, reveal?: boolean) => void }) {
-  return <aside className="detail-panel"><header><span>{t.details}</span><button className="icon-button" onClick={onClose} title={t.close}><X /></button></header><FileBadge extension={result.extension} large /><h2>{result.name}</h2><p className="detail-path">{result.path}</p><dl><div><dt>{t.modified}</dt><dd>{formatTimestamp(result.modified_ms, locale)}</dd></div><div><dt>{t.size}</dt><dd>{formatBytes(result.size)}</dd></div><div><dt>{t.relevance}</dt><dd>{Math.round(result.score * 100)}%</dd></div></dl><div className="detail-actions"><button className="primary-button" onClick={() => void onOpen(result.path)}><ExternalLink />{t.open}</button><button className="secondary-button" onClick={() => void onOpen(result.path, true)}><FolderOpen />{t.reveal}</button></div></aside>;
+  return <aside className="detail-panel">
+    <header><span>{t.details}</span><button className="icon-button" onClick={onClose} title={t.close}><X /></button></header>
+    <FileBadge extension={result.extension} large />
+    <h2>{result.name}</h2><p className="detail-path">{result.path}</p>
+    <dl><div><dt>{t.modified}</dt><dd>{formatTimestamp(result.modified_ms, locale)}</dd></div><div><dt>{t.size}</dt><dd>{formatBytes(result.size)}</dd></div><div><dt>{t.relevance}</dt><dd>{Math.round(result.score * 100)}%</dd></div></dl>
+    <div className="detail-actions">
+      <button className="primary-button" onClick={() => void onOpen(result.path)}><ExternalLink />{t.open}</button>
+      <button className="secondary-button" onClick={() => void onOpen(result.path, true)}><FolderOpen />{t.reveal}</button>
+    </div>
+    {Boolean(result.duplicates?.length) && <details className="duplicate-files" key={result.id}>
+      <summary>{t.sameText} ({result.duplicates!.length + 1})</summary>
+      {result.duplicates!.map((document) => <div className="duplicate-file" key={document.id}>
+        <span><strong>{document.name}</strong><small>{document.path}</small></span>
+        <button className="icon-button" title={t.open} aria-label={`${t.open}: ${document.path}`} onClick={() => void onOpen(document.path)}><ExternalLink /></button>
+        <button className="icon-button" title={t.reveal} aria-label={`${t.reveal}: ${document.path}`} onClick={() => void onOpen(document.path, true)}><FolderOpen /></button>
+      </div>)}
+    </details>}
+  </aside>;
 }
 
 function FileBadge({ extension, large = false }: { extension: string; large?: boolean }) {

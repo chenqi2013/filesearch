@@ -2,20 +2,43 @@ use crate::rwkv::RwkvModel;
 pub use crate::rwkv::EMBEDDING_DIMENSION;
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-unpadded-clean-word-v4";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-contiguous-passages-v5";
 const MAX_SEQUENCE_LENGTH: usize = 1024;
 const INFERENCE_MAX_BATCH_SIZE: usize = 4;
 const INFERENCE_MAX_PADDED_TOKENS: usize = 2_048;
 const EOS_TOKEN_ID: i64 = 65535;
+const EMBEDDING_CACHE_CAPACITY: usize = 4096;
 
 struct LocalRwkvModel {
     inference: RwkvModel,
     tokenizer: RwkvTokenizer,
     backend: RuntimeBackend,
+    cache: VectorCache,
+}
+
+#[derive(Default)]
+struct VectorCache {
+    vectors: HashMap<Vec<i64>, Vec<f32>>,
+    order: VecDeque<Vec<i64>>,
+}
+
+impl VectorCache {
+    fn insert(&mut self, tokens: Vec<i64>, vector: Vec<f32>) {
+        if self.vectors.contains_key(&tokens) {
+            return;
+        }
+        if self.order.len() >= EMBEDDING_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.vectors.remove(&oldest);
+            }
+        }
+        self.order.push_back(tokens.clone());
+        self.vectors.insert(tokens, vector);
+    }
 }
 
 #[derive(Default)]
@@ -154,6 +177,7 @@ impl EmbeddingEngine {
                         inference,
                         tokenizer,
                         backend: RuntimeBackend::Cuda,
+                        cache: VectorCache::default(),
                     });
                 }
                 Err(error) => {
@@ -168,6 +192,7 @@ impl EmbeddingEngine {
             inference: RwkvModel::load(&model_path)?,
             tokenizer,
             backend: RuntimeBackend::Cpu,
+            cache: VectorCache::default(),
         })
     }
 }
@@ -179,17 +204,36 @@ impl LocalRwkvModel {
             .enumerate()
             .map(|(index, text)| (index, self.tokenizer.encode_with_eos(text)))
             .collect::<Vec<_>>();
-        let batches = plan_token_batches(&tokenized);
+        let mut unique = HashSet::new();
+        let pending = tokenized
+            .iter()
+            .filter(|(_, tokens)| {
+                !self.cache.vectors.contains_key(tokens) && unique.insert(tokens.clone())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let batches = plan_token_batches(&pending);
         let mut vectors = vec![None; texts.len()];
+        let mut resolved = HashMap::new();
+        for (_, tokens) in &tokenized {
+            if let Some(vector) = self.cache.vectors.get(tokens) {
+                resolved.insert(tokens.clone(), vector.clone());
+            }
+        }
         for batch in batches {
             let inputs = batch
                 .iter()
-                .map(|index| tokenized[*index].1.clone())
+                .map(|index| pending[*index].1.clone())
                 .collect::<Vec<_>>();
             let outputs = self.inference.embed_tokens(&inputs)?;
             for (index, vector) in batch.into_iter().zip(outputs) {
-                vectors[tokenized[index].0] = Some(vector);
+                let tokens = pending[index].1.clone();
+                self.cache.insert(tokens.clone(), vector.clone());
+                resolved.insert(tokens, vector);
             }
+        }
+        for (index, tokens) in tokenized {
+            vectors[index] = resolved.get(&tokens).cloned();
         }
         vectors
             .into_iter()
@@ -601,6 +645,21 @@ mod tests {
         let terms = lexical_terms("本地搜索 Rust");
         assert!(terms.contains(&"本地".to_owned()));
         assert!(terms.contains(&"rust".to_owned()));
+    }
+
+    #[test]
+    fn vector_cache_is_bounded_and_uses_exact_model_input() {
+        let mut cache = VectorCache::default();
+        cache.insert(vec![1, EOS_TOKEN_ID], vec![0.5]);
+        cache.insert(vec![1, EOS_TOKEN_ID], vec![0.9]);
+        assert_eq!(cache.vectors[&vec![1, EOS_TOKEN_ID]], vec![0.5]);
+        assert!(!cache.vectors.contains_key(&vec![2, EOS_TOKEN_ID]));
+        for index in 2..=EMBEDDING_CACHE_CAPACITY + 1 {
+            cache.insert(vec![index as i64, EOS_TOKEN_ID], vec![1.0]);
+        }
+        assert_eq!(cache.vectors.len(), EMBEDDING_CACHE_CAPACITY);
+        assert_eq!(cache.order.len(), EMBEDDING_CACHE_CAPACITY);
+        assert!(!cache.vectors.contains_key(&vec![1, EOS_TOKEN_ID]));
     }
 
     #[test]
