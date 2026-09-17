@@ -93,6 +93,16 @@ function App() {
     return () => window.clearInterval(timer);
   }, [refreshStats, t.error]);
 
+  useEffect(() => {
+    if (notice !== t.indexStarted) return;
+
+    const timer = window.setTimeout(() => {
+      setNotice((current) => current === t.indexStarted ? null : current);
+    }, 3_000);
+
+    return () => window.clearTimeout(timer);
+  }, [notice, t.indexStarted]);
+
   const indexFolders = useCallback(
     async (paths: string[]) => {
       try {
