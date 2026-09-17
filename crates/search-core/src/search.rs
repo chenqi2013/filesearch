@@ -260,10 +260,12 @@ fn channel_ranks(
 
 fn reciprocal_rank_score(keyword: Option<usize>, semantic: Option<usize>) -> f32 {
     const RRF_OFFSET: f32 = 60.0;
+    const KEYWORD_WEIGHT: f32 = 0.25;
+    const SEMANTIC_WEIGHT: f32 = 0.75;
     let contribution = |rank: Option<usize>| {
         rank.map_or(0.0, |rank| (RRF_OFFSET + 1.0) / (RRF_OFFSET + rank as f32))
     };
-    (contribution(keyword) + contribution(semantic)) * 0.5
+    contribution(keyword) * KEYWORD_WEIGHT + contribution(semantic) * SEMANTIC_WEIGHT
 }
 
 fn keyword_is_relevant(terms: &[String], coverage: f32) -> bool {
@@ -364,6 +366,7 @@ mod tests {
         assert_eq!(ranks["copy"], 1);
         assert_eq!(ranks["other"], 2);
         assert!(reciprocal_rank_score(Some(2), Some(2)) > reciprocal_rank_score(Some(1), None));
+        assert!(reciprocal_rank_score(None, Some(1)) > reciprocal_rank_score(Some(1), None));
         assert_eq!(reciprocal_rank_score(None, None), 0.0);
         assert_eq!(reciprocal_rank_score(Some(1), Some(1)), 1.0);
     }

@@ -24,7 +24,7 @@ const EMBEDDING_BATCH_SIZE: usize = 4;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
-const MAX_SEMANTIC_CHUNKS_PER_DOCUMENT: usize = 16;
+const MAX_SEMANTIC_CHUNKS_PER_DOCUMENT: usize = 7;
 const MAX_SEMANTIC_EMBED_CHARS: usize = 480;
 const SEMANTIC_WINDOW_STRIDE: usize = 400;
 #[cfg(not(test))]

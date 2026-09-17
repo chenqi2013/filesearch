@@ -317,7 +317,7 @@ function App() {
                   <button className={`result-card ${selected?.id === result.id ? "selected" : ""}`} key={result.id} onClick={() => setSelected(result)}>
                     <FileBadge extension={result.extension} />
                     <span className="result-body">
-                      <span className="result-title"><strong>{result.name}</strong><em>{Math.round(result.score * 100)}%</em></span>
+                      <span className="result-title"><strong><Highlight text={result.name} query={submittedQuery} /></strong><em>{Math.round(result.score * 100)}%</em></span>
                       <span className="result-path">{result.path}</span>
                       <span className="snippet"><Highlight text={result.snippet} query={submittedQuery} /></span>
                       <span className="result-meta">{formatBytes(result.size)} · {formatTimestamp(result.modified_ms, locale)}{Boolean(result.duplicates?.length) && <span className="duplicate-count">{t.duplicateCount(result.duplicates!.length)}</span>}</span>

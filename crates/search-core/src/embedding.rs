@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-contiguous-passages-v5";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-contiguous-passages-7-v6";
 const MAX_SEQUENCE_LENGTH: usize = 1024;
 const INFERENCE_MAX_BATCH_SIZE: usize = 4;
 const INFERENCE_MAX_PADDED_TOKENS: usize = 2_048;
