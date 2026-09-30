@@ -46,6 +46,8 @@ struct Args {
     extract_file: Option<PathBuf>,
     #[arg(long, hide = true)]
     extract_output: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    extract_error_output: Option<PathBuf>,
 }
 
 struct AppState {
@@ -120,8 +122,14 @@ async fn main() -> anyhow::Result<()> {
             .extract_output
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("缺少提取结果输出路径"))?;
-        let text = extract::extract_text(input)?;
-        std::fs::write(output, text.as_bytes())?;
+        let result = extract::extract_text(input)
+            .and_then(|text| std::fs::write(output, text.as_bytes()).map_err(Into::into));
+        if let Err(error) = result {
+            if let Some(error_output) = args.extract_error_output.as_deref() {
+                let _ = std::fs::write(error_output, format!("{error:#}"));
+            }
+            return Err(error);
+        }
         return Ok(());
     }
     std::fs::create_dir_all(&args.data_dir)?;

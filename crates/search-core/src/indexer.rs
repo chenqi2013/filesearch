@@ -8,6 +8,8 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
+#[cfg(not(test))]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::{Command, Stdio};
@@ -1024,32 +1026,51 @@ fn extract_text_in_worker(path: &Path) -> Result<String> {
         nonce,
         stable_id(&path.to_string_lossy())
     ));
+    let error_output = output.with_extension("error.txt");
     let mut child = Command::new(executable)
         .arg("--extract-file")
         .arg(path)
         .arg("--extract-output")
         .arg(&output)
+        .arg("--extract-error-output")
+        .arg(&error_output)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("无法启动文件解析 worker: {}", path.display()))?;
     let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
+                let mut stderr = String::new();
+                if let Some(mut stream) = child.stderr.take() {
+                    let _ = stream.read_to_string(&mut stderr);
+                }
                 let _ = std::fs::remove_file(&output);
-                anyhow::bail!("文档解析 worker 失败，退出码: {status}");
+                let persisted_error = std::fs::read_to_string(&error_output).unwrap_or_default();
+                let _ = std::fs::remove_file(&error_output);
+                let detail = if persisted_error.trim().is_empty() {
+                    stderr.trim()
+                } else {
+                    persisted_error.trim()
+                };
+                if detail.is_empty() {
+                    anyhow::bail!("文档解析 worker 失败，退出码: {status}");
+                }
+                anyhow::bail!("文档解析失败: {detail}");
             }
             let text = std::fs::read_to_string(&output)
                 .with_context(|| format!("无法读取文件解析结果: {}", path.display()))?;
             let _ = std::fs::remove_file(&output);
+            let _ = std::fs::remove_file(&error_output);
             return Ok(text);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&output);
+            let _ = std::fs::remove_file(&error_output);
             anyhow::bail!(
                 "文档解析超时（{} 秒），已跳过文件: {}",
                 FILE_EXTRACTION_TIMEOUT.as_secs(),

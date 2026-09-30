@@ -44,11 +44,135 @@ pub fn extract_text(path: &Path) -> Result<String> {
         _ => return Err(anyhow!("暂不支持 .{extension} 格式")),
     };
 
-    let normalized = normalize_text(&text);
+    let mut normalized = normalize_text(&text);
+    if normalized.is_empty() && extension == "pdf" {
+        normalized = normalize_text(
+            &extract_pdf_ocr(path)
+                .with_context(|| format!("PDF 没有文字层，OCR 识别失败: {}", path.display()))?,
+        );
+    }
     if normalized.is_empty() {
         return Err(anyhow!("未提取到可索引文本"));
     }
     Ok(normalized)
+}
+
+#[cfg(windows)]
+fn extract_pdf_ocr(path: &Path) -> Result<String> {
+    use windows::core::HSTRING;
+    use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
+    use windows::Globalization::Language;
+    use windows::Graphics::Imaging::BitmapDecoder;
+    use windows::Media::Ocr::OcrEngine;
+    use windows::Storage::StorageFile;
+    use windows::Storage::Streams::InMemoryRandomAccessStream;
+
+    let file_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+    let file = StorageFile::GetFileFromPathAsync(&file_path)?.get()?;
+    let document = PdfDocument::LoadFromFileAsync(&file)?.get()?;
+    let profile_engine = OcrEngine::TryCreateFromUserProfileLanguages()
+        .context("Windows 未安装当前用户语言对应的 OCR 组件")?;
+    let profile_language = profile_engine
+        .RecognizerLanguage()?
+        .LanguageTag()?
+        .to_string();
+    let mut engines = vec![profile_engine];
+    if !profile_language.eq_ignore_ascii_case("en-US") {
+        let english = Language::CreateLanguage(&HSTRING::from("en-US"))?;
+        if OcrEngine::IsLanguageSupported(&english)? {
+            engines.push(OcrEngine::TryCreateFromLanguage(&english)?);
+        }
+    }
+    let max_dimension = OcrEngine::MaxImageDimension()? as f32;
+    let page_count = document.PageCount()?;
+    let mut output = String::new();
+
+    for page_index in 0..page_count {
+        let page = document.GetPage(page_index)?;
+        let page_size = page.Size()?;
+        let longest_edge = page_size.Width.max(page_size.Height).max(1.0);
+        let scale = (max_dimension / longest_edge).min(2.5).max(1.0);
+        let options = PdfPageRenderOptions::new()?;
+        options.SetDestinationWidth((page_size.Width * scale).round() as u32)?;
+        options.SetDestinationHeight((page_size.Height * scale).round() as u32)?;
+
+        let stream = InMemoryRandomAccessStream::new()?;
+        page.RenderWithOptionsToStreamAsync(&stream, &options)?
+            .get()?;
+        stream.Seek(0)?;
+        let decoder = BitmapDecoder::CreateAsync(&stream)?.get()?;
+        let bitmap = decoder.GetSoftwareBitmapAsync()?.get()?;
+        let mut page_text = String::new();
+        let mut best_score = i64::MIN;
+        for engine in &engines {
+            let result = engine.RecognizeAsync(&bitmap)?.get()?;
+            let candidate = result.Text()?.to_string();
+            let score = ocr_text_score(&candidate);
+            if score > best_score {
+                best_score = score;
+                page_text = candidate;
+            }
+        }
+        if !page_text.trim().is_empty() {
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.push_str(page_text.trim());
+        }
+    }
+
+    if output.is_empty() {
+        return Err(anyhow!("Windows OCR 未识别到可索引文本"));
+    }
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn ocr_text_score(text: &str) -> i64 {
+    let mut latin = 0i64;
+    let mut cjk = 0i64;
+    let mut other_letters = 0i64;
+    let mut digits = 0i64;
+    let mut symbols = 0i64;
+
+    for character in text.chars() {
+        if character.is_ascii_alphabetic() {
+            latin += 1;
+        } else if matches!(character, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}') {
+            cjk += 1;
+        } else if character.is_alphabetic() {
+            other_letters += 1;
+        } else if character.is_ascii_digit() {
+            digits += 1;
+        } else if !character.is_whitespace()
+            && !character.is_ascii_punctuation()
+            && !matches!(
+                character,
+                '，' | '。' | '、' | '；' | '：' | '！' | '？' | '（' | '）'
+            )
+        {
+            symbols += 1;
+        }
+    }
+
+    let latin_word_bonus = text
+        .split_whitespace()
+        .map(|word| word.chars().filter(char::is_ascii_alphabetic).count())
+        .filter(|length| *length >= 3)
+        .sum::<usize>() as i64;
+
+    if latin > cjk.saturating_mul(4) {
+        latin * 3 + latin_word_bonus * 2 + digits - cjk * 10 - symbols * 6
+    } else if cjk > latin {
+        cjk * 5 + latin + other_letters * 2 + digits - symbols * 6
+    } else {
+        latin * 2 + cjk * 3 + other_letters * 3 + latin_word_bonus + digits - symbols * 6
+    }
+}
+
+#[cfg(not(windows))]
+fn extract_pdf_ocr(_path: &Path) -> Result<String> {
+    Err(anyhow!("图片型 PDF OCR 目前仅支持 Windows"))
 }
 
 fn decode_text_bytes(bytes: &[u8]) -> String {
@@ -269,6 +393,14 @@ mod tests {
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(decode_text_bytes(&bytes), value);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ocr_scoring_prefers_clean_latin_text() {
+        let clean = "Mobile support is available on Android and iOS devices.";
+        let noisy = "Mobile SUPP0rt is available 0 n Andr01d 和 iO§ devices.";
+        assert!(ocr_text_score(clean) > ocr_text_score(noisy));
     }
 
     #[test]

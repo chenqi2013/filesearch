@@ -3797,6 +3797,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+ "windows",
  "zip",
 ]
 
