@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=1)
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location(
         "rwkv_benchmark", Path(__file__).with_name("benchmark-rwkv-nanobeir.py")
@@ -38,10 +39,12 @@ def main():
     encoder = benchmark.RustEncoder(args.executable, args.model, args.runtime)
     try:
         document_vectors, document_timing = benchmark.encode(
-            [document["text"] for document in documents], tokenizer, encoder, 4, 1024, "Documents"
+            [document["text"] for document in documents], tokenizer, encoder,
+            args.batch_size, 1024, "Documents"
         )
         query_vectors, query_timing = benchmark.encode(
-            [query["text"] for query in queries], tokenizer, encoder, 4, 1024, "Queries"
+            [query["text"] for query in queries], tokenizer, encoder,
+            args.batch_size, 1024, "Queries"
         )
         scores = query_vectors @ document_vectors.T
         rankings = torch.argsort(scores, dim=1, descending=True, stable=True).tolist()
@@ -63,7 +66,7 @@ def main():
             "onnx_sha256": benchmark.sha256(args.model),
             "executable_sha256": benchmark.sha256(args.executable),
             "runtime_sha256": benchmark.sha256(args.runtime),
-            "protocol": {"device": "CPU", "batch_size": 4, "max_tokens": 1024,
+            "protocol": {"device": "CPU", "batch_size": args.batch_size, "max_tokens": 1024,
                          "pooling": "single EOS", "instruction": None, "reranker": False,
                          "similarity": "normalized cosine", "cached_vectors": False,
                          "relevant_documents_per_query": 1},

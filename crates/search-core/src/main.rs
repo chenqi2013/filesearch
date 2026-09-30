@@ -53,6 +53,7 @@ struct AppState {
     storage: Arc<Storage>,
     text_index: Arc<TextIndex>,
     embedder: Arc<EmbeddingEngine>,
+    index_control: Arc<indexer::IndexControl>,
     indexing: AtomicBool,
     processed: AtomicUsize,
     total: AtomicUsize,
@@ -149,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         storage,
         text_index,
         embedder,
+        index_control: Arc::new(indexer::IndexControl::default()),
         indexing: AtomicBool::new(false),
         processed: AtomicUsize::new(0),
         total: AtomicUsize::new(0),
@@ -179,6 +181,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/chunks", get(chunks))
         .route("/search", post(search_documents))
         .route("/index", post(start_index))
+        .route("/index/pause", post(pause_index))
+        .route("/index/resume", post(resume_index))
+        .route("/index/cancel", post(cancel_index))
         .route("/failures", get(failures))
         .layer(
             CorsLayer::new()
@@ -219,9 +224,17 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
         failures: 0,
     });
     let indexing = state.indexing.load(Ordering::Relaxed);
+    let paused = indexing && state.index_control.is_paused();
     let timing = index_timing_snapshot(&state, indexing);
     Json(ServiceStats {
-        status: if indexing { "indexing" } else { "ready" }.to_owned(),
+        status: if paused {
+            "paused"
+        } else if indexing {
+            "indexing"
+        } else {
+            "ready"
+        }
+        .to_owned(),
         document_count: counts.documents,
         chunk_count: counts.chunks,
         failed_count: counts.failures,
@@ -355,6 +368,54 @@ async fn start_index(
     ))
 }
 
+async fn pause_index(
+    State(state): State<SharedState>,
+) -> Result<Json<IndexAccepted>, (StatusCode, Json<Value>)> {
+    if !state.indexing.load(Ordering::Relaxed) {
+        return Ok(Json(IndexAccepted {
+            accepted: false,
+            message: "当前没有正在运行的索引任务".to_owned(),
+        }));
+    }
+    state.index_control.pause();
+    Ok(Json(IndexAccepted {
+        accepted: true,
+        message: "索引将在当前批次完成后暂停".to_owned(),
+    }))
+}
+
+async fn resume_index(
+    State(state): State<SharedState>,
+) -> Result<Json<IndexAccepted>, (StatusCode, Json<Value>)> {
+    if !state.indexing.load(Ordering::Relaxed) {
+        return Ok(Json(IndexAccepted {
+            accepted: false,
+            message: "当前没有可继续的索引任务".to_owned(),
+        }));
+    }
+    state.index_control.resume();
+    Ok(Json(IndexAccepted {
+        accepted: true,
+        message: "索引已继续".to_owned(),
+    }))
+}
+
+async fn cancel_index(
+    State(state): State<SharedState>,
+) -> Result<Json<IndexAccepted>, (StatusCode, Json<Value>)> {
+    if !state.indexing.load(Ordering::Relaxed) {
+        return Ok(Json(IndexAccepted {
+            accepted: false,
+            message: "当前没有正在运行的索引任务".to_owned(),
+        }));
+    }
+    state.index_control.cancel();
+    Ok(Json(IndexAccepted {
+        accepted: true,
+        message: "正在取消索引，已完成批次会保留".to_owned(),
+    }))
+}
+
 fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
     if state
         .indexing
@@ -365,6 +426,7 @@ fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
     }
     state.processed.store(0, Ordering::Relaxed);
     state.total.store(0, Ordering::Relaxed);
+    state.index_control.reset();
     reset_index_timing(&state);
     let runtime = state.runtime.clone();
     runtime.spawn_blocking(move || {
@@ -373,15 +435,20 @@ fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
             &state.storage,
             &state.text_index,
             &state.embedder,
+            &state.index_control,
             |update| update_progress(&state, update),
         );
         if let Err(error) = result {
-            tracing::error!(%error, "full index task failed");
-            let _ = state.storage.record_failure(&IndexFailure {
-                path: "<index-task>".to_owned(),
-                category: "internal".to_owned(),
-                reason: format!("索引任务失败: {error:#}"),
-            });
+            if indexer::is_cancelled(&error) {
+                tracing::info!("index task cancelled; completed batches were retained");
+            } else {
+                tracing::error!(%error, "full index task failed");
+                let _ = state.storage.record_failure(&IndexFailure {
+                    path: "<index-task>".to_owned(),
+                    category: "internal".to_owned(),
+                    reason: format!("索引任务失败: {error:#}"),
+                });
+            }
         }
         finish_index_task(&state, true);
     });
@@ -403,6 +470,7 @@ fn launch_pending_incremental(state: SharedState) {
         return;
     }
     reset_index_timing(&state);
+    state.index_control.reset();
     let runtime = state.runtime.clone();
     runtime.spawn_blocking(move || {
         loop {
@@ -415,6 +483,7 @@ fn launch_pending_incremental(state: SharedState) {
                 &state.storage,
                 &state.text_index,
                 &state.embedder,
+                &state.index_control,
                 |update| update_progress(&state, update),
             ) {
                 tracing::error!(%error, "incremental index task failed");

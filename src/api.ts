@@ -30,6 +30,9 @@ export const coreApi = {
       method: "POST",
       body: JSON.stringify({ paths }),
     }),
+  pauseIndex: () => request<{ accepted: boolean; message: string }>("/index/pause", { method: "POST" }),
+  resumeIndex: () => request<{ accepted: boolean; message: string }>("/index/resume", { method: "POST" }),
+  cancelIndex: () => request<{ accepted: boolean; message: string }>("/index/cancel", { method: "POST" }),
   search: (query: string, mode: SearchMode, extension: string) =>
     request<SearchResponse>("/search", {
       method: "POST",

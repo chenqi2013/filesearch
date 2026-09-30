@@ -139,7 +139,7 @@ await prepareOnnxRuntime();
 prepareOptionalCudaLibraries();
 prepareMsvcRuntime();
 prepareEmbeddingModel();
-execFileSync("cargo", ["build", "-p", "search-core", ...(release ? ["--release"] : [])], verbose);
+execFileSync("cargo", ["build", "-p", "search-core", "--release"], verbose);
 const host = execFileSync("rustc", ["-vV"], { cwd: root, encoding: "utf8" })
   .split("\n")
   .find((line) => line.startsWith("host:"))
@@ -147,7 +147,10 @@ const host = execFileSync("rustc", ["-vV"], { cwd: root, encoding: "utf8" })
   .trim();
 if (!host) throw new Error("Unable to determine Rust target triple");
 const extension = process.platform === "win32" ? ".exe" : "";
-const source = resolve(root, "target", release ? "release" : "debug", `search-core${extension}`);
+const source = resolve(root, "target", "release", `search-core${extension}`);
+if (!release) {
+  copyFileSync(source, resolve(root, "target", "debug", `search-core${extension}`));
+}
 const destination = resolve(root, "src-tauri", "binaries", `search-core-${host}${extension}`);
 mkdirSync(dirname(destination), { recursive: true });
 copyFileSync(source, destination);

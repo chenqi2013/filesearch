@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex};
 #[cfg(not(test))]
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -67,6 +68,75 @@ pub struct ProgressUpdate<'a> {
     pub text_index_ms: u128,
 }
 
+const INDEX_CANCELLED: &str = "索引任务已取消";
+
+#[derive(Default)]
+struct ControlState {
+    paused: bool,
+    cancelled: bool,
+    waiting: bool,
+}
+
+#[derive(Default)]
+pub struct IndexControl {
+    state: Mutex<ControlState>,
+    wake: Condvar,
+}
+
+impl IndexControl {
+    pub fn reset(&self) {
+        let mut state = self.state.lock().expect("index control lock poisoned");
+        state.paused = false;
+        state.cancelled = false;
+        state.waiting = false;
+        self.wake.notify_all();
+    }
+
+    pub fn pause(&self) {
+        let mut state = self.state.lock().expect("index control lock poisoned");
+        if !state.cancelled {
+            state.paused = true;
+        }
+    }
+
+    pub fn resume(&self) {
+        let mut state = self.state.lock().expect("index control lock poisoned");
+        state.paused = false;
+        self.wake.notify_all();
+    }
+
+    pub fn cancel(&self) {
+        let mut state = self.state.lock().expect("index control lock poisoned");
+        state.cancelled = true;
+        state.paused = false;
+        self.wake.notify_all();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        let state = self.state.lock().expect("index control lock poisoned");
+        state.paused && state.waiting && !state.cancelled
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("index control lock poisoned");
+        while state.paused && !state.cancelled {
+            state.waiting = true;
+            state = self.wake.wait(state).expect("index control lock poisoned");
+        }
+        state.waiting = false;
+        if state.cancelled {
+            anyhow::bail!(INDEX_CANCELLED);
+        }
+        Ok(())
+    }
+}
+
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == INDEX_CANCELLED)
+}
+
 struct ScannedRoot {
     path: String,
     complete: bool,
@@ -78,6 +148,7 @@ pub fn build_index<F>(
     storage: &Storage,
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
+    control: &IndexControl,
     mut progress: F,
 ) -> Result<()>
 where
@@ -97,6 +168,7 @@ where
     let configured = roots.iter().cloned().collect::<HashSet<_>>();
     let mut changed = false;
 
+    control.checkpoint()?;
     for document in previous
         .iter()
         .filter(|document| !configured.contains(&document.root))
@@ -107,10 +179,12 @@ where
     }
 
     let scan_started = Instant::now();
+    control.checkpoint()?;
     report_progress(&mut progress, 0, 0, None, "scanning", &timings);
     let mut scans = Vec::with_capacity(roots.len());
     for root in &roots {
-        scans.push(scan_root(root, storage));
+        control.checkpoint()?;
+        scans.push(scan_root(root, storage, control)?);
     }
     let scan_elapsed = scan_started.elapsed();
     timings.scan = scan_elapsed;
@@ -125,6 +199,7 @@ where
     for scan in &scans {
         let seen = seen_by_root.entry(scan.path.clone()).or_default();
         for path in &scan.files {
+            control.checkpoint()?;
             let path_string = path.to_string_lossy().into_owned();
             report_progress(
                 &mut progress,
@@ -172,6 +247,7 @@ where
                     embedder,
                     &mut timings,
                     &mut progress,
+                    control,
                     processed,
                     total,
                 )?;
@@ -190,6 +266,7 @@ where
             embedder,
             &mut timings,
             &mut progress,
+            control,
             processed,
             total,
         )?;
@@ -203,6 +280,7 @@ where
             text_index,
             embedder,
             &mut progress,
+            control,
             processed,
             total,
             &timings,
@@ -261,6 +339,7 @@ pub fn update_paths<F>(
     storage: &Storage,
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
+    control: &IndexControl,
     mut progress: F,
 ) -> Result<()>
 where
@@ -275,12 +354,14 @@ where
     let document_paths = storage.list_document_paths()?;
 
     for path in paths {
+        control.checkpoint()?;
         if path.is_dir() {
             for entry in WalkDir::new(path)
                 .follow_links(false)
                 .into_iter()
                 .filter_map(Result::ok)
             {
+                control.checkpoint()?;
                 if entry.file_type().is_file() && is_supported(entry.path()) {
                     candidates.insert(entry.into_path());
                 }
@@ -308,6 +389,7 @@ where
     let mut parse_jobs = Vec::with_capacity(PARSE_BATCH_SIZE);
     let mut processed = 0usize;
     for (index, path) in files.iter().enumerate() {
+        control.checkpoint()?;
         let path_string = path.to_string_lossy().into_owned();
         report_progress(
             &mut progress,
@@ -365,6 +447,7 @@ where
                 embedder,
                 &mut timings,
                 &mut progress,
+                control,
                 processed,
                 files.len(),
             )?;
@@ -380,6 +463,7 @@ where
             embedder,
             &mut timings,
             &mut progress,
+            control,
             processed,
             files.len(),
         )?;
@@ -392,6 +476,7 @@ where
             text_index,
             embedder,
             &mut progress,
+            control,
             processed,
             files.len(),
             &timings,
@@ -431,7 +516,7 @@ where
     Ok(())
 }
 
-fn scan_root(root: &str, storage: &Storage) -> ScannedRoot {
+fn scan_root(root: &str, storage: &Storage, control: &IndexControl) -> Result<ScannedRoot> {
     let path = PathBuf::from(root);
     if !path.is_dir() {
         let _ = storage.record_failure(&IndexFailure {
@@ -439,15 +524,16 @@ fn scan_root(root: &str, storage: &Storage) -> ScannedRoot {
             category: "offline".to_owned(),
             reason: "索引目录不可访问，可能已断线、被移动或权限不足；保留已有索引".to_owned(),
         });
-        return ScannedRoot {
+        return Ok(ScannedRoot {
             path: root.to_owned(),
             complete: false,
             files: Vec::new(),
-        };
+        });
     }
     let mut complete = true;
     let mut files = Vec::new();
     for entry in WalkDir::new(&path).follow_links(false) {
+        control.checkpoint()?;
         match entry {
             Ok(entry) if entry.file_type().is_file() && is_supported(entry.path()) => {
                 files.push(entry.into_path());
@@ -461,11 +547,11 @@ fn scan_root(root: &str, storage: &Storage) -> ScannedRoot {
             }
         }
     }
-    ScannedRoot {
+    Ok(ScannedRoot {
         path: root.to_owned(),
         complete,
         files,
-    }
+    })
 }
 
 fn normalize_roots(paths: &[String]) -> Vec<String> {
@@ -483,10 +569,12 @@ fn persist_batch(
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
     progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    control: &IndexControl,
     processed: usize,
     total: usize,
     accumulated: &IndexTimings,
 ) -> Result<PersistTimings> {
+    control.checkpoint()?;
     let mut timings = PersistTimings::default();
     let mut documents = std::mem::take(pending);
     let semantic_chunks = documents
@@ -708,6 +796,7 @@ fn flush_parse_jobs(
     embedder: &EmbeddingEngine,
     timings: &mut IndexTimings,
     progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    control: &IndexControl,
     processed: usize,
     total: usize,
 ) -> Result<(usize, bool)> {
@@ -738,6 +827,7 @@ fn flush_parse_jobs(
     timings.parse += started.elapsed();
     let mut prepared = false;
     for (job_index, (path, elapsed, result)) in results.into_iter().enumerate() {
+        control.checkpoint()?;
         if elapsed >= Duration::from_secs(2) {
             tracing::info!(
                 path = %path.display(),
@@ -768,6 +858,7 @@ fn flush_parse_jobs(
                 text_index,
                 embedder,
                 progress,
+                control,
                 processed + job_index + 1,
                 total,
                 timings,
@@ -1036,6 +1127,20 @@ mod tests {
     use crate::embedding::fallback_embed;
 
     #[test]
+    fn index_control_pauses_and_resumes_at_a_checkpoint() {
+        let control = std::sync::Arc::new(IndexControl::default());
+        control.pause();
+        let worker_control = std::sync::Arc::clone(&control);
+        let worker = std::thread::spawn(move || worker_control.checkpoint());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!worker.is_finished());
+        control.resume();
+        assert!(worker.join().unwrap().is_ok());
+        control.cancel();
+        assert!(control.checkpoint().is_err());
+    }
+
+    #[test]
     fn chunks_keep_overlap() {
         let output = split_chunks(&"本".repeat(1700));
         assert_eq!(output.len(), 3);
@@ -1163,6 +1268,7 @@ mod tests {
             &storage,
             &text_index,
             &embedder,
+            &IndexControl::default(),
             |_| {},
         )
         .unwrap();

@@ -1,7 +1,7 @@
 export type SearchMode = "hybrid" | "keyword" | "semantic";
 
 export interface ServiceStats {
-  status: "ready" | "indexing";
+  status: "ready" | "indexing" | "paused";
   document_count: number;
   chunk_count: number;
   failed_count: number;

@@ -13,9 +13,13 @@ import {
   Folder,
   FolderOpen,
   Globe2,
+  MoreHorizontal,
+  Pause,
+  Play,
   Plus,
   RefreshCw,
   Search,
+  Square,
   Trash2,
   X,
 } from "lucide-react";
@@ -67,6 +71,13 @@ function App() {
   const [inventory, setInventory] = useState<InventoryState | null>(null);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [folderToRemove, setFolderToRemove] = useState<string | null>(null);
+  const [folderMenuOpen, setFolderMenuOpen] = useState(false);
+  const [folderSearchOpen, setFolderSearchOpen] = useState(false);
+  const [folderSearch, setFolderSearch] = useState("");
+  const [folderSort, setFolderSort] = useState<"default" | "modified-desc" | "modified-asc">("default");
+  const [folderModifiedTimes, setFolderModifiedTimes] = useState<Record<string, number>>({});
+  const folderMenuRef = useRef<HTMLDivElement>(null);
   const searchRequestId = useRef(0);
 
   const refreshStats = useCallback(async () => {
@@ -103,6 +114,25 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [notice, t.indexStarted]);
 
+  useEffect(() => {
+    if (!isTauri() || stats.directories.length === 0) {
+      setFolderModifiedTimes({});
+      return;
+    }
+    void invoke<Record<string, number>>("directory_modified_times", { paths: stats.directories })
+      .then(setFolderModifiedTimes)
+      .catch(() => setFolderModifiedTimes({}));
+  }, [stats.directories]);
+
+  useEffect(() => {
+    if (!folderMenuOpen) return;
+    const closeMenu = (event: MouseEvent) => {
+      if (!folderMenuRef.current?.contains(event.target as Node)) setFolderMenuOpen(false);
+    };
+    window.addEventListener("mousedown", closeMenu);
+    return () => window.removeEventListener("mousedown", closeMenu);
+  }, [folderMenuOpen]);
+
   const indexFolders = useCallback(
     async (paths: string[]) => {
       try {
@@ -115,6 +145,24 @@ function App() {
     },
     [refreshStats, t.error, t.indexStarted],
   );
+
+  const controlIndex = async (action: "pause" | "resume" | "cancel") => {
+    try {
+      const result = action === "pause"
+        ? await coreApi.pauseIndex()
+        : action === "resume"
+          ? await coreApi.resumeIndex()
+          : await coreApi.cancelIndex();
+      if (!result.accepted) {
+        setNotice(result.message);
+        return;
+      }
+      setNotice(action === "pause" ? t.indexPaused : action === "cancel" ? t.indexCancelRequested : t.indexStarted);
+      await refreshStats();
+    } catch (error) {
+      setNotice(`${t.error}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
   const addFolder = async () => {
     if (!isTauri()) {
@@ -152,6 +200,13 @@ function App() {
     await runSearch(searchQuery, mode, extension, true);
   };
 
+  const removeFolder = async () => {
+    if (!folderToRemove) return;
+    const remainingDirectories = stats.directories.filter((item) => item !== folderToRemove);
+    setFolderToRemove(null);
+    await indexFolders(remainingDirectories);
+  };
+
   useEffect(() => {
     if (!submittedQuery.trim()) return;
     void runSearch(submittedQuery, mode, extension, false);
@@ -184,9 +239,12 @@ function App() {
   };
 
   const extensions = stats.extensions;
+  const isIndexing = stats.status === "indexing" || stats.status === "paused";
   const progress = stats.total_files ? Math.round((stats.processed_files / stats.total_files) * 100) : 0;
   const modelLoading = stats.embedding_model?.includes("正在加载") ?? false;
-  const operation = modelLoading
+  const operation = stats.status === "paused"
+    ? t.indexPaused
+    : modelLoading
     ? t.embeddingLoading
     : stats.total_files === 0
       ? t.scanning
@@ -218,7 +276,20 @@ function App() {
     ["storage", t.stageStorage, stats.index_storage_ms ?? 0],
     ["text_index", t.stageTextIndex, stats.index_text_index_ms ?? 0],
   ] as const;
-  const showTiming = stats.status === "indexing" || (stats.index_total_elapsed_ms ?? 0) > 0;
+  const showTiming = isIndexing || (stats.index_total_elapsed_ms ?? 0) > 0;
+  const normalizedFolderSearch = folderSearch.trim().toLocaleLowerCase();
+  const visibleDirectories = stats.directories
+    .filter((path) => !normalizedFolderSearch || path.toLocaleLowerCase().includes(normalizedFolderSearch))
+    .sort((left, right) => {
+      if (folderSort === "default") return stats.directories.indexOf(left) - stats.directories.indexOf(right);
+      const difference = (folderModifiedTimes[left] ?? 0) - (folderModifiedTimes[right] ?? 0);
+      return folderSort === "modified-desc" ? -difference : difference;
+    });
+
+  const toggleFolderSort = () => {
+    setFolderSort((current) => current === "modified-desc" ? "modified-asc" : "modified-desc");
+    setFolderMenuOpen(false);
+  };
 
   return (
     <div className="app-shell">
@@ -242,28 +313,50 @@ function App() {
 
       <div className="workspace">
         <aside className="sidebar">
-          <div className="sidebar-heading"><span>{t.folders}</span><button className="icon-button" onClick={addFolder} title={t.addFolder}><Plus /></button></div>
+          <div className="sidebar-heading">
+            <span>{t.folders}</span>
+            {stats.directories.length > 0 && (
+              <div className="folder-menu-wrap" ref={folderMenuRef}>
+                <button className="icon-button" onClick={() => setFolderMenuOpen((open) => !open)} title={t.more} aria-expanded={folderMenuOpen}><MoreHorizontal /></button>
+                {folderMenuOpen && (
+                  <div className="folder-menu">
+                    <button onClick={() => { setFolderMenuOpen(false); void addFolder(); }}><Plus />{t.addFolder}</button>
+                    <button onClick={() => { setFolderSearchOpen(true); setFolderMenuOpen(false); }}><Search />{t.searchFolders}</button>
+                    <button onClick={toggleFolderSort}><Clock3 />{folderSort === "modified-desc" ? t.sortFoldersOldest : t.sortFoldersNewest}</button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          {folderSearchOpen && stats.directories.length > 0 && (
+            <div className="folder-search">
+              <Search />
+              <input autoFocus value={folderSearch} onChange={(event) => setFolderSearch(event.target.value)} placeholder={t.searchFoldersPlaceholder} />
+              <button className="icon-button" title={t.close} onClick={() => { setFolderSearch(""); setFolderSearchOpen(false); }}><X /></button>
+            </div>
+          )}
           <div className="folder-list">
             {stats.directories.length === 0 && <p className="muted compact">{t.noFolder}</p>}
-            {stats.directories.map((path) => (
+            {stats.directories.length > 0 && visibleDirectories.length === 0 && <p className="muted compact">{t.noMatchingFolders}</p>}
+            {visibleDirectories.map((path) => (
               <div className="folder-row" key={path}>
                 <button className="folder-open" title={`${t.openFolder}: ${path}`} onClick={() => void openPath(path)}>
                   <Folder aria-hidden="true" />
                   <span>{basename(path)}</span>
                 </button>
-                <button className="icon-button subtle" title={t.remove} onClick={() => void indexFolders(stats.directories.filter((item) => item !== path))}><Trash2 /></button>
+                <button className="icon-button subtle" title={t.remove} onClick={() => setFolderToRemove(path)}><Trash2 /></button>
               </div>
             ))}
           </div>
-          <button className="add-folder" onClick={addFolder}><Plus />{t.addFolder}</button>
+          {stats.directories.length === 0 && <button className="add-folder" onClick={addFolder}><Plus />{t.addFolder}</button>}
 
           <div className="index-summary">
-            <div className="status-line"><span className={`status-dot ${connected ? stats.status : "offline"}`} />{!connected ? t.unavailable : stats.status === "indexing" ? operation : t.ready}</div>
+            <div className="status-line"><span className={`status-dot ${connected ? stats.status : "offline"}`} />{!connected ? t.unavailable : isIndexing ? operation : t.ready}</div>
             <div className={`backend-status ${backend}`} title={stats.embedding_model ?? undefined}>
               <Cpu aria-hidden="true" />
               <span>{t.embeddingBackend}: <strong>{backendLabel}</strong></span>
             </div>
-            {stats.status === "indexing" && (
+            {isIndexing && (
               <div className="progress-block">
                 <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>
                 <small>{modelLoading ? stats.embedding_model : `${stats.processed_files} / ${stats.total_files}`}</small>
@@ -272,7 +365,7 @@ function App() {
             {showTiming && (
               <section className="timing-panel">
                 <header><span>{t.timingTitle}</span><strong>{formatDuration(stats.index_total_elapsed_ms ?? 0)}</strong></header>
-                {stats.status === "indexing" && (
+                {isIndexing && (
                   <div className="timing-current">
                     <span>{t.currentStage}</span>
                     <strong>{stageLabels[stats.index_stage ?? "starting"]}</strong>
@@ -281,8 +374,8 @@ function App() {
                 )}
                 <div className="timing-list">
                   {timingRows.map(([stage, label, elapsed]) => (
-                    <div className={stats.status === "indexing" && stats.index_stage === stage ? "active" : ""} key={stage}>
-                      <span>{label}</span><time>{formatDuration(elapsed + (stats.status === "indexing" && stats.index_stage === stage ? stats.index_stage_elapsed_ms ?? 0 : 0))}</time>
+                    <div className={isIndexing && stats.index_stage === stage ? "active" : ""} key={stage}>
+                      <span>{label}</span><time>{formatDuration(elapsed + (isIndexing && stats.index_stage === stage ? stats.index_stage_elapsed_ms ?? 0 : 0))}</time>
                     </div>
                   ))}
                 </div>
@@ -295,7 +388,12 @@ function App() {
             </div>
             <div className="index-actions">
               <span><Clock3 />{stats.last_indexed ? formatDate(stats.last_indexed, locale) : t.never}</span>
-              <button className="icon-button" disabled={stats.status === "indexing" || stats.directories.length === 0} onClick={() => void indexFolders(stats.directories)} title={t.reindex}><RefreshCw /></button>
+              <div className="index-action-buttons">
+                {stats.status === "indexing" && <button className="icon-button" onClick={() => void controlIndex("pause")} title={t.pauseIndex}><Pause /></button>}
+                {stats.status === "paused" && <button className="icon-button" onClick={() => void controlIndex("resume")} title={t.resumeIndex}><Play /></button>}
+                {isIndexing && <button className="icon-button danger-icon" onClick={() => void controlIndex("cancel")} title={t.cancelIndex}><Square /></button>}
+                {!isIndexing && <button className="icon-button" disabled={stats.directories.length === 0} onClick={() => void indexFolders(stats.directories)} title={t.reindex}><RefreshCw /></button>}
+              </div>
             </div>
           </div>
         </aside>
@@ -342,9 +440,45 @@ function App() {
       </div>
 
       {inventory && <InventoryModal inventory={inventory} loading={inventoryLoading} t={t} locale={locale} onClose={() => setInventory(null)} onPage={(offset) => void showInventory(inventory.kind, offset)} onOpen={openPath} />}
+      {folderToRemove && (
+        <ConfirmRemoveFolderModal
+          path={folderToRemove}
+          t={t}
+          onCancel={() => setFolderToRemove(null)}
+          onConfirm={() => void removeFolder()}
+        />
+      )}
       {notice && <button className="toast" onClick={() => setNotice(null)}>{notice}<X /></button>}
     </div>
   );
+}
+
+function ConfirmRemoveFolderModal({ path, t, onCancel, onConfirm }: {
+  path: string;
+  t: ReturnType<typeof getMessages>;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onMouseDown={onCancel}>
+      <section className="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="remove-folder-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><AlertTriangle /><h2 id="remove-folder-title">{t.removeConfirmTitle}</h2></div>
+          <button className="icon-button" onClick={onCancel} title={t.close}><X /></button>
+        </header>
+        <div className="confirm-modal-body">
+          <p>{t.removeConfirmMessage}</p>
+          <strong title={path}>{path}</strong>
+          <small>{t.removeConfirmHint}</small>
+        </div>
+        <footer className="confirm-modal-actions">
+          <button className="secondary-button" onClick={onCancel}>{t.cancel}</button>
+          <button className="danger-button" onClick={onConfirm}><Trash2 />{t.removeConfirmAction}</button>
+        </footer>
+      </section>
+    </div>
+  );
+
 }
 
 function InventoryModal({
@@ -369,6 +503,8 @@ function InventoryModal({
   const emptyText = inventory.kind === "documents" ? t.noDocuments : inventory.kind === "chunks" ? t.noChunks : t.noFailures;
   const start = page.total === 0 ? 0 : page.offset + 1;
   const end = Math.min(page.offset + page.items.length, page.total);
+  const totalPages = Math.max(1, Math.ceil(page.total / page.limit));
+  const currentPage = Math.min(totalPages, Math.floor(page.offset / page.limit) + 1);
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -418,6 +554,19 @@ function InventoryModal({
             <button className="icon-button" disabled={loading || page.offset === 0} onClick={() => onPage(Math.max(0, page.offset - page.limit))} title={t.previous}><ChevronLeft /></button>
             {loading && <RefreshCw className="spin" />}
             <button className="icon-button" disabled={loading || page.offset + page.limit >= page.total} onClick={() => onPage(page.offset + page.limit)} title={t.next}><ChevronRight /></button>
+            {inventory.kind !== "failures" && (
+              <select
+                className="inventory-page-select"
+                value={currentPage}
+                disabled={loading || page.total === 0}
+                aria-label={t.pageNumber(currentPage, totalPages)}
+                onChange={(event) => onPage((Number(event.target.value) - 1) * page.limit)}
+              >
+                {Array.from({ length: totalPages }, (_, index) => index + 1).map((pageNumber) => (
+                  <option key={pageNumber} value={pageNumber}>{t.pageNumber(pageNumber, totalPages)}</option>
+                ))}
+              </select>
+            )}
           </div>
         </footer>
       </section>

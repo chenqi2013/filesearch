@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub const EMBEDDING_DIMENSION: usize = 768;
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-single-eos-v2";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-single-eos-mixed-int8-v3";
 const RWKV_HEAD_COUNT: usize = 12;
 const RWKV_HEAD_SIZE: usize = 64;
 const RWKV_HEAD_STATE_SIZE: usize = RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;

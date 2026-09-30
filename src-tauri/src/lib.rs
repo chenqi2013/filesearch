@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Command as SystemCommand, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, RunEvent, State};
 
 #[cfg(windows)]
@@ -81,6 +82,22 @@ fn reveal_path(path: String) -> Result<(), String> {
     run_open_command(&path, true)
 }
 
+#[tauri::command]
+fn directory_modified_times(paths: Vec<String>) -> HashMap<String, u64> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let modified_ms = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default();
+            (path, modified_ms)
+        })
+        .collect()
+}
+
 fn ensure_exists(path: &str) -> Result<(), String> {
     if Path::new(path).exists() {
         Ok(())
@@ -133,7 +150,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ensure_search_core,
             open_path,
-            reveal_path
+            reveal_path,
+            directory_modified_times
         ])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application");
