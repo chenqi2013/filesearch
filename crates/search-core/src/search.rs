@@ -1,4 +1,4 @@
-use crate::embedding::{query_terms, EmbeddingEngine};
+use crate::embedding::{query_terms, EmbeddingEngine, ASCII_PREFIX_MIN_LENGTH};
 use crate::model::{IndexedDocument, SearchMode, SearchRequest, SearchResult, StoredDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
@@ -8,6 +8,8 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct Candidate {
     keyword: f32,
+    lexical_coverage: f32,
+    short_cjk_coverage: f32,
     semantic: f32,
     semantic_relevance: f32,
     snippet: Option<String>,
@@ -16,9 +18,14 @@ struct Candidate {
 
 const SEMANTIC_SNIPPET_SCAN_LIMIT: usize = 1;
 const RAW_SEMANTIC_MIN_SCORE: f32 = 0.24;
-const SEMANTIC_RESULT_MIN_SCORE: f32 = 0.36;
+const SEMANTIC_RESULT_MIN_SCORE: f32 = 0.30;
 const KEYWORD_MIN_COVERAGE: f32 = 0.25;
-const SEMANTIC_ONLY_MIN_SCORE: f32 = 0.50;
+const SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE: f32 = 0.40;
+const SEMANTIC_ONLY_RELATIVE_RATIO: f32 = 0.84;
+const SEMANTIC_KEYWORD_MIN_COVERAGE: f32 = 0.30;
+const SHORT_CJK_SEMANTIC_MIN_SCORE: f32 = 0.30;
+const SHORT_CJK_MIN_COVERAGE: f32 = 1.0;
+const SHORT_CJK_RELEVANCE_BOOST: f32 = 0.10;
 
 pub fn search(
     storage: &Storage,
@@ -70,6 +77,7 @@ pub fn search(
             candidate.keyword = normalized;
             candidate.snippet = Some(chunk.text);
         }
+        candidate.lexical_coverage = candidate.lexical_coverage.max(coverage);
     }
 
     if request.mode != SearchMode::Keyword {
@@ -115,12 +123,27 @@ pub fn search(
             let semantic_text = candidate
                 .semantic_snippet
                 .as_deref()
+                .or(candidate.snippet.as_deref())
                 .unwrap_or(document.name.as_str());
             let coverage = term_coverage(&terms, &format!("{} {semantic_text}", document.name));
-            candidate.semantic_relevance =
-                candidate.semantic * 0.72 + coverage * 0.28 + candidate.keyword * 0.18;
+            let short_cjk_coverage = short_cjk_coverage(
+                &request.query,
+                &format!("{} {semantic_text}", document.name),
+            );
+            candidate.lexical_coverage = candidate.lexical_coverage.max(coverage);
+            candidate.short_cjk_coverage = candidate.short_cjk_coverage.max(short_cjk_coverage);
+            candidate.semantic_relevance = candidate.semantic * 0.72
+                + coverage * 0.28
+                + candidate.keyword * 0.18
+                + short_cjk_coverage * SHORT_CJK_RELEVANCE_BOOST;
         }
     }
+    let best_semantic_score = candidates
+        .values()
+        .map(|candidate| candidate.semantic)
+        .fold(0.0f32, f32::max);
+    let semantic_only_min_score =
+        (best_semantic_score * SEMANTIC_ONLY_RELATIVE_RATIO).max(SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE);
     let keyword_ranks = channel_ranks(
         candidates
             .iter()
@@ -135,7 +158,8 @@ pub fn search(
             .filter(|(_, candidate)| {
                 candidate.semantic >= RAW_SEMANTIC_MIN_SCORE
                     && candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE
-                    && (candidate.keyword > 0.0 || candidate.semantic >= SEMANTIC_ONLY_MIN_SCORE)
+                    && (candidate.keyword > 0.0
+                        || semantic_is_supported(candidate, semantic_only_min_score))
             })
             .map(|(id, candidate)| (id.clone(), candidate.semantic_relevance))
             .collect(),
@@ -150,15 +174,24 @@ pub fn search(
             } else {
                 0.0
             };
-            if candidate.keyword == 0.0
-                && filename_boost == 0.0
-                && candidate.semantic < SEMANTIC_ONLY_MIN_SCORE
-            {
+            let semantic_evidence = semantic_is_supported(&candidate, semantic_only_min_score)
+                && candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE;
+            let keyword_fallback = semantic_keyword_fallback(&candidate);
+            let supported = match request.mode {
+                SearchMode::Keyword => candidate.keyword > 0.0,
+                SearchMode::Semantic => {
+                    semantic_evidence || keyword_fallback > 0.0 || filename_boost > 0.0
+                }
+                SearchMode::Hybrid => {
+                    candidate.keyword > 0.0 || semantic_evidence || filename_boost > 0.0
+                }
+            };
+            if !supported {
                 return None;
             }
             let score = match request.mode {
                 SearchMode::Keyword => candidate.keyword,
-                SearchMode::Semantic => candidate.semantic_relevance,
+                SearchMode::Semantic => candidate.semantic_relevance.max(keyword_fallback),
                 SearchMode::Hybrid => reciprocal_rank_score(
                     keyword_ranks.get(&document_id).copied(),
                     semantic_ranks.get(&document_id).copied(),
@@ -268,6 +301,19 @@ fn reciprocal_rank_score(keyword: Option<usize>, semantic: Option<usize>) -> f32
     contribution(keyword) * KEYWORD_WEIGHT + contribution(semantic) * SEMANTIC_WEIGHT
 }
 
+fn semantic_keyword_fallback(candidate: &Candidate) -> f32 {
+    if candidate.keyword <= 0.0 || candidate.lexical_coverage < SEMANTIC_KEYWORD_MIN_COVERAGE {
+        return 0.0;
+    }
+    candidate.keyword * 0.45 + candidate.lexical_coverage * 0.25
+}
+
+fn semantic_is_supported(candidate: &Candidate, semantic_only_min_score: f32) -> bool {
+    candidate.semantic >= semantic_only_min_score
+        || (candidate.semantic >= SHORT_CJK_SEMANTIC_MIN_SCORE
+            && candidate.short_cjk_coverage >= SHORT_CJK_MIN_COVERAGE)
+}
+
 fn keyword_is_relevant(terms: &[String], coverage: f32) -> bool {
     if terms.is_empty() {
         return false;
@@ -290,13 +336,37 @@ fn term_coverage(query_terms: &[String], text: &str) -> f32 {
             if term.is_ascii() {
                 lower
                     .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                    .any(|word| word == term.as_str())
+                    .any(|word| {
+                        word == term.as_str()
+                            || (term.len() >= ASCII_PREFIX_MIN_LENGTH
+                                && word.starts_with(term.as_str()))
+                    })
             } else {
                 lower.contains(term.as_str())
             }
         })
         .count();
     matched as f32 / query_terms.len() as f32
+}
+
+fn short_cjk_coverage(query: &str, text: &str) -> f32 {
+    let characters = query
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<std::collections::HashSet<_>>();
+    if !(2..=4).contains(&characters.len())
+        || characters
+            .iter()
+            .any(|character| !matches!(*character as u32, 0x3400..=0x9fff | 0xf900..=0xfaff))
+    {
+        return 0.0;
+    }
+    let matched = characters
+        .iter()
+        .filter(|character| text.contains(**character))
+        .count();
+    matched as f32 / characters.len() as f32
 }
 
 fn best_semantic_snippet(storage: &Storage, document: &StoredDocument) -> Result<String> {
@@ -369,6 +439,236 @@ mod tests {
         assert!(reciprocal_rank_score(None, Some(1)) > reciprocal_rank_score(Some(1), None));
         assert_eq!(reciprocal_rank_score(None, None), 0.0);
         assert_eq!(reciprocal_rank_score(Some(1), Some(1)), 1.0);
+    }
+
+    #[test]
+    fn semantic_mode_keeps_strong_keyword_evidence_without_broad_fallbacks() {
+        let strong = Candidate {
+            keyword: 0.9,
+            lexical_coverage: 0.34,
+            ..Candidate::default()
+        };
+        let weak = Candidate {
+            keyword: 1.0,
+            lexical_coverage: 0.2,
+            ..Candidate::default()
+        };
+        assert!(semantic_keyword_fallback(&strong) >= SEMANTIC_RESULT_MIN_SCORE);
+        assert_eq!(semantic_keyword_fallback(&weak), 0.0);
+    }
+
+    #[test]
+    fn short_cjk_coverage_requires_every_query_character_for_full_support() {
+        assert_eq!(
+            short_cjk_coverage("赔款", "逾期付款需要支付违约金并承担赔偿责任"),
+            1.0
+        );
+        assert_eq!(short_cjk_coverage("赔款", "采购款应当按时支付"), 0.5);
+        assert_eq!(
+            short_cjk_coverage("适合全家一起看的轻松片子", "全家观看"),
+            0.0
+        );
+        assert!(semantic_is_supported(
+            &Candidate {
+                semantic: 0.31,
+                short_cjk_coverage: 1.0,
+                ..Candidate::default()
+            },
+            0.40
+        ));
+        assert!(!semantic_is_supported(
+            &Candidate {
+                semantic: 0.29,
+                short_cjk_coverage: 1.0,
+                ..Candidate::default()
+            },
+            0.40
+        ));
+        assert!(!semantic_is_supported(
+            &Candidate {
+                semantic: 0.31,
+                short_cjk_coverage: 0.5,
+                ..Candidate::default()
+            },
+            0.40
+        ));
+    }
+
+    #[test]
+    fn semantic_search_keeps_matching_terms_from_unsampled_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let document = crate::model::PreparedDocument {
+            id: "jobs".to_owned(),
+            root: "/test".to_owned(),
+            path: "/test/重庆考公职位表.xlsx".to_owned(),
+            name: "重庆考公职位表.xlsx".to_owned(),
+            extension: "xlsx".to_owned(),
+            modified_ms: 1,
+            size: 100,
+            chunks: vec!["岗位名称: 办公室四级主任科员及以下 | 招录人数: 2".to_owned()],
+            embedding: Vec::new(),
+        };
+        let chunks = storage.upsert_document(&document).unwrap();
+        index
+            .replace_document(&document.id, &document.name, &chunks)
+            .unwrap();
+        index.commit().unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("missing-model"));
+        let results = search(
+            &storage,
+            &index,
+            &engine,
+            &SearchRequest {
+                query: "坐办公室的岗位".to_owned(),
+                mode: SearchMode::Semantic,
+                extension: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            results.first().map(|result| result.id.as_str()),
+            Some("jobs")
+        );
+    }
+
+    #[test]
+    #[ignore = "loads the bundled RWKV model"]
+    fn customer_semantic_cases_recall_expected_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/models/embedding-rwkv-tiny"),
+        );
+        let cases = [
+            (
+                "contract",
+                "2024-03供应商合作协议.pdf",
+                "供应商合作协议：采购方逾期付款时，应按未付金额支付违约金并承担赔偿责任。",
+                "赔款",
+            ),
+            (
+                "jobs",
+                "重庆考公职位表.xlsx",
+                "工作表 招录职位 | 岗位名称: 办公室四级主任科员及以下 | 招录人数: 2",
+                "坐办公室的岗位",
+            ),
+            (
+                "movies",
+                "经典电影数据.xlsx",
+                "电影名: 欢乐家庭 | 类型: 喜剧 动画 | 适合人群: 全家观看 | 氛围: 轻松",
+                "适合全家一起看的轻松片子",
+            ),
+            (
+                "songs",
+                "KTV热歌.txt",
+                "歌单分类: 经典怀旧 | 内容: 往年流行金曲和经典老歌",
+                "以前很火的老歌",
+            ),
+        ];
+        for (id, name, text, _) in &cases {
+            let extension = name.rsplit_once('.').unwrap().1;
+            let vector = engine.embed_passages(&[text.to_string()]).remove(0);
+            let document = crate::model::PreparedDocument {
+                id: (*id).to_owned(),
+                root: "/test".to_owned(),
+                path: format!("/test/{name}"),
+                name: (*name).to_owned(),
+                extension: extension.to_owned(),
+                modified_ms: 1,
+                size: text.len() as u64,
+                chunks: vec![(*text).to_owned()],
+                embedding: vector.clone(),
+            };
+            let chunks = storage.upsert_document(&document).unwrap();
+            index
+                .replace_document(&document.id, &document.name, &chunks)
+                .unwrap();
+            storage
+                .replace_chunk_embeddings(&[(chunks[0].id, (*text).to_owned(), vector)])
+                .unwrap();
+            storage.update_document_embeddings(&[document]).unwrap();
+        }
+        index.commit().unwrap();
+        for (expected_id, _, _, query) in cases {
+            let results = search(
+                &storage,
+                &index,
+                &engine,
+                &SearchRequest {
+                    query: query.to_owned(),
+                    mode: SearchMode::Semantic,
+                    extension: None,
+                    limit: 10,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                results.first().map(|result| result.id.as_str()),
+                Some(expected_id),
+                "query={query:?}, results={:?}",
+                results
+                    .iter()
+                    .map(|result| (&result.id, result.score))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "loads the bundled RWKV model"]
+    fn pdf_contract_semantic_recall_uses_production_passage_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/models/embedding-rwkv-tiny"),
+        );
+        let name = "2024-03供应商合作协议.pdf";
+        let text = "2024年3月供应商合作协议\n甲方应在收到合格发票后十五个工作日内支付采购款。\n甲方逾期付款的，每逾期一日，应按未付金额的千分之一支付违约金。\n因一方违约造成对方损失的，违约方应承担相应赔偿责任。\n双方应优先协商解决履约争议。";
+        let passage = format!("{name}\n{text}");
+        let vector = engine.embed_passages(&[passage]).remove(0);
+        let document = crate::model::PreparedDocument {
+            id: "contract".to_owned(),
+            root: "/test".to_owned(),
+            path: format!("/test/{name}"),
+            name: name.to_owned(),
+            extension: "pdf".to_owned(),
+            modified_ms: 1,
+            size: text.len() as u64,
+            chunks: vec![text.to_owned()],
+            embedding: vector.clone(),
+        };
+        let chunks = storage.upsert_document(&document).unwrap();
+        index
+            .replace_document(&document.id, &document.name, &chunks)
+            .unwrap();
+        storage
+            .replace_chunk_embeddings(&[(chunks[0].id, text.to_owned(), vector)])
+            .unwrap();
+        storage.update_document_embeddings(&[document]).unwrap();
+        index.commit().unwrap();
+        let results = search(
+            &storage,
+            &index,
+            &engine,
+            &SearchRequest {
+                query: "赔款".to_owned(),
+                mode: SearchMode::Semantic,
+                extension: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            results.first().map(|result| result.id.as_str()),
+            Some("contract")
+        );
     }
 
     #[test]

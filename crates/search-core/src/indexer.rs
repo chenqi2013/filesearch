@@ -27,7 +27,9 @@ const EMBEDDING_BATCH_SIZE: usize = 4;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
-const MAX_SEMANTIC_CHUNKS_PER_DOCUMENT: usize = 7;
+const BASE_SEMANTIC_PASSAGES_PER_DOCUMENT: usize = 7;
+const MAX_LONG_DOCUMENT_SEMANTIC_PASSAGES: usize = 12;
+const MAX_SPREADSHEET_SEMANTIC_PASSAGES: usize = 24;
 const MAX_SEMANTIC_EMBED_CHARS: usize = 480;
 const SEMANTIC_WINDOW_STRIDE: usize = 400;
 #[cfg(not(test))]
@@ -712,7 +714,7 @@ fn semantic_chunks_for_document(document: &PreparedDocument) -> Vec<(usize, Stri
         })
         .collect::<Vec<_>>();
     let window_count = counts.iter().sum::<usize>();
-    let sample_count = window_count.min(MAX_SEMANTIC_CHUNKS_PER_DOCUMENT);
+    let sample_count = semantic_passage_budget(document, window_count);
     let selected = (0..sample_count)
         .map(|index| {
             if sample_count <= 1 {
@@ -743,6 +745,20 @@ fn semantic_chunks_for_document(document: &PreparedDocument) -> Vec<(usize, Stri
         offset += count;
     }
     passages
+}
+
+fn semantic_passage_budget(document: &PreparedDocument, window_count: usize) -> usize {
+    if window_count <= BASE_SEMANTIC_PASSAGES_PER_DOCUMENT {
+        return window_count;
+    }
+    let maximum = match document.extension.as_str() {
+        "xlsx" => MAX_SPREADSHEET_SEMANTIC_PASSAGES,
+        "pdf" | "docx" | "txt" => MAX_LONG_DOCUMENT_SEMANTIC_PASSAGES,
+        _ => BASE_SEMANTIC_PASSAGES_PER_DOCUMENT,
+    };
+    let adaptive =
+        ((window_count as f64).sqrt().ceil() as usize * 2).max(BASE_SEMANTIC_PASSAGES_PER_DOCUMENT);
+    adaptive.min(maximum).min(window_count)
 }
 
 fn semantic_chunk_text(name: &str, text: &str) -> String {
@@ -1182,9 +1198,36 @@ mod tests {
             embedding: Vec::new(),
         };
         let samples = semantic_chunks_for_document(&document);
-        assert_eq!(samples.len(), MAX_SEMANTIC_CHUNKS_PER_DOCUMENT);
+        assert_eq!(samples.len(), 10);
         assert_eq!(samples.first().map(|sample| sample.0), Some(0));
         assert_eq!(samples.last().map(|sample| sample.0), Some(19));
+    }
+
+    #[test]
+    fn spreadsheets_receive_more_semantic_coverage_than_long_documents() {
+        let build = |extension: &str| PreparedDocument {
+            id: extension.to_owned(),
+            root: "root".to_owned(),
+            name: format!("table.{extension}"),
+            extension: extension.to_owned(),
+            path: format!("table.{extension}"),
+            modified_ms: 0,
+            size: 0,
+            chunks: (0..400).map(|index| format!("记录 {index}")).collect(),
+            embedding: Vec::new(),
+        };
+        assert_eq!(
+            semantic_chunks_for_document(&build("xlsx")).len(),
+            MAX_SPREADSHEET_SEMANTIC_PASSAGES
+        );
+        assert_eq!(
+            semantic_chunks_for_document(&build("pdf")).len(),
+            MAX_LONG_DOCUMENT_SEMANTIC_PASSAGES
+        );
+        assert_eq!(
+            semantic_chunks_for_document(&build("json")).len(),
+            BASE_SEMANTIC_PASSAGES_PER_DOCUMENT
+        );
     }
 
     #[test]

@@ -1,12 +1,12 @@
-use crate::embedding::{lexical_text, query_terms};
+use crate::embedding::{lexical_text, query_terms, ASCII_PREFIX_MIN_LENGTH};
 use crate::model::{StoredChunk, StoredDocument};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, INDEXED, STORED, STRING, TEXT};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Schema, Value, INDEXED, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 const WRITER_MEMORY_BYTES: usize = 128 * 1024 * 1024;
@@ -143,12 +143,11 @@ impl TextIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<KeywordHit>> {
-        let query = query_terms(query).join(" ");
-        if query.is_empty() {
+        let terms = query_terms(query);
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let parser = QueryParser::for_index(&self.index, vec![self.content]);
-        let parsed = parser.parse_query(&query)?;
+        let parsed = keyword_query(&terms, self.content);
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit.clamp(1, 2_000)))?;
         let mut hits = Vec::with_capacity(top_docs.len());
@@ -167,6 +166,31 @@ impl TextIndex {
     pub fn document_count(&self) -> u64 {
         self.reader.searcher().num_docs()
     }
+}
+
+fn keyword_query(terms: &[String], content: Field) -> Box<dyn Query> {
+    let clauses = terms
+        .iter()
+        .map(|term| {
+            let term = Term::from_field_text(content, term);
+            if term
+                .value()
+                .as_str()
+                .is_some_and(|value| value.len() >= ASCII_PREFIX_MIN_LENGTH)
+            {
+                (
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new_prefix(term, 0, true)) as Box<dyn Query>,
+                )
+            } else {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                )
+            }
+        })
+        .collect();
+    Box::new(BooleanQuery::new(clauses))
 }
 
 fn build_schema() -> Schema {
@@ -202,5 +226,47 @@ mod tests {
         assert!(index.search("如何制作搜索引擎蛋糕", 10).is_ok());
         assert!(index.search("本年度天气预报", 10).unwrap().is_empty());
         assert!(!index.search("本", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tantivy_matches_ascii_prefixes() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = TextIndex::open(directory.path()).unwrap();
+        index
+            .replace_document(
+                "doc-1",
+                "11.xlsx",
+                &[StoredChunk {
+                    id: 1,
+                    document_id: "doc-1".to_owned(),
+                    text: "Pellentesque sit amet lectus. Praesent pulvinar, nunc quis iaculis sagittis".to_owned(),
+                }],
+            )
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(
+            index
+                .search("Praesent pulv", 10)
+                .unwrap()
+                .first()
+                .map(|hit| hit.chunk_id),
+            Some(1)
+        );
+        assert_eq!(
+            index
+                .search("Praesent pu", 10)
+                .unwrap()
+                .first()
+                .map(|hit| hit.chunk_id),
+            Some(1)
+        );
+        assert_eq!(
+            index
+                .search("pulv", 10)
+                .unwrap()
+                .first()
+                .map(|hit| hit.chunk_id),
+            Some(1)
+        );
     }
 }

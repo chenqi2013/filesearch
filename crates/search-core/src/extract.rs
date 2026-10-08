@@ -45,11 +45,22 @@ pub fn extract_text(path: &Path) -> Result<String> {
     };
 
     let mut normalized = normalize_text(&text);
-    if normalized.is_empty() && extension == "pdf" {
-        normalized = normalize_text(
-            &extract_pdf_ocr(path)
-                .with_context(|| format!("PDF 没有文字层，OCR 识别失败: {}", path.display()))?,
-        );
+    if extension == "pdf" && pdf_text_needs_ocr(&normalized) {
+        match extract_pdf_ocr(path) {
+            Ok(ocr_text) => {
+                let ocr_text = normalize_text(&ocr_text);
+                if normalized.is_empty()
+                    || pdf_text_quality(&ocr_text) > pdf_text_quality(&normalized)
+                {
+                    normalized = ocr_text;
+                }
+            }
+            Err(error) if normalized.is_empty() => {
+                return Err(error)
+                    .with_context(|| format!("PDF 没有文字层，OCR 识别失败: {}", path.display()));
+            }
+            Err(_) => {}
+        }
     }
     if normalized.is_empty() {
         return Err(anyhow!("未提取到可索引文本"));
@@ -170,6 +181,47 @@ fn ocr_text_score(text: &str) -> i64 {
     }
 }
 
+fn pdf_text_needs_ocr(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    let total = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count();
+    if total == 0 {
+        return true;
+    }
+    let suspicious = text
+        .chars()
+        .filter(|character| {
+            matches!(*character, '\u{fffd}' | '\0')
+                || character.is_control()
+                || matches!(*character as u32, 0xe000..=0xf8ff)
+        })
+        .count();
+    suspicious.saturating_mul(20) > total
+        || text.contains("(cid:")
+        || text.contains("锟斤拷")
+        || text.contains("����")
+}
+
+fn pdf_text_quality(text: &str) -> i64 {
+    let meaningful = text
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count() as i64;
+    let suspicious = text
+        .chars()
+        .filter(|character| {
+            matches!(*character, '\u{fffd}' | '\0')
+                || character.is_control()
+                || matches!(*character as u32, 0xe000..=0xf8ff)
+        })
+        .count() as i64;
+    meaningful - suspicious * 20
+}
+
 #[cfg(not(windows))]
 fn extract_pdf_ocr(_path: &Path) -> Result<String> {
     Err(anyhow!("图片型 PDF OCR 目前仅支持 Windows"))
@@ -213,6 +265,9 @@ enum OoxmlKind {
 fn extract_ooxml(path: &Path, kind: OoxmlKind) -> Result<String> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file).context("无效的 Office Open XML 文件")?;
+    if matches!(kind, OoxmlKind::Excel) {
+        return extract_xlsx(&mut archive);
+    }
     let mut names = (0..archive.len())
         .filter_map(|index| {
             archive
@@ -223,10 +278,7 @@ fn extract_ooxml(path: &Path, kind: OoxmlKind) -> Result<String> {
         .filter(|name| match kind {
             OoxmlKind::Word => name == "word/document.xml",
             OoxmlKind::PowerPoint => name.starts_with("ppt/slides/slide") && name.ends_with(".xml"),
-            OoxmlKind::Excel => {
-                name == "xl/sharedStrings.xml"
-                    || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
-            }
+            OoxmlKind::Excel => false,
         })
         .collect::<Vec<_>>();
     names.sort_by_key(|name| natural_number(name));
@@ -246,6 +298,207 @@ fn extract_ooxml(path: &Path, kind: OoxmlKind) -> Result<String> {
         }
     }
     Ok(output)
+}
+
+fn extract_xlsx(archive: &mut ZipArchive<File>) -> Result<String> {
+    let shared_strings = if let Ok(mut entry) = archive.by_name("xl/sharedStrings.xml") {
+        let mut xml = String::new();
+        entry.read_to_string(&mut xml)?;
+        xlsx_shared_strings(&xml)?
+    } else {
+        Vec::new()
+    };
+    let mut sheet_names = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_owned())
+        })
+        .filter(|name| name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
+        .collect::<Vec<_>>();
+    sheet_names.sort_by_key(|name| natural_number(name));
+
+    let mut output = String::new();
+    for (sheet_index, name) in sheet_names.iter().enumerate() {
+        let mut entry = archive.by_name(name)?;
+        let mut xml = String::new();
+        entry.read_to_string(&mut xml)?;
+        let rows = xlsx_rows(&xml, &shared_strings)?;
+        let headers = rows
+            .iter()
+            .find(|(_, cells)| xlsx_header_candidate(cells))
+            .map(|(_, cells)| {
+                cells
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for (row_number, cells) in rows {
+            if cells.is_empty() {
+                continue;
+            }
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&format!("工作表 {} 第 {} 行", sheet_index + 1, row_number));
+            for (column, value) in cells {
+                let label = headers
+                    .get(&column)
+                    .filter(|header| !header.is_empty() && *header != &value)
+                    .cloned()
+                    .unwrap_or_else(|| xlsx_column_name(column));
+                output.push_str(" | ");
+                output.push_str(&label);
+                output.push_str(": ");
+                output.push_str(&value);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn xlsx_shared_strings(xml: &str) -> Result<Vec<String>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_item = false;
+    let mut in_text = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => match start.local_name().as_ref() {
+                b"si" => {
+                    current.clear();
+                    in_item = true;
+                }
+                b"t" if in_item => in_text = true,
+                _ => {}
+            },
+            Ok(Event::Text(text)) if in_text => current.push_str(&text.unescape()?),
+            Ok(Event::End(end)) => match end.local_name().as_ref() {
+                b"t" => in_text = false,
+                b"si" => {
+                    values.push(normalize_text(&current));
+                    in_item = false;
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(error.into()),
+            _ => {}
+        }
+    }
+    Ok(values)
+}
+
+fn xlsx_rows(xml: &str, shared_strings: &[String]) -> Result<Vec<(usize, Vec<(usize, String)>)>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut rows = Vec::new();
+    let mut row_number = 0usize;
+    let mut cells = Vec::new();
+    let mut cell_column = 0usize;
+    let mut cell_type = String::new();
+    let mut cell_value = String::new();
+    let mut in_value = false;
+    let mut in_inline_text = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => match start.local_name().as_ref() {
+                b"row" => {
+                    row_number = xml_attribute(&start, b"r")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(rows.len() + 1);
+                    cells.clear();
+                }
+                b"c" => {
+                    cell_type = xml_attribute(&start, b"t").unwrap_or_default();
+                    cell_column = xml_attribute(&start, b"r")
+                        .map(|reference| xlsx_column_index(&reference))
+                        .unwrap_or(cells.len());
+                    cell_value.clear();
+                }
+                b"v" => in_value = true,
+                b"t" if cell_type == "inlineStr" => in_inline_text = true,
+                _ => {}
+            },
+            Ok(Event::Text(text)) if in_value || in_inline_text => {
+                cell_value.push_str(&text.unescape()?)
+            }
+            Ok(Event::End(end)) => match end.local_name().as_ref() {
+                b"v" => in_value = false,
+                b"t" => in_inline_text = false,
+                b"c" => {
+                    let value = match cell_type.as_str() {
+                        "s" => cell_value
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|index| shared_strings.get(index))
+                            .cloned()
+                            .unwrap_or_default(),
+                        "b" => match cell_value.trim() {
+                            "1" => "是".to_owned(),
+                            "0" => "否".to_owned(),
+                            value => value.to_owned(),
+                        },
+                        _ => normalize_text(&cell_value),
+                    };
+                    if !value.is_empty() {
+                        cells.push((cell_column, value));
+                    }
+                }
+                b"row" => rows.push((row_number, std::mem::take(&mut cells))),
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(error.into()),
+            _ => {}
+        }
+    }
+    Ok(rows)
+}
+
+fn xml_attribute(start: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+    start
+        .attributes()
+        .flatten()
+        .find(|attribute| attribute.key.as_ref() == key)
+        .map(|attribute| String::from_utf8_lossy(attribute.value.as_ref()).into_owned())
+}
+
+fn xlsx_column_index(reference: &str) -> usize {
+    reference
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .fold(0usize, |value, character| {
+            value * 26 + (character.to_ascii_uppercase() as usize - 'A' as usize + 1)
+        })
+        .saturating_sub(1)
+}
+
+fn xlsx_column_name(mut index: usize) -> String {
+    let mut value = String::new();
+    loop {
+        value.insert(0, (b'A' + (index % 26) as u8) as char);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    value
+}
+
+fn xlsx_header_candidate(cells: &[(usize, String)]) -> bool {
+    cells.len() >= 2
+        && cells.len() <= 64
+        && cells.iter().all(|(_, value)| {
+            let length = value.chars().count();
+            (1..=40).contains(&length) && value.chars().any(|character| character.is_alphabetic())
+        })
 }
 
 fn natural_number(value: &str) -> u64 {
@@ -393,6 +646,47 @@ mod tests {
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(decode_text_bytes(&bytes), value);
+    }
+
+    #[test]
+    fn xlsx_rows_preserve_headers_and_cell_relationships() {
+        let shared = xlsx_shared_strings(
+            r#"<sst><si><t>电影名</t></si><si><t>类型</t></si><si><t>适合人群</t></si>
+            <si><t>欢乐家庭</t></si><si><t>喜剧 动画</t></si><si><t>全家观看</t></si></sst>"#,
+        )
+        .unwrap();
+        let rows = xlsx_rows(
+            r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>
+            <row r="2"><c r="A2" t="s"><v>3</v></c><c r="B2" t="s"><v>4</v></c><c r="C2" t="s"><v>5</v></c></row>
+            </sheetData></worksheet>"#,
+            &shared,
+        )
+        .unwrap();
+        let headers = rows[0]
+            .1
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let rendered = rows[1]
+            .1
+            .iter()
+            .map(|(column, value)| format!("{}: {value}", headers[column]))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(
+            rendered,
+            "电影名: 欢乐家庭 | 类型: 喜剧 动画 | 适合人群: 全家观看"
+        );
+    }
+
+    #[test]
+    fn pdf_ocr_detection_is_conservative() {
+        assert!(pdf_text_needs_ocr(""));
+        assert!(pdf_text_needs_ocr("(cid:123) (cid:456)"));
+        assert!(!pdf_text_needs_ocr(
+            "供应商逾期付款时，应当按照合同约定支付违约金。"
+        ));
     }
 
     #[cfg(windows)]

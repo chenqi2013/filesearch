@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-mixed-int8-upper-ffn-passages-7-v7";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-mixed-int8-structured-adaptive-passages-v8";
 const MAX_SEQUENCE_LENGTH: usize = 1024;
 const INFERENCE_MAX_BATCH_SIZE: usize = 4;
 const INFERENCE_MAX_PADDED_TOKENS: usize = 2_048;
@@ -461,6 +461,8 @@ pub fn lexical_terms(text: &str) -> Vec<String> {
     values.sort_unstable();
     values
 }
+
+pub const ASCII_PREFIX_MIN_LENGTH: usize = 2;
 
 pub fn query_terms(text: &str) -> Vec<String> {
     let single_character = text.trim().chars().count() == 1;
