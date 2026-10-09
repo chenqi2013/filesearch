@@ -174,9 +174,9 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; flex: 0 0 auto; }
 .inventory-body p { margin: 2px 0 0; display: -webkit-box; overflow: hidden; color: #4d5651; font-size: 12px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .chunk-item { align-items: start; }
 .chunk-item > svg { margin: 2px 0 0 8px; }
-.failure-item { grid-template-columns: 24px minmax(0, 1fr); cursor: default; }
-.failure-item:hover { background: transparent; }
+.failure-item { grid-template-columns: 24px minmax(0, 1fr) 20px; }
 .failure-item > svg { color: var(--danger); }
+.failure-item > svg:last-child { color: var(--muted); }
 .failure-item .inventory-body strong { white-space: normal; overflow-wrap: anywhere; }
 .failure-item .inventory-body p { color: var(--danger); }
 .failure-category { width: fit-content; padding: 2px 6px; border-radius: 3px; background: #f7e9e6; color: var(--danger) !important; text-transform: uppercase; }

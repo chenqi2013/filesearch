@@ -4,6 +4,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -35,8 +36,7 @@ pub fn extract_text(path: &Path) -> Result<String> {
             if pdf_has_encrypt_marker(path)? {
                 return Err(anyhow!("加密 PDF 不支持，请解密后重新索引"));
             }
-            pdf_extract::extract_text(path)
-                .with_context(|| format!("PDF 解析失败: {}", path.display()))?
+            extract_pdf_text(path)?
         }
         "docx" => extract_ooxml(path, OoxmlKind::Word)?,
         "pptx" => extract_ooxml(path, OoxmlKind::PowerPoint)?,
@@ -63,9 +63,44 @@ pub fn extract_text(path: &Path) -> Result<String> {
         }
     }
     if normalized.is_empty() {
+        if matches!(
+            extension.as_str(),
+            "txt" | "md" | "csv" | "json" | "log" | "rst"
+        ) {
+            return Err(anyhow!("空文件或仅包含空白内容，已跳过"));
+        }
         return Err(anyhow!("未提取到可索引文本"));
     }
     Ok(normalized)
+}
+
+fn extract_pdf_text(path: &Path) -> Result<String> {
+    match catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text(path))) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => extract_pdf_ocr(path).with_context(|| {
+            format!(
+                "PDF 文字层解析失败，OCR 降级也失败: {}; 原始解析错误: {error}",
+                path.display()
+            )
+        }),
+        Err(payload) => {
+            let panic_message = panic_message(payload.as_ref());
+            extract_pdf_ocr(path).with_context(|| {
+                format!(
+                    "PDF 文字层解析异常，OCR 降级也失败: {}; 原始解析异常: {panic_message}",
+                    path.display()
+                )
+            })
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "未知异常".to_owned())
 }
 
 #[cfg(windows)]
@@ -646,6 +681,24 @@ mod tests {
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(decode_text_bytes(&bytes), value);
+    }
+
+    #[test]
+    fn reports_empty_text_files_as_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.txt");
+        std::fs::write(&path, " \r\n\t").unwrap();
+        let error = extract_text(&path).unwrap_err().to_string();
+        assert_eq!(error, "空文件或仅包含空白内容，已跳过");
+    }
+
+    #[test]
+    fn preserves_pdf_parser_panic_messages() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("unsupported encoding GBK-EUC-H");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "unsupported encoding GBK-EUC-H"
+        );
     }
 
     #[test]
