@@ -8,7 +8,7 @@ React UI
   ▼
 search-core（独立 Rust 进程）
   ├─ notify 文件监听、900 ms 去抖、后台增量队列
-  ├─ PDF / OOXML / 纯文本解析与异常分类
+  ├─ PDF / Office / 纯文本解析与异常分类
   ├─ EmbeddingRWKV Tiny 本地 ONNX Embedding（按 Token 长度动态组批，WKV 运行时选择 AVX2/FMA）
   ├─ SQLite WAL：目录、文档、正文分段、向量、失败状态
   └─ Tantivy：中文单字/双字词项、BM25 分段倒排索引
@@ -29,6 +29,8 @@ React 不直接读取磁盘，搜索核心不依赖 Tauri。服务只监听 `127
 4. Tantivy 保存片段级 BM25 索引。中文预处理包含单字、相邻双字及英文词，文件名词项重复加权。SQLite 按解析正文片段序列保存 SHA-256 指纹，用于相同正文折叠；不等同于文件二进制去重。
 5. SQLite 使用 WAL 与外键级联；Tantivy 提交后刷新 reader。服务启动时会比较 SQLite 片段数与 Tantivy 文档数，不一致则从 SQLite 自动重建全文索引。
 6. 旧版 `index.json` 首次启动自动迁移，随后后台重新扫描以补齐 EmbeddingRWKV Tiny 向量。
+
+旧版 `.doc/.xls/.ppt` 文件会先在系统临时目录转换为 OOXML 副本：优先调用 LibreOffice，无可用 LibreOffice 时在 Windows 上调用本机 Microsoft Office。转换完成后复用现有 OOXML 提取器，临时副本随即删除，用户原文件不会被修改。
 
 目录暂时不可访问或共享盘断线时，该根目录标记为 `offline`，不会删除已经建立的索引。明确从 UI 移除目录时才删除对应记录。
 

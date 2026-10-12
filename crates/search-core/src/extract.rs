@@ -5,12 +5,15 @@ use quick_xml::Reader;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "pdf", "docx", "xlsx", "pptx", "txt", "md", "csv", "json", "log", "rst",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json", "log", "rst",
 ];
+pub const EXTRACTION_PROFILE: &str = "office-legacy-conversion-v2";
 
 pub fn is_supported(path: &Path) -> bool {
     path.extension()
@@ -41,6 +44,9 @@ pub fn extract_text(path: &Path) -> Result<String> {
         "docx" => extract_ooxml(path, OoxmlKind::Word)?,
         "pptx" => extract_ooxml(path, OoxmlKind::PowerPoint)?,
         "xlsx" => extract_ooxml(path, OoxmlKind::Excel)?,
+        "doc" => extract_legacy_office(path, OoxmlKind::Word)?,
+        "ppt" => extract_legacy_office(path, OoxmlKind::PowerPoint)?,
+        "xls" => extract_legacy_office(path, OoxmlKind::Excel)?,
         _ => return Err(anyhow!("暂不支持 .{extension} 格式")),
     };
 
@@ -72,6 +78,204 @@ pub fn extract_text(path: &Path) -> Result<String> {
         return Err(anyhow!("未提取到可索引文本"));
     }
     Ok(normalized)
+}
+
+fn extract_legacy_office(path: &Path, kind: OoxmlKind) -> Result<String> {
+    let converted = convert_legacy_office(path, kind)?;
+    extract_ooxml(&converted.path, kind)
+}
+
+struct ConvertedOfficeFile {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for ConvertedOfficeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn convert_legacy_office(path: &Path, kind: OoxmlKind) -> Result<ConvertedOfficeFile> {
+    let directory = legacy_conversion_directory(path)?;
+    let extension = legacy_conversion_extension(kind);
+    let converted_path = directory.join(format!(
+        "{}.{}",
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("converted"),
+        extension
+    ));
+    let mut errors = Vec::new();
+
+    match convert_with_libreoffice(path, &directory, extension) {
+        Ok(()) if converted_path.is_file() => {
+            return Ok(ConvertedOfficeFile {
+                directory,
+                path: converted_path,
+            });
+        }
+        Ok(()) => errors.push("LibreOffice 未生成转换文件".to_owned()),
+        Err(error) => errors.push(format!("LibreOffice: {error:#}")),
+    }
+
+    match convert_with_microsoft_office(path, &converted_path, kind) {
+        Ok(()) if converted_path.is_file() => Ok(ConvertedOfficeFile {
+            directory,
+            path: converted_path,
+        }),
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&directory);
+            Err(anyhow!("Microsoft Office 未生成转换文件"))
+        }
+        Err(error) => {
+            errors.push(format!("Microsoft Office: {error:#}"));
+            let _ = std::fs::remove_dir_all(&directory);
+            Err(anyhow!(
+                "旧版 Office 文件转换失败，请安装 Microsoft Office 或 LibreOffice；{}",
+                errors.join("；")
+            ))
+        }
+    }
+}
+
+fn legacy_conversion_directory(path: &Path) -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "filesearch-office-{}-{nonce}-{}",
+        std::process::id(),
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("document")
+    ));
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("无法创建旧版 Office 转换临时目录: {}", directory.display()))?;
+    Ok(directory)
+}
+
+fn legacy_conversion_extension(kind: OoxmlKind) -> &'static str {
+    match kind {
+        OoxmlKind::Word => "docx",
+        OoxmlKind::Excel => "xlsx",
+        OoxmlKind::PowerPoint => "pptx",
+    }
+}
+
+fn convert_with_libreoffice(path: &Path, directory: &Path, extension: &str) -> Result<()> {
+    let mut errors = Vec::new();
+    for executable in libreoffice_candidates() {
+        let output = hidden_command(&executable)
+            .arg("--headless")
+            .arg("--convert-to")
+            .arg(extension)
+            .arg("--outdir")
+            .arg(directory)
+            .arg(path)
+            .stdin(Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => errors.push(command_failure(&output)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if errors.is_empty() {
+        Err(anyhow!("未找到 LibreOffice"))
+    } else {
+        Err(anyhow!(errors.join("；")))
+    }
+}
+
+fn libreoffice_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("soffice.exe"),
+        PathBuf::from("libreoffice.exe"),
+    ];
+    #[cfg(windows)]
+    {
+        for root in [
+            std::env::var_os("ProgramFiles"),
+            std::env::var_os("ProgramFiles(x86)"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            candidates.push(PathBuf::from(root).join("LibreOffice/program/soffice.exe"));
+        }
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn convert_with_microsoft_office(path: &Path, output: &Path, kind: OoxmlKind) -> Result<()> {
+    let script_path = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("convert.ps1");
+    std::fs::write(&script_path, microsoft_office_script(kind))?;
+    let powershell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+        .filter(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+    let command_output = hidden_command(&powershell)
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-STA")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&script_path)
+        .arg(path)
+        .arg(output)
+        .stdin(Stdio::null())
+        .output()
+        .context("无法启动 Microsoft Office 转换")?;
+    if command_output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(command_failure(&command_output)))
+    }
+}
+
+#[cfg(not(windows))]
+fn convert_with_microsoft_office(_path: &Path, _output: &Path, _kind: OoxmlKind) -> Result<()> {
+    Err(anyhow!("Microsoft Office 自动转换仅支持 Windows"))
+}
+
+#[cfg(windows)]
+fn microsoft_office_script(kind: OoxmlKind) -> &'static str {
+    match kind {
+        OoxmlKind::Word => include_str!("office_scripts/convert_word.ps1"),
+        OoxmlKind::Excel => include_str!("office_scripts/convert_excel.ps1"),
+        OoxmlKind::PowerPoint => include_str!("office_scripts/convert_powerpoint.ps1"),
+    }
+}
+
+fn hidden_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
+
+fn command_failure(output: &Output) -> String {
+    let stderr = decode_text_bytes(&output.stderr).trim().to_owned();
+    let stdout = decode_text_bytes(&output.stdout).trim().to_owned();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("进程退出码 {}", output.status)
+    }
 }
 
 fn extract_pdf_text(path: &Path) -> Result<String> {
@@ -291,6 +495,7 @@ fn pdf_has_encrypt_marker(path: &Path) -> Result<bool> {
         .any(|window| window == b"/Encrypt"))
 }
 
+#[derive(Clone, Copy)]
 enum OoxmlKind {
     Word,
     PowerPoint,
@@ -675,6 +880,41 @@ mod tests {
         assert_eq!(decode_text_bytes(&encoded), value);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn conversion_errors_preserve_utf8_and_legacy_chinese_output() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let message = "转换失败：远程过程调用失败 (HRESULT: 0x800706BE)";
+        let (legacy_bytes, _, had_errors) = GB18030.encode(message);
+        assert!(!had_errors);
+        for stderr in [message.as_bytes().to_vec(), legacy_bytes.into_owned()] {
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr,
+            };
+            assert_eq!(command_failure(&output), message);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_redirected_errors_preserve_chinese_paths() {
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = hidden_command(&powershell)
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); [Console]::Error.WriteLine('转换失败：C:\\测试目录\\文档.doc (HRESULT: 0x800706BE)'); exit 1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            command_failure(&output),
+            "转换失败：C:\\测试目录\\文档.doc (HRESULT: 0x800706BE)"
+        );
+    }
+
     #[test]
     fn decodes_utf16_text_with_bom() {
         let value = "本地文档搜索";
@@ -690,6 +930,21 @@ mod tests {
         std::fs::write(&path, " \r\n\t").unwrap();
         let error = extract_text(&path).unwrap_err().to_string();
         assert_eq!(error, "空文件或仅包含空白内容，已跳过");
+    }
+
+    #[test]
+    fn legacy_office_extensions_are_supported() {
+        assert!(is_supported(Path::new("sample.doc")));
+        assert!(is_supported(Path::new("sample.xls")));
+        assert!(is_supported(Path::new("sample.ppt")));
+        assert!(is_supported(Path::new("sample.DOC")));
+    }
+
+    #[test]
+    fn legacy_office_extensions_map_to_ooxml() {
+        assert_eq!(legacy_conversion_extension(OoxmlKind::Word), "docx");
+        assert_eq!(legacy_conversion_extension(OoxmlKind::Excel), "xlsx");
+        assert_eq!(legacy_conversion_extension(OoxmlKind::PowerPoint), "pptx");
     }
 
     #[test]

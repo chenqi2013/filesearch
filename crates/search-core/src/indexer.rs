@@ -319,6 +319,7 @@ where
         timings.text_index += commit_started.elapsed();
     }
     storage.set_embedding_profile()?;
+    storage.set_extraction_profile()?;
     storage.set_last_indexed_now()?;
     report_progress(&mut progress, total, total, None, "ready", &timings);
     tracing::info!(
@@ -966,7 +967,10 @@ fn extract_text_with_timeout(path: &Path) -> Result<String> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "pdf" | "docx" | "xlsx" | "pptx") {
+    if !matches!(
+        extension.as_str(),
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+    ) {
         return extract_text(path);
     }
 

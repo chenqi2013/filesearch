@@ -173,10 +173,14 @@ async fn main() -> anyhow::Result<()> {
 
     let directories = state.storage.directories()?;
     let profile_changed = !state.storage.embedding_profile_matches()?;
+    let extraction_profile_changed = !state.storage.extraction_profile_matches()?;
     if profile_changed {
         state.storage.clear_embeddings()?;
     }
-    if (migrated || profile_changed || state.storage.missing_embedding_count()? > 0)
+    if (migrated
+        || profile_changed
+        || extraction_profile_changed
+        || state.storage.missing_embedding_count()? > 0)
         && !directories.is_empty()
     {
         launch_full_index(Arc::clone(&state), directories);

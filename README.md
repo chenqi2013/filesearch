@@ -5,7 +5,7 @@
 ## 已实现
 
 - 添加、移除一个或多个本地索引目录
-- PDF、DOCX、XLSX、PPTX、TXT、MD、CSV、JSON、LOG、RST 文本抽取
+- PDF、DOC/DOCX、XLS/XLSX、PPT/PPTX、TXT、MD、CSV、JSON、LOG、RST 文本抽取
 - SQLite WAL 文件元数据 + Tantivy BM25 分段倒排索引，可面向 5,000–50,000 个文件
 - EmbeddingRWKV Tiny 本地 ONNX Embedding，支持关键词、语义、混合三种检索模式
 - 按文件大小和修改时间增量重建，文件变化 900 ms 去抖后后台自动更新
@@ -89,8 +89,8 @@ cargo test -p search-core sqlite_wal_handles_fifty_thousand_documents -- --ignor
 
 ## 当前边界
 
-- `.doc`、`.xls`、`.ppt` 旧版二进制格式尚未解析；可先另存为 OOXML 格式。
-- 扫描版 PDF 与图片 OCR、问答摘要尚未实现；加密 PDF 会明确列为失败文件。
+- `.doc`、`.xls`、`.ppt` 会优先通过 LibreOffice、其次通过本机 Microsoft Office 转换临时副本后解析；原文件不修改。两者均未安装或转换失败时会列入失败文件。
+- 扫描版 PDF、图片型 PDF 或不受支持的 PDF 文字编码会自动降级为 Windows OCR；加密 PDF 会明确列为失败文件。
 - PDF 和 Office 文档解析采用独立 worker，单文件默认 180 秒超时；超时文件会记录为 `timeout` 失败并继续处理后续文件。
 - 已完成 5 万条合成元数据容量测试；上线前仍建议在目标 Windows 机器和真实混合文档/共享盘环境进行长时间压力测试。
 

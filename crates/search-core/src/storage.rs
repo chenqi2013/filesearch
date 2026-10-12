@@ -653,6 +653,15 @@ impl Storage {
         self.set_setting("embedding_profile", crate::embedding::EMBEDDING_PROFILE)
     }
 
+    pub fn extraction_profile_matches(&self) -> Result<bool> {
+        Ok(self.setting("extraction_profile")?.as_deref()
+            == Some(crate::extract::EXTRACTION_PROFILE))
+    }
+
+    pub fn set_extraction_profile(&self) -> Result<()> {
+        self.set_setting("extraction_profile", crate::extract::EXTRACTION_PROFILE)
+    }
+
     fn setting(&self, key: &str) -> Result<Option<String>> {
         self.connection
             .lock()
