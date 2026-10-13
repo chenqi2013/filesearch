@@ -14,6 +14,8 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json", "log", "rst",
 ];
 pub const EXTRACTION_PROFILE: &str = "office-legacy-conversion-v2";
+pub(crate) const LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER: &str =
+    "[filesearch:legacy-office-environment-unavailable]";
 
 pub fn is_supported(path: &Path) -> bool {
     path.extension()
@@ -108,16 +110,18 @@ fn convert_legacy_office(path: &Path, kind: OoxmlKind) -> Result<ConvertedOffice
     ));
     let mut errors = Vec::new();
 
-    match convert_with_libreoffice(path, &directory, extension) {
+    let libreoffice_error = match convert_with_libreoffice(path, &directory, extension) {
         Ok(()) if converted_path.is_file() => {
             return Ok(ConvertedOfficeFile {
                 directory,
                 path: converted_path,
             });
         }
-        Ok(()) => errors.push("LibreOffice 未生成转换文件".to_owned()),
-        Err(error) => errors.push(format!("LibreOffice: {error:#}")),
-    }
+        Ok(()) => "LibreOffice 未生成转换文件".to_owned(),
+        Err(error) => format!("LibreOffice: {error:#}"),
+    };
+    let libreoffice_unavailable = libreoffice_error == "LibreOffice: 未找到 LibreOffice";
+    errors.push(libreoffice_error);
 
     match convert_with_microsoft_office(path, &converted_path, kind) {
         Ok(()) if converted_path.is_file() => Ok(ConvertedOfficeFile {
@@ -129,14 +133,43 @@ fn convert_legacy_office(path: &Path, kind: OoxmlKind) -> Result<ConvertedOffice
             Err(anyhow!("Microsoft Office 未生成转换文件"))
         }
         Err(error) => {
-            errors.push(format!("Microsoft Office: {error:#}"));
+            let microsoft_error = format!("Microsoft Office: {error:#}");
+            let environment_unavailable = libreoffice_unavailable
+                && microsoft_office_environment_unavailable(&microsoft_error);
+            errors.push(microsoft_error);
             let _ = std::fs::remove_dir_all(&directory);
-            Err(anyhow!(
-                "旧版 Office 文件转换失败，请安装 Microsoft Office 或 LibreOffice；{}",
-                errors.join("；")
-            ))
+            let marker = if environment_unavailable {
+                LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER
+            } else {
+                ""
+            };
+            let summary = if environment_unavailable {
+                "旧版 Office 转换环境不可用，请安装 Microsoft Office 或 LibreOffice"
+            } else {
+                "旧版 Office 文件转换失败"
+            };
+            Err(anyhow!("{marker}{summary}；{}", errors.join("；")))
         }
     }
+}
+
+fn microsoft_office_environment_unavailable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "0x80040154", // COM class not registered
+        "0x800401f3", // invalid COM class string
+        "0x800706ba", // RPC server unavailable
+        "0x800706be", // RPC call failed
+        "0x80080005", // COM server execution failed
+        "activex component can't create object",
+        "无法创建 activex",
+        "无法创建activex",
+        "检索 com 类工厂",
+        "无效的类字符串",
+        "microsoft office 自动转换仅支持 windows",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn legacy_conversion_directory(path: &Path) -> Result<PathBuf> {
@@ -945,6 +978,20 @@ mod tests {
         assert_eq!(legacy_conversion_extension(OoxmlKind::Word), "docx");
         assert_eq!(legacy_conversion_extension(OoxmlKind::Excel), "xlsx");
         assert_eq!(legacy_conversion_extension(OoxmlKind::PowerPoint), "pptx");
+    }
+
+    #[test]
+    fn identifies_office_environment_failures_without_treating_file_errors_as_global() {
+        assert!(microsoft_office_environment_unavailable(
+            "RPC 服务器不可用 (HRESULT: 0x800706BA)"
+        ));
+        assert!(microsoft_office_environment_unavailable(
+            "Class not registered (HRESULT: 0x80040154)"
+        ));
+        assert!(!microsoft_office_environment_unavailable(
+            "文件已损坏，无法打开 (HRESULT: 0x800A1066)"
+        ));
+        assert!(!microsoft_office_environment_unavailable("文档受密码保护"));
     }
 
     #[test]

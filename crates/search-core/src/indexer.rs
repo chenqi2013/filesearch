@@ -1,5 +1,5 @@
 use crate::embedding::{normalize, EmbeddingEngine, EMBEDDING_DIMENSION};
-use crate::extract::{extract_text, is_supported};
+use crate::extract::{extract_text, is_supported, LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER};
 use crate::model::{IndexFailure, PreparedDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
@@ -47,6 +47,121 @@ struct ParseJob {
     root: String,
     modified_ms: u64,
     size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum LegacyOfficeKind {
+    Word,
+    Excel,
+    PowerPoint,
+}
+
+impl LegacyOfficeKind {
+    fn from_path(path: &Path) -> Option<Self> {
+        match path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "doc" => Some(Self::Word),
+            "xls" => Some(Self::Excel),
+            "ppt" => Some(Self::PowerPoint),
+            _ => None,
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Word => "doc",
+            Self::Excel => "xls",
+            Self::PowerPoint => "ppt",
+        }
+    }
+}
+
+enum LegacyOfficeCapability {
+    Probing,
+    Available,
+    Unavailable(String),
+}
+
+#[derive(Default)]
+struct LegacyOfficeCapabilityCache {
+    states: Mutex<HashMap<LegacyOfficeKind, LegacyOfficeCapability>>,
+    wake: Condvar,
+}
+
+impl LegacyOfficeCapabilityCache {
+    fn extract<T>(&self, path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(kind) = LegacyOfficeKind::from_path(path) else {
+            return operation();
+        };
+
+        let probing = {
+            let mut states = self
+                .states
+                .lock()
+                .expect("legacy Office cache lock poisoned");
+            loop {
+                match states.get(&kind) {
+                    None => {
+                        states.insert(kind, LegacyOfficeCapability::Probing);
+                        break true;
+                    }
+                    Some(LegacyOfficeCapability::Probing) => {
+                        states = self
+                            .wake
+                            .wait(states)
+                            .expect("legacy Office cache lock poisoned");
+                    }
+                    Some(LegacyOfficeCapability::Available) => break false,
+                    Some(LegacyOfficeCapability::Unavailable(reason)) => {
+                        return Err(anyhow::anyhow!(reason.clone()));
+                    }
+                }
+            }
+        };
+
+        let result = operation();
+        let environment_failure = result.as_ref().err().and_then(|error| {
+            let message = format!("{error:#}");
+            message
+                .contains(LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER)
+                .then(|| skipped_legacy_office_reason(kind, &message))
+        });
+        let mut states = self
+            .states
+            .lock()
+            .expect("legacy Office cache lock poisoned");
+        if let Some(reason) = environment_failure {
+            states.insert(kind, LegacyOfficeCapability::Unavailable(reason));
+        } else if probing {
+            if result.is_ok() {
+                states.insert(kind, LegacyOfficeCapability::Available);
+            } else {
+                states.remove(&kind);
+            }
+        }
+        self.wake.notify_all();
+        result
+    }
+}
+
+fn skipped_legacy_office_reason(kind: LegacyOfficeKind, reason: &str) -> String {
+    format!(
+        "本次索引任务已跳过后续 .{} 文件转换：{}",
+        kind.extension(),
+        visible_failure_reason(reason)
+    )
+}
+
+fn visible_failure_reason(reason: &str) -> String {
+    reason
+        .replace(LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER, "")
+        .trim()
+        .to_owned()
 }
 
 #[derive(Default)]
@@ -195,6 +310,7 @@ where
     let mut processed = 0usize;
     let mut pending = Vec::with_capacity(EMBEDDING_BATCH_SIZE);
     let mut parse_jobs = Vec::with_capacity(PARSE_BATCH_SIZE);
+    let legacy_office_cache = LegacyOfficeCapabilityCache::default();
     let mut seen_by_root: HashMap<String, HashSet<String>> = HashMap::new();
 
     for scan in &scans {
@@ -249,6 +365,7 @@ where
                     &mut timings,
                     &mut progress,
                     control,
+                    &legacy_office_cache,
                     processed,
                     total,
                 )?;
@@ -268,6 +385,7 @@ where
             &mut timings,
             &mut progress,
             control,
+            &legacy_office_cache,
             processed,
             total,
         )?;
@@ -389,6 +507,7 @@ where
     report_progress(&mut progress, 0, files.len(), None, "checking", &timings);
     let mut pending = Vec::with_capacity(EMBEDDING_BATCH_SIZE);
     let mut parse_jobs = Vec::with_capacity(PARSE_BATCH_SIZE);
+    let legacy_office_cache = LegacyOfficeCapabilityCache::default();
     let mut processed = 0usize;
     for (index, path) in files.iter().enumerate() {
         control.checkpoint()?;
@@ -450,6 +569,7 @@ where
                 &mut timings,
                 &mut progress,
                 control,
+                &legacy_office_cache,
                 processed,
                 files.len(),
             )?;
@@ -466,6 +586,7 @@ where
             &mut timings,
             &mut progress,
             control,
+            &legacy_office_cache,
             processed,
             files.len(),
         )?;
@@ -768,6 +889,7 @@ fn flush_parse_jobs(
     timings: &mut IndexTimings,
     progress: &mut dyn FnMut(ProgressUpdate<'_>),
     control: &IndexControl,
+    legacy_office_cache: &LegacyOfficeCapabilityCache,
     processed: usize,
     total: usize,
 ) -> Result<(usize, bool)> {
@@ -790,7 +912,13 @@ fn flush_parse_jobs(
             .map(|job| {
                 let path = job.path;
                 let started = Instant::now();
-                let result = prepare_document(&path, &job.root, job.modified_ms, job.size);
+                let result = prepare_document(
+                    &path,
+                    &job.root,
+                    job.modified_ms,
+                    job.size,
+                    legacy_office_cache,
+                );
                 (path, started.elapsed(), result)
             })
             .collect::<Vec<_>>()
@@ -928,12 +1056,13 @@ fn prepare_document(
     root: &str,
     modified_ms: u64,
     size: u64,
+    legacy_office_cache: &LegacyOfficeCapabilityCache,
 ) -> Result<PreparedDocument> {
     if size > MAX_FILE_BYTES {
         anyhow::bail!("文件超过 200 MB 单文件限制");
     }
     let started = Instant::now();
-    let text = extract_text_with_timeout(path)?;
+    let text = legacy_office_cache.extract(path, || extract_text_with_timeout(path))?;
     tracing::debug!(
         path = %path.display(),
         elapsed_ms = started.elapsed().as_millis(),
@@ -1078,7 +1207,7 @@ fn stable_id(value: &str) -> String {
 }
 
 fn failure_for(path: &Path, error: &anyhow::Error) -> IndexFailure {
-    let reason = format!("{error:#}");
+    let reason = visible_failure_reason(&format!("{error:#}"));
     IndexFailure {
         path: path.to_string_lossy().into_owned(),
         category: classify_failure(&reason).to_owned(),
@@ -1118,6 +1247,7 @@ pub(crate) fn classify_failure(reason: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::embedding::fallback_embed;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn index_control_pauses_and_resumes_at_a_checkpoint() {
@@ -1244,6 +1374,81 @@ mod tests {
         assert_eq!(classify_failure("network share offline"), "offline");
         assert_eq!(classify_failure("invalid zip archive"), "corrupt");
         assert_eq!(classify_failure("文档解析超时（180 秒）"), "timeout");
+    }
+
+    #[test]
+    fn unavailable_legacy_office_provider_is_cached_per_format() {
+        let cache = LegacyOfficeCapabilityCache::default();
+        let doc_attempts = AtomicUsize::new(0);
+        let first = cache.extract(Path::new("first.doc"), || {
+            doc_attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(anyhow::anyhow!(
+                "{LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER}Office COM 不可用"
+            ))
+        });
+        assert!(first.is_err());
+
+        let second = cache.extract(Path::new("second.doc"), || {
+            doc_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(second.is_err());
+        assert_eq!(doc_attempts.load(Ordering::SeqCst), 1);
+        assert!(second
+            .unwrap_err()
+            .to_string()
+            .contains("已跳过后续 .doc 文件转换"));
+
+        let xls_attempts = AtomicUsize::new(0);
+        cache
+            .extract(Path::new("sheet.xls"), || {
+                xls_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(xls_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn file_specific_legacy_office_failure_does_not_trip_cache() {
+        let cache = LegacyOfficeCapabilityCache::default();
+        let attempts = AtomicUsize::new(0);
+        assert!(cache
+            .extract(Path::new("broken.doc"), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("文件损坏或受密码保护"))
+            })
+            .is_err());
+        cache
+            .extract(Path::new("valid.doc"), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_new_index_task_retries_legacy_office_provider() {
+        let unavailable = LegacyOfficeCapabilityCache::default();
+        assert!(unavailable
+            .extract(Path::new("first.ppt"), || Err::<(), _>(anyhow::anyhow!(
+                "{LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER}PowerPoint COM 不可用"
+            )))
+            .is_err());
+
+        let next_task = LegacyOfficeCapabilityCache::default();
+        assert!(next_task
+            .extract(Path::new("second.ppt"), || Ok::<_, anyhow::Error>(()))
+            .is_ok());
+    }
+
+    #[test]
+    fn internal_legacy_office_marker_is_hidden_from_failure_rows() {
+        let error =
+            anyhow::anyhow!("文档解析失败: {LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER}Office 不可用");
+        let failure = failure_for(Path::new("test.doc"), &error);
+        assert_eq!(failure.reason, "文档解析失败: Office 不可用");
     }
 
     #[test]
