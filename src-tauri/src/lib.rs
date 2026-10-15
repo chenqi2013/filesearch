@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager, RunEvent, State};
 use std::os::windows::process::CommandExt;
 
 const CORE_PORT: u16 = 47653;
+const LIBREOFFICE_DOWNLOAD_URL: &str = "https://www.libreoffice.org/download/download-libreoffice/";
 
 #[derive(Default)]
 struct CoreProcess(Mutex<Option<Child>>);
@@ -83,6 +84,11 @@ fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_libreoffice_download() -> Result<(), String> {
+    run_open_url_command(LIBREOFFICE_DOWNLOAD_URL)
+}
+
+#[tauri::command]
 fn directory_modified_times(paths: Vec<String>) -> HashMap<String, u64> {
     paths
         .into_iter()
@@ -143,6 +149,31 @@ fn run_open_command(path: &str, reveal: bool) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn run_open_url_command(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = SystemCommand::new("rundll32.exe");
+        command.args(["url.dll,FileProtocolHandler", url]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = SystemCommand::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = SystemCommand::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -151,6 +182,7 @@ pub fn run() {
             ensure_search_core,
             open_path,
             reveal_path,
+            open_libreoffice_download,
             directory_modified_times
         ])
         .build(tauri::generate_context!())

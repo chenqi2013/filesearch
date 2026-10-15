@@ -3,8 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Clock3,
   Cpu,
   ExternalLink,
@@ -71,6 +73,8 @@ function App() {
   const [inventory, setInventory] = useState<InventoryState | null>(null);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [officeSetupRequired, setOfficeSetupRequired] = useState(false);
+  const [indexSummaryCollapsed, setIndexSummaryCollapsed] = useState(false);
   const [folderToRemove, setFolderToRemove] = useState<string | null>(null);
   const [folderMenuOpen, setFolderMenuOpen] = useState(false);
   const [folderSearchOpen, setFolderSearchOpen] = useState(false);
@@ -79,12 +83,27 @@ function App() {
   const [folderModifiedTimes, setFolderModifiedTimes] = useState<Record<string, number>>({});
   const folderMenuRef = useRef<HTMLDivElement>(null);
   const searchRequestId = useRef(0);
+  const previousIndexStatus = useRef<ServiceStats["status"] | null>(null);
 
   const refreshStats = useCallback(async () => {
     try {
       const next = await coreApi.stats();
+      const previous = previousIndexStatus.current;
+      previousIndexStatus.current = next.status;
       setStats(next);
       setConnected(true);
+      if (
+        (previous === "indexing" || previous === "paused")
+        && next.status === "ready"
+        && next.failed_count > 0
+      ) {
+        try {
+          const failures = await coreApi.failures(0, 100);
+          if (failures.items.some(isOfficeDependencyFailure)) {
+            setOfficeSetupRequired(true);
+          }
+        } catch {}
+      }
     } catch {
       setConnected(false);
     }
@@ -238,8 +257,19 @@ function App() {
     }
   };
 
+  const downloadLibreOffice = async () => {
+    try {
+      if (!isTauri()) throw new Error("仅桌面应用支持此操作");
+      await invoke("open_libreoffice_download");
+      setOfficeSetupRequired(false);
+    } catch (error) {
+      setNotice(`${t.error}: ${String(error)}`);
+    }
+  };
+
   const extensions = stats.extensions;
   const isIndexing = stats.status === "indexing" || stats.status === "paused";
+  const indexDetailsCollapsed = indexSummaryCollapsed && !isIndexing;
   const progress = stats.total_files ? Math.round((stats.processed_files / stats.total_files) * 100) : 0;
   const modelLoading = stats.embedding_model?.includes("正在加载") ?? false;
   const operation = stats.status === "paused"
@@ -351,42 +381,60 @@ function App() {
           {stats.directories.length === 0 && <button className="add-folder" onClick={addFolder}><Plus />{t.addFolder}</button>}
 
           <div className="index-summary">
-            <div className="status-line"><span className={`status-dot ${connected ? stats.status : "offline"}`} />{!connected ? t.unavailable : isIndexing ? operation : t.ready}</div>
-            <div className={`backend-status ${backend}`} title={stats.embedding_model ?? undefined}>
-              <Cpu aria-hidden="true" />
-              <span>{t.embeddingBackend}: <strong>{backendLabel}</strong></span>
+            <div className="status-line">
+              <span className={`status-dot ${connected ? stats.status : "offline"}`} />
+              <span className="status-label">{!connected ? t.unavailable : isIndexing ? operation : t.ready}</span>
+              {connected && !isIndexing && (
+                <button
+                  className="icon-button summary-toggle"
+                  onClick={() => setIndexSummaryCollapsed((collapsed) => !collapsed)}
+                  title={indexSummaryCollapsed ? t.expandIndexInfo : t.collapseIndexInfo}
+                  aria-label={indexSummaryCollapsed ? t.expandIndexInfo : t.collapseIndexInfo}
+                  aria-expanded={!indexSummaryCollapsed}
+                >
+                  {indexSummaryCollapsed ? <ChevronDown /> : <ChevronUp />}
+                </button>
+              )}
             </div>
-            {isIndexing && (
-              <div className="progress-block">
-                <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>
-                <small>{modelLoading ? stats.embedding_model : `${stats.processed_files} / ${stats.total_files}`}</small>
-              </div>
-            )}
-            {showTiming && (
-              <section className="timing-panel">
-                <header><span>{t.timingTitle}</span><strong>{formatDuration(stats.index_total_elapsed_ms ?? 0)}</strong></header>
+            {!indexDetailsCollapsed && (
+              <>
+                <div className={`backend-status ${backend}`} title={stats.embedding_model ?? undefined}>
+                  <Cpu aria-hidden="true" />
+                  <span>{t.embeddingBackend}: <strong>{backendLabel}</strong></span>
+                </div>
                 {isIndexing && (
-                  <div className="timing-current">
-                    <span>{t.currentStage}</span>
-                    <strong>{stageLabels[stats.index_stage ?? "starting"]}</strong>
-                    <time>{formatDuration(stats.index_stage_elapsed_ms ?? 0)}</time>
+                  <div className="progress-block">
+                    <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>
+                    <small>{modelLoading ? stats.embedding_model : `${stats.processed_files} / ${stats.total_files}`}</small>
                   </div>
                 )}
-                <div className="timing-list">
-                  {timingRows.map(([stage, label, elapsed]) => (
-                    <div className={isIndexing && stats.index_stage === stage ? "active" : ""} key={stage}>
-                      <span>{label}</span><time>{formatDuration(elapsed + (isIndexing && stats.index_stage === stage ? stats.index_stage_elapsed_ms ?? 0 : 0))}</time>
+                {showTiming && (
+                  <section className="timing-panel">
+                    <header><span>{t.timingTitle}</span><strong>{formatDuration(stats.index_total_elapsed_ms ?? 0)}</strong></header>
+                    {isIndexing && (
+                      <div className="timing-current">
+                        <span>{t.currentStage}</span>
+                        <strong>{stageLabels[stats.index_stage ?? "starting"]}</strong>
+                        <time>{formatDuration(stats.index_stage_elapsed_ms ?? 0)}</time>
+                      </div>
+                    )}
+                    <div className="timing-list">
+                      {timingRows.map(([stage, label, elapsed]) => (
+                        <div className={isIndexing && stats.index_stage === stage ? "active" : ""} key={stage}>
+                          <span>{label}</span><time>{formatDuration(elapsed + (isIndexing && stats.index_stage === stage ? stats.index_stage_elapsed_ms ?? 0 : 0))}</time>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              </section>
+                  </section>
+                )}
+              </>
             )}
             <div className="stat-grid">
               <button onClick={() => void showInventory("documents")}><strong>{stats.document_count}</strong>{t.documents}</button>
               <button onClick={() => void showInventory("chunks")}><strong>{stats.chunk_count}</strong>{t.chunks}</button>
               <button onClick={() => void showInventory("failures")}><strong>{stats.failed_count}</strong>{t.failures}</button>
             </div>
-            <div className="index-actions">
+            {!indexDetailsCollapsed && <div className="index-actions">
               <span><Clock3 />{stats.last_indexed ? formatDate(stats.last_indexed, locale) : t.never}</span>
               <div className="index-action-buttons">
                 {stats.status === "indexing" && <button className="icon-button" onClick={() => void controlIndex("pause")} title={t.pauseIndex}><Pause /></button>}
@@ -394,7 +442,7 @@ function App() {
                 {isIndexing && <button className="icon-button danger-icon" onClick={() => void controlIndex("cancel")} title={t.cancelIndex}><Square /></button>}
                 {!isIndexing && <button className="icon-button" disabled={stats.directories.length === 0} onClick={() => void indexFolders(stats.directories)} title={t.reindex}><RefreshCw /></button>}
               </div>
-            </div>
+            </div>}
           </div>
         </aside>
 
@@ -448,7 +496,39 @@ function App() {
           onConfirm={() => void removeFolder()}
         />
       )}
+      {officeSetupRequired && (
+        <OfficeSetupModal
+          t={t}
+          onCancel={() => setOfficeSetupRequired(false)}
+          onDownload={() => void downloadLibreOffice()}
+        />
+      )}
       {notice && <button className="toast" onClick={() => setNotice(null)}>{notice}<X /></button>}
+    </div>
+  );
+}
+
+function OfficeSetupModal({ t, onCancel, onDownload }: {
+  t: ReturnType<typeof getMessages>;
+  onCancel: () => void;
+  onDownload: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onMouseDown={onCancel}>
+      <section className="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="office-required-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><AlertTriangle /><h2 id="office-required-title">{t.officeRequiredTitle}</h2></div>
+          <button className="icon-button" onClick={onCancel} title={t.close}><X /></button>
+        </header>
+        <div className="confirm-modal-body">
+          <p>{t.officeRequiredMessage}</p>
+          <small>{t.officeRequiredHint}</small>
+        </div>
+        <footer className="confirm-modal-actions">
+          <button className="secondary-button" onClick={onCancel}>{t.cancel}</button>
+          <button className="primary-button" onClick={onDownload}><ExternalLink />{t.downloadLibreOffice}</button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -618,6 +698,8 @@ function Highlight({ text, query }: { text: string; query: string }) {
 }
 
 const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+const isOfficeDependencyFailure = (failure: IndexFailure) => failure.category === "dependency"
+  || failure.reason.includes("旧版 Office 转换环境不可用");
 const formatBytes = (size: number) => size < 1024 ? `${size} B` : size < 1024 ** 2 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 ** 2).toFixed(1)} MB`;
 const formatDuration = (milliseconds: number) => milliseconds < 1_000
   ? `${Math.round(milliseconds)} ms`

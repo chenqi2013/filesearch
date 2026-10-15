@@ -13,6 +13,6 @@ try {
     [Console]::Error.WriteLine("{0} (HRESULT: 0x{1})", $_.Exception.Message, $_.Exception.HResult.ToString("X8"))
     exit 1
 } finally {
-    if ($null -ne $presentation) { $presentation.Close() }
-    if ($null -ne $application) { $application.Quit() }
+    if ($null -ne $presentation) { try { $presentation.Close() } catch {} }
+    if ($null -ne $application) { try { $application.Quit() } catch {} }
 }

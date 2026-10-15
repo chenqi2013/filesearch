@@ -82,7 +82,7 @@ impl LegacyOfficeKind {
 }
 
 enum LegacyOfficeCapability {
-    Probing,
+    Converting,
     Available,
     Unavailable(String),
 }
@@ -91,6 +91,7 @@ enum LegacyOfficeCapability {
 struct LegacyOfficeCapabilityCache {
     states: Mutex<HashMap<LegacyOfficeKind, LegacyOfficeCapability>>,
     wake: Condvar,
+    conversion: Mutex<()>,
 }
 
 impl LegacyOfficeCapabilityCache {
@@ -99,7 +100,7 @@ impl LegacyOfficeCapabilityCache {
             return operation();
         };
 
-        let probing = {
+        let previously_available = {
             let mut states = self
                 .states
                 .lock()
@@ -107,16 +108,19 @@ impl LegacyOfficeCapabilityCache {
             loop {
                 match states.get(&kind) {
                     None => {
-                        states.insert(kind, LegacyOfficeCapability::Probing);
-                        break true;
+                        states.insert(kind, LegacyOfficeCapability::Converting);
+                        break false;
                     }
-                    Some(LegacyOfficeCapability::Probing) => {
+                    Some(LegacyOfficeCapability::Converting) => {
                         states = self
                             .wake
                             .wait(states)
                             .expect("legacy Office cache lock poisoned");
                     }
-                    Some(LegacyOfficeCapability::Available) => break false,
+                    Some(LegacyOfficeCapability::Available) => {
+                        states.insert(kind, LegacyOfficeCapability::Converting);
+                        break true;
+                    }
                     Some(LegacyOfficeCapability::Unavailable(reason)) => {
                         return Err(anyhow::anyhow!(reason.clone()));
                     }
@@ -124,7 +128,12 @@ impl LegacyOfficeCapabilityCache {
             }
         };
 
+        let conversion = self
+            .conversion
+            .lock()
+            .expect("legacy Office conversion lock poisoned");
         let result = operation();
+        drop(conversion);
         let environment_failure = result.as_ref().err().and_then(|error| {
             let message = format!("{error:#}");
             message
@@ -137,12 +146,10 @@ impl LegacyOfficeCapabilityCache {
             .expect("legacy Office cache lock poisoned");
         if let Some(reason) = environment_failure {
             states.insert(kind, LegacyOfficeCapability::Unavailable(reason));
-        } else if probing {
-            if result.is_ok() {
-                states.insert(kind, LegacyOfficeCapability::Available);
-            } else {
-                states.remove(&kind);
-            }
+        } else if previously_available || result.is_ok() {
+            states.insert(kind, LegacyOfficeCapability::Available);
+        } else {
+            states.remove(&kind);
         }
         self.wake.notify_all();
         result
@@ -1217,7 +1224,9 @@ fn failure_for(path: &Path, error: &anyhow::Error) -> IndexFailure {
 
 pub(crate) fn classify_failure(reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
-    if lower.contains("encrypt") || lower.contains("password") || lower.contains("加密") {
+    if lower.contains("旧版 office 转换环境不可用") {
+        "dependency"
+    } else if lower.contains("encrypt") || lower.contains("password") || lower.contains("加密") {
         "encrypted"
     } else if lower.contains("permission denied")
         || lower.contains("access is denied")
@@ -1248,6 +1257,7 @@ mod tests {
     use super::*;
     use crate::embedding::fallback_embed;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn index_control_pauses_and_resumes_at_a_checkpoint() {
@@ -1369,6 +1379,10 @@ mod tests {
 
     #[test]
     fn failure_categories_cover_required_cases() {
+        assert_eq!(
+            classify_failure("旧版 Office 转换环境不可用，请安装 Microsoft Office 或 LibreOffice"),
+            "dependency"
+        );
         assert_eq!(classify_failure("document is encrypted"), "encrypted");
         assert_eq!(classify_failure("Permission denied"), "permission");
         assert_eq!(classify_failure("network share offline"), "offline");
@@ -1426,6 +1440,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn legacy_office_conversions_are_serialized_across_formats() {
+        let cache = Arc::new(LegacyOfficeCapabilityCache::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(4));
+        let workers = ["document.doc", "workbook.xls", "slides.ppt"]
+            .into_iter()
+            .map(|path| {
+                let cache = Arc::clone(&cache);
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache
+                        .extract(Path::new(path), || {
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            maximum.fetch_max(current, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(20));
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 
     #[test]
