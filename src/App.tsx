@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, Fragment, PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -16,6 +16,8 @@ import {
   FolderOpen,
   Globe2,
   MoreHorizontal,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pause,
   Play,
   Plus,
@@ -57,6 +59,9 @@ const EMPTY_STATS: ServiceStats = {
 };
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
+const DEFAULT_SIDEBAR_WIDTH = 258;
+const MIN_SIDEBAR_WIDTH = 200;
+const MAX_SIDEBAR_WIDTH = 420;
 
 function App() {
   const [locale, setLocale] = useState<Locale>("zh");
@@ -74,6 +79,8 @@ function App() {
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [officeSetupRequired, setOfficeSetupRequired] = useState(false);
+  const [sidebarHidden, setSidebarHidden] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [indexSummaryCollapsed, setIndexSummaryCollapsed] = useState(false);
   const [folderToRemove, setFolderToRemove] = useState<string | null>(null);
   const [folderMenuOpen, setFolderMenuOpen] = useState(false);
@@ -84,6 +91,27 @@ function App() {
   const folderMenuRef = useRef<HTMLDivElement>(null);
   const searchRequestId = useRef(0);
   const previousIndexStatus = useRef<ServiceStats["status"] | null>(null);
+  const sidebarResize = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const beginSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    sidebarResize.current = { startX: event.clientX, startWidth: sidebarWidth };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    document.body.classList.add("resizing-sidebar");
+  };
+
+  const continueSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!sidebarResize.current) return;
+    const width = sidebarResize.current.startWidth + event.clientX - sidebarResize.current.startX;
+    setSidebarWidth(Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width)));
+  };
+
+  const finishSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    sidebarResize.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    document.body.classList.remove("resizing-sidebar");
+  };
 
   const refreshStats = useCallback(async () => {
     try {
@@ -323,8 +351,21 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand"><FileSearch aria-hidden="true" /><strong>{t.appName}</strong></div>
+      <header className={`topbar ${sidebarHidden ? "sidebar-hidden" : ""}`}>
+        <div className="brand">
+          <FileSearch aria-hidden="true" />
+          <strong>{t.appName}</strong>
+          <button
+            className="icon-button sidebar-toggle"
+            type="button"
+            title={sidebarHidden ? t.showSidebar : t.hideSidebar}
+            aria-label={sidebarHidden ? t.showSidebar : t.hideSidebar}
+            aria-expanded={!sidebarHidden}
+            onClick={() => setSidebarHidden((hidden) => !hidden)}
+          >
+            {sidebarHidden ? <PanelLeftOpen /> : <PanelLeftClose />}
+          </button>
+        </div>
         <form className="searchbox" onSubmit={submitSearch}>
           <Search aria-hidden="true" />
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t.searchPlaceholder} />
@@ -341,8 +382,11 @@ function App() {
         </label>
       </header>
 
-      <div className="workspace">
-        <aside className="sidebar">
+      <div
+        className={`workspace ${sidebarHidden ? "sidebar-hidden" : ""}`}
+        style={sidebarHidden ? undefined : { gridTemplateColumns: `${sidebarWidth}px 5px minmax(0, 1fr)` }}
+      >
+        {!sidebarHidden && <aside className="sidebar">
           <div className="sidebar-heading">
             <span>{t.folders}</span>
             {stats.directories.length > 0 && (
@@ -383,7 +427,12 @@ function App() {
           <div className="index-summary">
             <div className="status-line">
               <span className={`status-dot ${connected ? stats.status : "offline"}`} />
-              <span className="status-label">{!connected ? t.unavailable : isIndexing ? operation : t.ready}</span>
+              <span
+                className="status-label"
+                title={stats.current_file ? basename(stats.current_file) : undefined}
+              >
+                {!connected ? t.unavailable : isIndexing ? operation : t.ready}
+              </span>
               {connected && !isIndexing && (
                 <button
                   className="icon-button summary-toggle"
@@ -444,7 +493,24 @@ function App() {
               </div>
             </div>}
           </div>
-        </aside>
+        </aside>}
+        {!sidebarHidden && (
+          <div
+            className="sidebar-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label={t.resizeSidebar}
+            aria-valuemin={MIN_SIDEBAR_WIDTH}
+            aria-valuemax={MAX_SIDEBAR_WIDTH}
+            aria-valuenow={Math.round(sidebarWidth)}
+            title={t.resizeSidebar}
+            onPointerDown={beginSidebarResize}
+            onPointerMove={continueSidebarResize}
+            onPointerUp={finishSidebarResize}
+            onPointerCancel={finishSidebarResize}
+            onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+          />
+        )}
 
         <main className="content">
           <div className="result-toolbar">

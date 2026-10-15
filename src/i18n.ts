@@ -3,6 +3,9 @@ export type Locale = "zh" | "en" | "ru";
 const messages = {
   zh: {
     appName: "本地知搜",
+    hideSidebar: "隐藏侧边栏",
+    showSidebar: "显示侧边栏",
+    resizeSidebar: "拖动调整侧边栏宽度，双击恢复默认宽度",
     searchPlaceholder: "搜索文件、内容或自然语言问题",
     folders: "索引目录",
     addFolder: "添加目录",
@@ -91,6 +94,9 @@ const messages = {
   },
   en: {
     appName: "LocalFind",
+    hideSidebar: "Hide sidebar",
+    showSidebar: "Show sidebar",
+    resizeSidebar: "Drag to resize the sidebar; double-click to reset",
     searchPlaceholder: "Search files, content, or ask a question",
     folders: "Indexed folders",
     addFolder: "Add folder",
@@ -179,6 +185,9 @@ const messages = {
   },
   ru: {
     appName: "Локальный поиск",
+    hideSidebar: "Скрыть боковую панель",
+    showSidebar: "Показать боковую панель",
+    resizeSidebar: "Перетащите для изменения ширины; двойной щелчок — сброс",
     searchPlaceholder: "Поиск файлов, текста или вопрос",
     folders: "Папки индекса",
     addFolder: "Добавить папку",

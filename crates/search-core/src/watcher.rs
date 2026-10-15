@@ -1,5 +1,7 @@
+use crate::extract::is_temporary_office_file;
 use anyhow::Result;
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{MetadataKind, ModifyKind};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +59,17 @@ impl WatchService {
             while !worker_stop.load(Ordering::Relaxed) {
                 match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(Ok(event)) => {
-                        pending.extend(event.paths);
-                        last_event = Instant::now();
+                        if event_affects_index(&event) {
+                            pending.extend(
+                                event
+                                    .paths
+                                    .into_iter()
+                                    .filter(|path| !is_temporary_office_file(path)),
+                            );
+                            if !pending.is_empty() {
+                                last_event = Instant::now();
+                            }
+                        }
                     }
                     Ok(Err(error)) => on_error(format!("文件监听异常: {error}")),
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -97,11 +108,47 @@ impl WatchService {
     }
 }
 
+fn event_affects_index(event: &Event) -> bool {
+    !matches!(
+        event.kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+    )
+}
+
 impl Drop for WatchService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{AccessKind, AccessMode};
+
+    #[test]
+    fn ignores_file_access_and_access_time_events() {
+        let opened = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)));
+        let access_time = Event::new(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime,
+        )));
+        assert!(!event_affects_index(&opened));
+        assert!(!event_affects_index(&access_time));
+    }
+
+    #[test]
+    fn keeps_content_create_rename_and_remove_events() {
+        assert!(event_affects_index(&Event::new(EventKind::Create(
+            notify::event::CreateKind::File,
+        ))));
+        assert!(event_affects_index(&Event::new(EventKind::Modify(
+            ModifyKind::Data(notify::event::DataChange::Content),
+        ))));
+        assert!(event_affects_index(&Event::new(EventKind::Remove(
+            notify::event::RemoveKind::File,
+        ))));
     }
 }

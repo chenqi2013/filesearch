@@ -18,10 +18,22 @@ pub(crate) const LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER: &str =
     "[filesearch:legacy-office-environment-unavailable]";
 
 pub fn is_supported(path: &Path) -> bool {
+    if is_temporary_office_file(path) {
+        return false;
+    }
     path.extension()
         .and_then(|value| value.to_str())
         .map(|value| SUPPORTED_EXTENSIONS.contains(&value.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+pub(crate) fn is_temporary_office_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.starts_with("~$") || name.starts_with(".~lock.")
 }
 
 pub fn extract_text(path: &Path) -> Result<String> {
@@ -971,6 +983,15 @@ mod tests {
         assert!(is_supported(Path::new("sample.xls")));
         assert!(is_supported(Path::new("sample.ppt")));
         assert!(is_supported(Path::new("sample.DOC")));
+    }
+
+    #[test]
+    fn office_lock_files_are_not_indexed() {
+        assert!(!is_supported(Path::new("~$report.docx")));
+        assert!(!is_supported(Path::new("~$budget.xlsx")));
+        assert!(!is_supported(Path::new("~$slides.pptx")));
+        assert!(!is_supported(Path::new(".~lock.report.docx#")));
+        assert!(is_supported(Path::new("report.docx")));
     }
 
     #[test]
