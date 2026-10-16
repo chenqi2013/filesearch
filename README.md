@@ -71,7 +71,7 @@ DOCX 解析按 Word XML 结构读取可见文字，跳过域指令并保留域�
 
 完全离线环境可在启动前设置 `FILESEARCH_EMBEDDING_OFFLINE=1`，直接使用离线特征。
 
-Windows 安装包同时包含 CPU 和 NVIDIA CUDA 版 ONNX Runtime。启动时会检测 NVIDIA 驱动和 GPU，满足条件时启用 CUDA Execution Provider；没有 NVIDIA GPU、驱动不兼容或 CUDA/cuDNN 运行库缺失时自动回退 CPU，不影响使用。当前 ONNX 模型中的 `Rwkv7` 自定义 WKV 算子仍为 CPU 实现，因此 CUDA 版本只加速其余 ONNX 节点，完整 WKV CUDA kernel 尚未接入。
+Windows 安装包同时包含 CPU 和 NVIDIA CUDA 版 ONNX Runtime，并内置经过版本锁定和 SHA-256 校验的 CUDA 12、cuBLAS、cuFFT 与 cuDNN 9 运行库，目标电脑无需另外安装 CUDA Toolkit 或 cuDNN。启动时会检测 NVIDIA 驱动和 GPU，满足条件时启用 CUDA Execution Provider；`Rwkv7` 自定义算子使用与 ONNX Runtime 相同的 CUDA 上下文和计算流，输入、状态计算与输出均保留在显存。模型加载后会执行一次 GPU 试算；没有 NVIDIA GPU、驱动不兼容或 WKV CUDA 内核加载失败时自动回退 CPU，不影响使用。
 
 ## 大数据量设计
 

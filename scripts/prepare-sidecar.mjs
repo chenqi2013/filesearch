@@ -1,6 +1,21 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, cpSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  copyFileSync,
+  cpSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -62,41 +77,171 @@ async function prepareOnnxRuntime() {
   }
 }
 
-function prepareOptionalCudaLibraries() {
+const cudaPackages = [
+  {
+    name: "nvidia-cuda-runtime-cu12",
+    version: "12.2.140",
+    sha256: "3f35d098455efb847acdc5e6345b2943c6d570296d1b265adb97a500ce3ab941",
+    destination: "cuda-runtime",
+    license: "LICENSE-nvidia-cuda-runtime-cu12.txt",
+    files: ["cudart64_12.dll"],
+  },
+  {
+    name: "nvidia-cublas-cu12",
+    version: "12.2.5.6",
+    sha256: "b65d8b6e198056e4fafe998ae4e819e0be8e25554a724560a4cfd0602c5aa65b",
+    destination: "cuda-runtime",
+    license: "LICENSE-nvidia-cublas-cu12.txt",
+    files: ["cublasLt64_12.dll", "cublas64_12.dll"],
+  },
+  {
+    name: "nvidia-cufft-cu12",
+    version: "11.0.8.103",
+    sha256: "9e357c00a9504e8e27d1f9b95b769a6e9a5b96e0e031044d93d80ce69a43ee9b",
+    destination: "cuda-runtime",
+    license: "LICENSE-nvidia-cufft-cu12.txt",
+    files: ["cufft64_11.dll"],
+  },
+  {
+    name: "nvidia-cudnn-cu12",
+    version: "9.6.0.74",
+    sha256: "6a6466301b5ab1f0d8e62b14cdd02a714158f32f70ee99892218bec661e76595",
+    destination: "cudnn-runtime",
+    license: "LICENSE-nvidia-cudnn-cu12.txt",
+    // This RWKV graph has no Conv/RNN nodes. Keep the cuDNN dispatcher and its
+    // lightweight core components, but omit the 575 MiB convolution/RNN engine
+    // and advanced-operation DLLs so the signed NSIS payload stays below 2 GiB.
+    files: [
+      "cudnn_engines_runtime_compiled64_9.dll",
+      "cudnn_heuristic64_9.dll",
+      "cudnn_ops64_9.dll",
+      "cudnn_graph64_9.dll",
+      "cudnn64_9.dll",
+    ],
+  },
+];
+
+async function prepareCudaLibraries() {
   if (process.platform !== "win32") return;
   const buildDir = resolve(root, "target", release ? "release" : "debug");
   const sidecarDir = resolve(root, "src-tauri", "binaries");
-  const cudaRuntimeDir = resolve(sidecarDir, "cuda-runtime");
-  const cudnnRuntimeDir = resolve(sidecarDir, "cudnn-runtime");
   mkdirSync(resolve(buildDir, "cuda-runtime"), { recursive: true });
   mkdirSync(resolve(buildDir, "cudnn-runtime"), { recursive: true });
-  mkdirSync(cudaRuntimeDir, { recursive: true });
-  mkdirSync(cudnnRuntimeDir, { recursive: true });
-  const names = [
-    "cublasLt64_12.dll",
-    "cublas64_12.dll",
-    "cufft64_11.dll",
-    "cudart64_12.dll",
-    "cudnn_engines_runtime_compiled64_9.dll",
-    "cudnn_engines_precompiled64_9.dll",
-    "cudnn_heuristic64_9.dll",
-    "cudnn_ops64_9.dll",
-    "cudnn_adv64_9.dll",
-    "cudnn_graph64_9.dll",
-    "cudnn64_9.dll",
-  ];
-  const roots = [];
-  if (process.env.CUDA_PATH) roots.push(resolve(process.env.CUDA_PATH, "bin"));
-  if (process.env.CUDNN_PATH) roots.push(resolve(process.env.CUDNN_PATH, "bin"));
-  for (const name of names) {
-    const source = roots.map((directory) => resolve(directory, name)).find(existsSync);
-    if (!source) continue;
-    const destinationDir = name.startsWith("cudnn") ? cudnnRuntimeDir : cudaRuntimeDir;
-    const buildDestinationDir = name.startsWith("cudnn")
-      ? resolve(buildDir, "cudnn-runtime")
-      : resolve(buildDir, "cuda-runtime");
-    copyFileSync(source, resolve(buildDestinationDir, name));
-    copyFileSync(source, resolve(destinationDir, name));
+  mkdirSync(resolve(sidecarDir, "cuda-runtime"), { recursive: true });
+  mkdirSync(resolve(sidecarDir, "cudnn-runtime"), { recursive: true });
+
+  const expectedFiles = new Map([
+    ["cuda-runtime", new Set()],
+    ["cudnn-runtime", new Set()],
+  ]);
+  for (const dependency of cudaPackages) {
+    const expected = expectedFiles.get(dependency.destination);
+    for (const name of dependency.files) expected.add(name.toLowerCase());
+    expected.add(dependency.license.toLowerCase());
+  }
+  for (const [directory, expected] of expectedFiles) {
+    pruneRuntimeDirectory(resolve(buildDir, directory), expected);
+    pruneRuntimeDirectory(resolve(sidecarDir, directory), expected);
+  }
+
+  for (const dependency of cudaPackages) {
+    const packageRoot = await ensureNvidiaPackage(dependency);
+    for (const name of dependency.files) {
+      const source = findFile(packageRoot, name);
+      if (!source) {
+        throw new Error(`${dependency.name} ${dependency.version} is missing ${name}`);
+      }
+      copyIfChanged(source, resolve(buildDir, dependency.destination, name));
+      copyIfChanged(source, resolve(sidecarDir, dependency.destination, name));
+    }
+    const license = findFile(packageRoot, "License.txt");
+    if (!license) throw new Error(`${dependency.name} ${dependency.version} is missing its license`);
+    copyIfChanged(license, resolve(buildDir, dependency.destination, dependency.license));
+    copyIfChanged(license, resolve(sidecarDir, dependency.destination, dependency.license));
+  }
+}
+
+async function ensureNvidiaPackage(dependency) {
+  const cacheDir = resolve(root, ".codex-tmp", "nvidia-runtime");
+  const packageRoot = resolve(cacheDir, `${dependency.name}-${dependency.version}`);
+  if (dependency.files.every((name) => findFile(packageRoot, name))) return packageRoot;
+
+  mkdirSync(cacheDir, { recursive: true });
+  const archive = resolve(cacheDir, `${dependency.name}-${dependency.version}-win_amd64.zip`);
+  if (!existsSync(archive) || await sha256(archive) !== dependency.sha256) {
+    const metadataUrl = `https://pypi.org/pypi/${dependency.name}/${dependency.version}/json`;
+    const metadataResponse = await fetch(metadataUrl);
+    if (!metadataResponse.ok) {
+      throw new Error(`Unable to query ${dependency.name}: ${metadataResponse.status}`);
+    }
+    const metadata = await metadataResponse.json();
+    const wheel = metadata.urls.find((file) => file.filename.endsWith("win_amd64.whl"));
+    if (!wheel) throw new Error(`No Windows x64 wheel found for ${dependency.name}`);
+    if (wheel.digests.sha256 !== dependency.sha256) {
+      throw new Error(`Unexpected checksum published for ${dependency.name} ${dependency.version}`);
+    }
+    await downloadFile(wheel.url, archive, dependency.sha256);
+  }
+  mkdirSync(packageRoot, { recursive: true });
+  execFileSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    `Expand-Archive -LiteralPath '${archive}' -DestinationPath '${packageRoot}' -Force`,
+  ], verbose);
+  return packageRoot;
+}
+
+async function downloadFile(url, destination, expectedSha256) {
+  const temporary = `${destination}.download`;
+  if (existsSync(temporary)) unlinkSync(temporary);
+  console.log(`Downloading ${url}`);
+  const response = await fetch(url);
+  if (!response.ok || !response.body) throw new Error(`Download failed: ${response.status}`);
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(temporary));
+  const actual = await sha256(temporary);
+  if (actual !== expectedSha256) {
+    unlinkSync(temporary);
+    throw new Error(`Checksum mismatch for ${destination}: ${actual}`);
+  }
+  if (existsSync(destination)) unlinkSync(destination);
+  renameSync(temporary, destination);
+}
+
+function sha256(path) {
+  return new Promise((resolveHash, reject) => {
+    const hash = createHash("sha256");
+    const input = createReadStream(path);
+    input.on("error", reject);
+    input.on("data", (chunk) => hash.update(chunk));
+    input.on("end", () => resolveHash(hash.digest("hex")));
+  });
+}
+
+function findFile(directory, name) {
+  if (!existsSync(directory)) return undefined;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = resolve(directory, entry.name);
+    if (entry.isFile() && entry.name.toLowerCase() === name.toLowerCase()) return path;
+    if (entry.isDirectory()) {
+      const nested = findFile(path, name);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+function copyIfChanged(source, destination) {
+  if (!existsSync(destination) || statSync(source).size !== statSync(destination).size) {
+    copyFileSync(source, destination);
+  }
+}
+
+function pruneRuntimeDirectory(directory, expected) {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.isFile() && !expected.has(entry.name.toLowerCase())) {
+      unlinkSync(resolve(directory, entry.name));
+    }
   }
 }
 
@@ -136,7 +281,7 @@ function fileSize(path) {
 }
 
 await prepareOnnxRuntime();
-prepareOptionalCudaLibraries();
+await prepareCudaLibraries();
 prepareMsvcRuntime();
 prepareEmbeddingModel();
 execFileSync("cargo", ["build", "-p", "search-core", "--release"], verbose);

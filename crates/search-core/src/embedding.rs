@@ -68,7 +68,7 @@ impl RuntimeBackend {
     fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
-            Self::Cuda => "NVIDIA CUDA（WKV 使用 CPU）",
+            Self::Cuda => "NVIDIA CUDA（含 WKV）",
         }
     }
 }

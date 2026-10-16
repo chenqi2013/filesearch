@@ -9,6 +9,8 @@ src-tauri/binaries/search-core-*
 src-tauri/binaries/onnxruntime.dll
 src-tauri/binaries/onnxruntime-cuda.dll
 src-tauri/binaries/onnxruntime_providers_*.dll
+src-tauri/binaries/cuda-runtime/
+src-tauri/binaries/cudnn-runtime/
 src-tauri/binaries/cublas*.dll
 src-tauri/binaries/cufft*.dll
 src-tauri/binaries/cudart*.dll

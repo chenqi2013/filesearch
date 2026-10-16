@@ -12,6 +12,10 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[cfg(windows)]
+#[path = "rwkv/rwkv_cuda.rs"]
+mod rwkv_cuda;
+
 pub const EMBEDDING_DIMENSION: usize = 768;
 pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-single-eos-mixed-int8-v3";
 const RWKV_HEAD_COUNT: usize = 12;
@@ -421,7 +425,9 @@ impl RwkvModel {
     }
 
     pub fn load_with_cuda(model_path: &Path) -> Result<Self> {
-        Self::load_backend(model_path, true, 4, true)
+        let mut model = Self::load_backend(model_path, true, 4, true)?;
+        model.embed_tokens(&[vec![65535]])?;
+        Ok(model)
     }
 
     pub fn load_cpu_config(model_path: &Path, threads: usize, spinning: bool) -> Result<Self> {
@@ -438,7 +444,15 @@ impl RwkvModel {
         threads: usize,
         spinning: bool,
     ) -> Result<Self> {
-        let operators = OperatorDomain::new("com.localfind")?.add(Rwkv7Operator)?;
+        let operators = OperatorDomain::new("com.localfind")?;
+        #[cfg(windows)]
+        let operators = if use_cuda {
+            operators.add(rwkv_cuda::Rwkv7CudaOperator)?
+        } else {
+            operators.add(Rwkv7Operator)?
+        };
+        #[cfg(not(windows))]
+        let operators = operators.add(Rwkv7Operator)?;
         let mut builder = Session::builder()?
             .with_operators(operators)?
             .with_intra_threads(threads)?
