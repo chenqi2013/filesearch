@@ -1,6 +1,6 @@
 use crate::embedding::{query_terms, EmbeddingEngine, ASCII_PREFIX_MIN_LENGTH};
 use crate::model::{IndexedDocument, SearchMode, SearchRequest, SearchResult, StoredDocument};
-use crate::storage::Storage;
+use crate::storage::{SemanticChunkMatch, Storage};
 use crate::text_index::TextIndex;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -8,12 +8,30 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct Candidate {
     keyword: f32,
-    lexical_coverage: f32,
     short_cjk_coverage: f32,
+    short_concept_confirmed: bool,
     semantic: f32,
     semantic_relevance: f32,
+    semantic_confirmation: f32,
+    semantic_coverage: f32,
+    semantic_precision: bool,
+    semantic_minimum: Option<f32>,
+    cross_query_support: bool,
+    keyword_fallback: f32,
+    fallback_snippet: Option<String>,
+    topic: f32,
+    structure_relevance: f32,
+    structure_snippet: Option<String>,
     snippet: Option<String>,
     semantic_snippet: Option<String>,
+    local_snippet: Option<String>,
+    local_snippet_score: f32,
+    local_snippet_joint: f32,
+    local_snippet_coverage: f32,
+    alternative_snippet: Option<String>,
+    alternative_snippet_score: f32,
+    alternative_snippet_joint: f32,
+    alternative_snippet_coverage: f32,
 }
 
 const SEMANTIC_SNIPPET_SCAN_LIMIT: usize = 1;
@@ -21,11 +39,51 @@ const RAW_SEMANTIC_MIN_SCORE: f32 = 0.24;
 const SEMANTIC_RESULT_MIN_SCORE: f32 = 0.30;
 const KEYWORD_MIN_COVERAGE: f32 = 0.25;
 const SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE: f32 = 0.40;
+const SEMANTIC_AGREEMENT_MIN_SCORE: f32 = 0.40;
 const SEMANTIC_ONLY_RELATIVE_RATIO: f32 = 0.84;
 const SEMANTIC_KEYWORD_MIN_COVERAGE: f32 = 0.30;
 const SHORT_CJK_SEMANTIC_MIN_SCORE: f32 = 0.30;
 const SHORT_CJK_MIN_COVERAGE: f32 = 1.0;
 const SHORT_CJK_RELEVANCE_BOOST: f32 = 0.10;
+const UNANCHORED_SEMANTIC_MIN_SCORE: f32 = 0.43;
+const LOCAL_PASSAGE_MIN_SCORE: f32 = 0.20;
+const SNIPPET_SEMANTIC_IMPROVEMENT: f32 = 0.10;
+const SNIPPET_LEXICAL_RETENTION: f32 = 0.75;
+
+impl Candidate {
+    fn consider_snippet(&mut self, text: &str, semantic: f32, confirmation: f32, lexical: f32) {
+        let joint = (semantic * confirmation).sqrt();
+        let lexical_score = joint * 0.50 + lexical * 0.50;
+        if lexical_score > self.local_snippet_score {
+            self.local_snippet_score = lexical_score;
+            self.local_snippet_joint = joint;
+            self.local_snippet_coverage = lexical;
+            self.local_snippet = Some(text.to_owned());
+        }
+        let semantic_score = joint * 0.80 + lexical * 0.20;
+        if semantic_score > self.alternative_snippet_score {
+            self.alternative_snippet_score = semantic_score;
+            self.alternative_snippet_joint = joint;
+            self.alternative_snippet_coverage = lexical;
+            self.alternative_snippet = Some(text.to_owned());
+        }
+    }
+
+    fn select_snippet(&mut self) {
+        // Keep lexical localization for close alternatives. A different passage must
+        // have both absolute support and a clear same-passage semantic improvement.
+        // Retain most of the query's lexical evidence so a broad semantic topic
+        // cannot replace a more specific clause. Document admission is unchanged.
+        if self.alternative_snippet_joint >= SEMANTIC_AGREEMENT_MIN_SCORE
+            && self.alternative_snippet_joint
+                >= self.local_snippet_joint + SNIPPET_SEMANTIC_IMPROVEMENT
+            && self.alternative_snippet_coverage
+                >= self.local_snippet_coverage * SNIPPET_LEXICAL_RETENTION
+        {
+            self.local_snippet = self.alternative_snippet.take();
+        }
+    }
+}
 
 pub fn search(
     storage: &Storage,
@@ -33,6 +91,9 @@ pub fn search(
     embedder: &EmbeddingEngine,
     request: &SearchRequest,
 ) -> Result<Vec<SearchResult>> {
+    if request.query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let extension = request
         .extension
         .as_deref()
@@ -49,9 +110,17 @@ pub fn search(
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     let mut keyword_snippets = HashMap::new();
     let terms = query_terms(&request.query);
+    let weights = if request.mode == SearchMode::Keyword {
+        vec![1.0; terms.len()]
+    } else {
+        text_index.query_term_weights(&terms)?
+    };
     let candidate_limit = (request.limit.clamp(1, 100) * 20).clamp(200, 1_000);
 
     let hits = text_index.search(&request.query, candidate_limit)?;
+    let keyword_chunks = hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>();
+    let mut keyword_scores = HashMap::new();
+    let mut semantic_only_min_score = SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE;
     let max_score = hits
         .first()
         .map(|hit| hit.score)
@@ -64,48 +133,204 @@ pub fn search(
         let Some(document) = by_id.get(chunk.document_id.as_str()) else {
             continue;
         };
-        let coverage = term_coverage(&terms, &format!("{} {}", document.name, chunk.text));
+        let lexical_text = format!("{} {}", document.name, chunk.text);
+        let normalized = (hit.score / max_score).clamp(0.0, 1.0);
+        keyword_scores.insert(hit.chunk_id, normalized);
+        let coverage = term_coverage(&terms, &lexical_text);
         if !keyword_is_relevant(&terms, coverage) {
             continue;
         }
         keyword_snippets
             .entry(chunk.document_id.clone())
             .or_insert_with(|| chunk.text.clone());
-        let normalized = (hit.score / max_score).clamp(0.0, 1.0);
+        let fallback = if request.mode == SearchMode::Keyword {
+            0.0
+        } else {
+            precise_keyword_relevance(
+                normalized,
+                coverage,
+                precise_lexical_match(&request.query, &terms, &lexical_text),
+            )
+        };
         let candidate = candidates.entry(chunk.document_id).or_default();
+        if fallback > candidate.keyword_fallback {
+            candidate.keyword_fallback = fallback;
+            candidate.fallback_snippet = Some(chunk.text.clone());
+        }
         if normalized > candidate.keyword {
             candidate.keyword = normalized;
             candidate.snippet = Some(chunk.text);
         }
-        candidate.lexical_coverage = candidate.lexical_coverage.max(coverage);
     }
 
     if request.mode != SearchMode::Keyword {
         let query_embedding = embedder.embed_query(&request.query);
-        let semantic_chunks =
-            storage.semantic_chunk_search(&query_embedding, extension, candidate_limit);
+        let confirmation = embedder.embed_query(&format!("关于{}的资料", request.query.trim()));
+        let mut semantic_chunks = storage.semantic_passage_matches(
+            &query_embedding,
+            &confirmation,
+            extension,
+            candidate_limit,
+            8,
+            &keyword_chunks,
+        );
+        let topics = storage
+            .semantic_search(&query_embedding, extension, documents.len())
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         if semantic_chunks.is_empty() {
-            for (document_id, score) in
-                storage.semantic_search(&query_embedding, extension, candidate_limit)
-            {
+            let document_matches =
+                storage.semantic_search(&query_embedding, extension, candidate_limit);
+            let best_score = document_matches
+                .iter()
+                .map(|(_, score)| *score)
+                .fold(0.0f32, f32::max);
+            semantic_only_min_score =
+                (best_score * SEMANTIC_ONLY_RELATIVE_RATIO).max(SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE);
+            let confirmations = storage
+                .semantic_search(&confirmation, extension, documents.len())
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            for (document_id, score) in document_matches {
                 if score >= RAW_SEMANTIC_MIN_SCORE {
-                    candidates.entry(document_id).or_default().semantic = score;
+                    let candidate = candidates.entry(document_id.clone()).or_default();
+                    candidate.semantic = score;
+                    candidate.semantic_confirmation =
+                        confirmations.get(&document_id).copied().unwrap_or_default();
                 }
             }
         } else {
-            for (document_id, text, score) in semantic_chunks {
-                if score < RAW_SEMANTIC_MIN_SCORE {
+            let best_score = semantic_chunks
+                .iter()
+                .map(|hit| hit.score)
+                .fold(0.0f32, f32::max);
+            semantic_only_min_score =
+                (best_score * SEMANTIC_ONLY_RELATIVE_RATIO).max(SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE);
+            let instructed_query = embedder.embed_query(&format!(
+                "Instruct: Given a query, retrieve documents that answer the query\nQuery: {}",
+                request.query.trim()
+            ));
+            let instructed_chunks = storage.semantic_passage_matches(
+                &instructed_query,
+                &confirmation,
+                extension,
+                candidate_limit,
+                8,
+                &keyword_chunks,
+            );
+            let instructed_best = instructed_chunks
+                .iter()
+                .map(|hit| hit.score)
+                .fold(0.0f32, f32::max);
+            let instructed_minimum = (instructed_best * SEMANTIC_ONLY_RELATIVE_RATIO)
+                .max(SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE);
+            let corroborated = cross_query_winner(&semantic_chunks, &instructed_chunks);
+            let original_len = semantic_chunks.len();
+            semantic_chunks.extend(instructed_chunks);
+            for (position, hit) in semantic_chunks.into_iter().enumerate() {
+                let original_view = position < original_len;
+                if hit.score < LOCAL_PASSAGE_MIN_SCORE {
                     continue;
                 }
-                if !by_id.contains_key(document_id.as_str()) {
+                let Some(document) = by_id.get(hit.document_id.as_str()) else {
                     continue;
+                };
+                let local_text = snippet_with_weights(&hit.text, &request.query, &terms, &weights);
+                let lexical_text = format!("{} {}", document.name, hit.text);
+                let coverage = term_coverage(&terms, &lexical_text);
+                let short_coverage = if original_view {
+                    short_cjk_coverage(&request.query, &lexical_text)
+                } else {
+                    0.0
+                };
+                let confirmed = original_view
+                    && short_concept_confirmed(
+                        &request.query,
+                        &hit.text,
+                        hit.score,
+                        hit.confirmation,
+                    );
+                let mut window = Candidate {
+                    cross_query_support: corroborated.as_deref() == Some(hit.document_id.as_str())
+                        && !original_view,
+                    semantic_minimum: Some(if original_view {
+                        semantic_only_min_score
+                    } else {
+                        instructed_minimum
+                    }),
+                    semantic: hit.score,
+                    semantic_confirmation: hit.confirmation,
+                    semantic_coverage: coverage,
+                    semantic_precision: precise_lexical_match(
+                        &request.query,
+                        &terms,
+                        &lexical_text,
+                    ),
+                    short_cjk_coverage: short_coverage,
+                    short_concept_confirmed: confirmed,
+                    semantic_relevance: hit.score * 0.72
+                        + coverage * 0.28
+                        + if short_coverage >= SHORT_CJK_MIN_COVERAGE || confirmed {
+                            SHORT_CJK_RELEVANCE_BOOST
+                        } else {
+                            0.0
+                        },
+                    ..Candidate::default()
+                };
+                if !body_is_supported(&window, semantic_only_min_score) {
+                    window.semantic_relevance = 0.0;
                 }
-                let candidate = candidates.entry(document_id).or_default();
-                if score > candidate.semantic {
-                    candidate.semantic = score;
-                    candidate.semantic_snippet = Some(text);
+                let candidate = candidates.entry(hit.document_id.clone()).or_default();
+                if window.semantic_relevance > candidate.semantic_relevance {
+                    candidate.semantic = window.semantic;
+                    candidate.semantic_minimum = window.semantic_minimum;
+                    candidate.cross_query_support = window.cross_query_support;
+                    candidate.semantic_confirmation = hit.confirmation;
+                    candidate.semantic_precision = window.semantic_precision;
+                    candidate.semantic_coverage = coverage;
+                    candidate.short_cjk_coverage = short_coverage;
+                    candidate.short_concept_confirmed = confirmed;
+                    candidate.semantic_relevance = window.semantic_relevance;
+                    candidate.semantic_snippet = Some(hit.text.clone());
+                }
+                candidate.consider_snippet(
+                    &hit.text,
+                    hit.score,
+                    hit.confirmation,
+                    weighted_coverage(&terms, &weights, &local_text),
+                );
+                if let Some(keyword) = keyword_scores.get(&hit.chunk_id) {
+                    let fallback = local_keyword_relevance(
+                        *keyword,
+                        coverage,
+                        hit.score,
+                        hit.confirmation,
+                        weighted_coverage(&terms, &weights, &local_text),
+                        &terms,
+                        &local_text,
+                    );
+                    if fallback > candidate.keyword_fallback {
+                        candidate.keyword_fallback = fallback;
+                        candidate.fallback_snippet = Some(local_text);
+                    }
                 }
             }
+        }
+        for (document_id, text, anchor_score, body_score) in
+            storage.semantic_anchor_search(&query_embedding, extension)
+        {
+            let score = structure_relevance(&request.query, anchor_score, body_score);
+            if score <= 0.0 || !by_id.contains_key(document_id.as_str()) {
+                continue;
+            }
+            let candidate = candidates.entry(document_id).or_default();
+            if score > candidate.structure_relevance {
+                candidate.structure_relevance = score;
+                candidate.structure_snippet = Some(text);
+            }
+        }
+        for (id, candidate) in &mut candidates {
+            candidate.topic = topics.get(id).copied().unwrap_or_default();
         }
     }
 
@@ -119,7 +344,10 @@ pub fn search(
     }
     let fingerprints = storage.content_fingerprints();
     for (document_id, candidate) in &mut candidates {
-        if let Some(document) = by_id.get(document_id.as_str()) {
+        if let Some(document) = by_id
+            .get(document_id.as_str())
+            .filter(|_| candidate.semantic_relevance == 0.0 && candidate.semantic > 0.0)
+        {
             let semantic_text = candidate
                 .semantic_snippet
                 .as_deref()
@@ -130,25 +358,39 @@ pub fn search(
                 &request.query,
                 &format!("{} {semantic_text}", document.name),
             );
-            candidate.lexical_coverage = candidate.lexical_coverage.max(coverage);
             candidate.short_cjk_coverage = candidate.short_cjk_coverage.max(short_cjk_coverage);
+            candidate.semantic_precision = precise_lexical_match(
+                &request.query,
+                &terms,
+                &format!("{} {semantic_text}", document.name),
+            );
+            candidate.semantic_coverage = coverage;
+            candidate.short_concept_confirmed = short_concept_confirmed(
+                &request.query,
+                semantic_text,
+                candidate.semantic,
+                candidate.semantic_confirmation,
+            );
             candidate.semantic_relevance = candidate.semantic * 0.72
                 + coverage * 0.28
-                + candidate.keyword * 0.18
-                + short_cjk_coverage * SHORT_CJK_RELEVANCE_BOOST;
+                + if short_cjk_coverage >= SHORT_CJK_MIN_COVERAGE
+                    || candidate.short_concept_confirmed
+                {
+                    SHORT_CJK_RELEVANCE_BOOST
+                } else {
+                    0.0
+                };
         }
     }
-    let best_semantic_score = candidates
-        .values()
-        .map(|candidate| candidate.semantic)
-        .fold(0.0f32, f32::max);
-    let semantic_only_min_score =
-        (best_semantic_score * SEMANTIC_ONLY_RELATIVE_RATIO).max(SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE);
+    for candidate in candidates.values_mut() {
+        finalize_semantic_candidate(candidate, semantic_only_min_score);
+        candidate.select_snippet();
+    }
     let keyword_ranks = channel_ranks(
         candidates
             .iter()
-            .filter(|(_, candidate)| candidate.keyword > 0.0)
-            .map(|(id, candidate)| (id.clone(), candidate.keyword))
+            .filter(|(_, candidate)| candidate.keyword_fallback > 0.0)
+            .map(|(id, candidate)| (id.clone(), candidate.keyword_fallback))
             .collect(),
         &fingerprints,
     );
@@ -156,10 +398,9 @@ pub fn search(
         candidates
             .iter()
             .filter(|(_, candidate)| {
-                candidate.semantic >= RAW_SEMANTIC_MIN_SCORE
+                (candidate.semantic >= RAW_SEMANTIC_MIN_SCORE
+                    || candidate.structure_relevance > 0.0)
                     && candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE
-                    && (candidate.keyword > 0.0
-                        || semantic_is_supported(candidate, semantic_only_min_score))
             })
             .map(|(id, candidate)| (id.clone(), candidate.semantic_relevance))
             .collect(),
@@ -174,8 +415,7 @@ pub fn search(
             } else {
                 0.0
             };
-            let semantic_evidence = semantic_is_supported(&candidate, semantic_only_min_score)
-                && candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE;
+            let semantic_evidence = candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE;
             let keyword_fallback = semantic_keyword_fallback(&candidate);
             let supported = match request.mode {
                 SearchMode::Keyword => candidate.keyword > 0.0,
@@ -183,7 +423,7 @@ pub fn search(
                     semantic_evidence || keyword_fallback > 0.0 || filename_boost > 0.0
                 }
                 SearchMode::Hybrid => {
-                    candidate.keyword > 0.0 || semantic_evidence || filename_boost > 0.0
+                    candidate.keyword_fallback > 0.0 || semantic_evidence || filename_boost > 0.0
                 }
             };
             if !supported {
@@ -204,7 +444,11 @@ pub fn search(
             };
             let matched_text = match request.mode {
                 SearchMode::Keyword => candidate.snippet,
-                SearchMode::Semantic => candidate.semantic_snippet.or(candidate.snippet),
+                _ if candidate.local_snippet.is_some() => candidate.local_snippet,
+                SearchMode::Semantic if candidate.semantic_relevance >= keyword_fallback => {
+                    candidate.semantic_snippet.or(candidate.snippet)
+                }
+                SearchMode::Semantic => candidate.fallback_snippet.or(candidate.semantic_snippet),
                 SearchMode::Hybrid
                     if semantic_ranks
                         .get(&document_id)
@@ -217,7 +461,7 @@ pub fn search(
                 {
                     candidate.semantic_snippet.or(candidate.snippet)
                 }
-                SearchMode::Hybrid => candidate.snippet.or(candidate.semantic_snippet),
+                SearchMode::Hybrid => candidate.fallback_snippet.or(candidate.semantic_snippet),
             };
             (score >= threshold).then_some((document_id, score, matched_text))
         })
@@ -246,7 +490,11 @@ pub fn search(
             extension: document.extension.clone(),
             modified_ms: document.modified_ms,
             size: document.size,
-            snippet: snippet(&text, &request.query),
+            snippet: if request.mode == SearchMode::Keyword {
+                snippet(&text, &request.query)
+            } else {
+                snippet_with_weights(&text, &request.query, &terms, &weights)
+            },
             duplicates: documents
                 .iter()
                 .filter(|other| {
@@ -268,6 +516,30 @@ pub fn search(
         });
     }
     Ok(results)
+}
+
+fn cross_query_winner(
+    original: &[SemanticChunkMatch],
+    instructed: &[SemanticChunkMatch],
+) -> Option<String> {
+    let winner = |passages: &[SemanticChunkMatch], minimum: f32| {
+        let mut scores: HashMap<&str, f32> = HashMap::new();
+        for passage in passages {
+            let value = scores.entry(&passage.document_id).or_default();
+            *value = value.max(passage.score);
+        }
+        let mut ranked = scores.into_iter().collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0))
+        });
+        let (identity, score) = *ranked.first()?;
+        let (_, runner_up) = *ranked.get(1)?;
+        (score >= minimum && runner_up < score * SEMANTIC_ONLY_RELATIVE_RATIO)
+            .then(|| identity.to_owned())
+    };
+    let original_winner = winner(original, RAW_SEMANTIC_MIN_SCORE)?;
+    (winner(instructed, SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE)? == original_winner)
+        .then_some(original_winner)
 }
 
 fn channel_ranks(
@@ -302,16 +574,158 @@ fn reciprocal_rank_score(keyword: Option<usize>, semantic: Option<usize>) -> f32
 }
 
 fn semantic_keyword_fallback(candidate: &Candidate) -> f32 {
-    if candidate.keyword <= 0.0 || candidate.lexical_coverage < SEMANTIC_KEYWORD_MIN_COVERAGE {
-        return 0.0;
-    }
-    candidate.keyword * 0.45 + candidate.lexical_coverage * 0.25
+    candidate.keyword_fallback
+        + if candidate.keyword_fallback > 0.0 {
+            candidate.topic * 0.20
+        } else {
+            0.0
+        }
 }
 
-fn semantic_is_supported(candidate: &Candidate, semantic_only_min_score: f32) -> bool {
-    candidate.semantic >= semantic_only_min_score
+fn precise_keyword_relevance(keyword: f32, coverage: f32, precise: bool) -> f32 {
+    if keyword <= 0.0 || !precise || coverage < SEMANTIC_KEYWORD_MIN_COVERAGE {
+        return 0.0;
+    }
+    keyword * 0.20 + coverage * 0.20 + 0.05
+}
+
+fn local_keyword_relevance(
+    keyword: f32,
+    coverage: f32,
+    semantic: f32,
+    confirmation: f32,
+    weighted: f32,
+    terms: &[String],
+    text: &str,
+) -> f32 {
+    if !keyword_is_relevant(terms, term_coverage(terms, text))
+        || coverage < KEYWORD_MIN_COVERAGE
+        || semantic < RAW_SEMANTIC_MIN_SCORE
+        || confirmation < RAW_SEMANTIC_MIN_SCORE
+        || weighted < 0.60
+    {
+        return 0.0;
+    }
+    keyword * 0.20 + coverage * 0.20 + 0.05
+}
+
+fn weighted_coverage(terms: &[String], weights: &[f32], text: &str) -> f32 {
+    let total = weights.iter().sum::<f32>();
+    if total <= 0.0 {
+        return term_coverage(terms, text);
+    }
+    let lower = text.to_lowercase();
+    terms
+        .iter()
+        .zip(weights)
+        .filter_map(|(term, weight)| {
+            (term_matches(term, &lower)
+                || (term.is_ascii()
+                    && term.len() > 4
+                    && term.strip_suffix('s').is_some_and(|singular| {
+                        lower
+                            .split(|character: char| {
+                                !character.is_ascii_alphanumeric() && character != '_'
+                            })
+                            .any(|word| word == singular)
+                    })))
+            .then_some(weight)
+        })
+        .sum::<f32>()
+        / total
+}
+
+fn body_is_supported(candidate: &Candidate, semantic_only_min_score: f32) -> bool {
+    let semantic_only_min_score = candidate
+        .semantic_minimum
+        .unwrap_or(semantic_only_min_score);
+    let joint = (candidate.semantic * candidate.semantic_confirmation).sqrt();
+    let agreement = candidate.semantic >= semantic_only_min_score
+        || (candidate.semantic >= SEMANTIC_RESULT_MIN_SCORE && joint >= semantic_only_min_score);
+    let grounded = candidate.semantic_coverage > 0.0 || joint >= UNANCHORED_SEMANTIC_MIN_SCORE;
+    (agreement
+        && (candidate.semantic_precision || (joint >= SEMANTIC_AGREEMENT_MIN_SCORE && grounded)))
+        || (candidate.cross_query_support
+            && candidate.semantic >= SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE
+            && candidate.semantic_confirmation >= RAW_SEMANTIC_MIN_SCORE)
         || (candidate.semantic >= SHORT_CJK_SEMANTIC_MIN_SCORE
             && candidate.short_cjk_coverage >= SHORT_CJK_MIN_COVERAGE)
+        || candidate.short_concept_confirmed
+}
+
+fn short_concept_confirmed(query: &str, text: &str, score: f32, confirmation: f32) -> bool {
+    let characters = query.trim().chars().collect::<Vec<_>>();
+    characters.len() == 2
+        && characters.iter().all(|character| {
+            matches!(*character as u32, 0x3400..=0x9fff | 0xf900..=0xfaff)
+                && text.contains(*character)
+        })
+        && score >= SHORT_CJK_SEMANTIC_MIN_SCORE
+        && confirmation >= (score * 0.90).min(0.35)
+}
+
+fn finalize_semantic_candidate(candidate: &mut Candidate, semantic_only_min_score: f32) {
+    if !body_is_supported(candidate, semantic_only_min_score) {
+        candidate.semantic_relevance = 0.0;
+    }
+    let structure_score = if candidate.structure_relevance >= SEMANTIC_RESULT_MIN_SCORE {
+        candidate.structure_relevance + 0.10
+    } else {
+        0.0
+    };
+    if structure_score > candidate.semantic_relevance {
+        candidate.semantic_relevance = structure_score;
+        candidate.semantic_snippet = candidate.structure_snippet.clone();
+    }
+    if candidate.semantic_relevance > 0.0 {
+        candidate.semantic_relevance += candidate.topic.max(0.0) * 0.20;
+    }
+}
+
+fn precise_lexical_match(query: &str, terms: &[String], text: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    let text = text.to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    if query.is_ascii() {
+        return term_coverage(terms, &text) >= 0.75;
+    }
+    if text.contains(&query) {
+        return true;
+    }
+    let characters = query.chars().collect::<Vec<_>>();
+    if characters.len() > 4 && term_coverage(terms, &text) < 0.50 {
+        return false;
+    }
+    let minimum = if characters.len() <= 4 {
+        characters.len()
+    } else {
+        3
+    };
+    characters.windows(minimum).any(|window| {
+        window
+            .iter()
+            .all(|character| matches!(*character as u32, 0x3400..=0x9fff | 0xf900..=0xfaff))
+            && text.contains(&window.iter().collect::<String>())
+    })
+}
+
+fn structure_relevance(query: &str, anchor_score: f32, body_score: f32) -> f32 {
+    let short_concept = query
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count()
+        <= 3;
+    let body_minimum = if short_concept { 0.24 } else { 0.30 };
+    if anchor_score < 0.40 || body_score < body_minimum {
+        return 0.0;
+    }
+    let joint = anchor_score * 0.65 + body_score * 0.35;
+    if joint < 0.36 {
+        return 0.0;
+    }
+    joint * 0.85
 }
 
 fn keyword_is_relevant(terms: &[String], coverage: f32) -> bool {
@@ -332,21 +746,21 @@ fn term_coverage(query_terms: &[String], text: &str) -> f32 {
     let lower = text.to_lowercase();
     let matched = query_terms
         .iter()
-        .filter(|term| {
-            if term.is_ascii() {
-                lower
-                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                    .any(|word| {
-                        word == term.as_str()
-                            || (term.len() >= ASCII_PREFIX_MIN_LENGTH
-                                && word.starts_with(term.as_str()))
-                    })
-            } else {
-                lower.contains(term.as_str())
-            }
-        })
+        .filter(|term| term_matches(term, &lower))
         .count();
     matched as f32 / query_terms.len() as f32
+}
+
+fn term_matches(term: &str, lower: &str) -> bool {
+    if term.is_ascii() {
+        lower
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|word| {
+                word == term || (term.len() >= ASCII_PREFIX_MIN_LENGTH && word.starts_with(term))
+            })
+    } else {
+        lower.contains(term)
+    }
 }
 
 fn short_cjk_coverage(query: &str, text: &str) -> f32 {
@@ -362,11 +776,11 @@ fn short_cjk_coverage(query: &str, text: &str) -> f32 {
     {
         return 0.0;
     }
-    let matched = characters
-        .iter()
-        .filter(|character| text.contains(**character))
-        .count();
-    matched as f32 / characters.len() as f32
+    if text.to_lowercase().contains(&query.trim().to_lowercase()) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 fn best_semantic_snippet(storage: &Storage, document: &StoredDocument) -> Result<String> {
@@ -379,22 +793,45 @@ fn best_semantic_snippet(storage: &Storage, document: &StoredDocument) -> Result
 }
 
 fn snippet(text: &str, query: &str) -> String {
+    let terms = query_terms(query);
+    snippet_with_weights(text, query, &terms, &vec![1.0; terms.len()])
+}
+
+fn snippet_with_weights(text: &str, query: &str, terms: &[String], weights: &[f32]) -> String {
     const WINDOW: usize = 260;
     let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= WINDOW {
+    if chars.len() <= WINDOW + 6 {
         return text.to_owned();
     }
     let lower = text.to_lowercase();
     let query_lower = query.to_lowercase();
-    let byte_position = lower.find(&query_lower).unwrap_or_else(|| {
-        query_terms(query)
+    let start = if let Some(position) = lower.find(&query_lower) {
+        lowercase_char_position(text, position).saturating_sub(70)
+    } else {
+        terms
             .iter()
-            .filter_map(|term| lower.find(term))
-            .min()
-            .unwrap_or(0)
-    });
-    let char_position = lower[..byte_position].chars().count();
-    let start = char_position.saturating_sub(70);
+            .flat_map(|term| {
+                let value = if term.is_ascii() && term.len() > 4 {
+                    term.strip_suffix('s').unwrap_or(term)
+                } else {
+                    term
+                };
+                lower.match_indices(value).map(|(position, _)| position)
+            })
+            .map(|position| lowercase_char_position(text, position).saturating_sub(70))
+            .fold((0, -1.0f32), |best, start| {
+                let end = (start + WINDOW).min(chars.len());
+                let value = chars[start..end].iter().collect::<String>();
+                let score = weighted_coverage(terms, weights, &value);
+                if score > best.1 {
+                    (start, score)
+                } else {
+                    best
+                }
+            })
+            .0
+    };
+    let start = start.min(chars.len());
     let end = (start + WINDOW).min(chars.len());
     let mut value = chars[start..end].iter().collect::<String>();
     if start > 0 {
@@ -406,9 +843,212 @@ fn snippet(text: &str, query: &str) -> String {
     value
 }
 
+fn lowercase_char_position(text: &str, byte_position: usize) -> usize {
+    let mut offset = 0;
+    for (position, character) in text.chars().enumerate() {
+        if offset >= byte_position {
+            return position;
+        }
+        offset += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    text.chars().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippet_can_escape_lexical_overlap_with_clear_local_semantic_support() {
+        let mut candidate = Candidate::default();
+        candidate.consider_snippet("unrelated repeated query terms", 0.30, 0.30, 0.80);
+        candidate.consider_snippet("answer phrased differently", 0.41, 0.41, 0.65);
+        assert_eq!(
+            candidate.local_snippet.as_deref(),
+            Some("unrelated repeated query terms")
+        );
+        candidate.semantic_relevance = 0.53;
+        candidate.select_snippet();
+        assert_eq!(
+            candidate.local_snippet.as_deref(),
+            Some("answer phrased differently")
+        );
+        assert_eq!(candidate.semantic_relevance, 0.53);
+    }
+
+    #[test]
+    fn snippet_keeps_lexical_evidence_for_close_or_weak_alternatives() {
+        for (original, alternative) in [(0.32, 0.40), (0.20, 0.35)] {
+            let mut candidate = Candidate::default();
+            candidate.consider_snippet("specific evidence", original, original, 1.0);
+            candidate.consider_snippet("broad topic", alternative, alternative, 0.50);
+            candidate.select_snippet();
+            assert_eq!(
+                candidate.local_snippet.as_deref(),
+                Some("specific evidence")
+            );
+        }
+    }
+
+    #[test]
+    fn snippet_support_cannot_be_borrowed_from_a_different_passage() {
+        let mut candidate = Candidate::default();
+        candidate.consider_snippet("lexical evidence", 0.30, 0.30, 1.0);
+        candidate.consider_snippet("raw query only", 0.90, 0.10, 0.40);
+        candidate.consider_snippet("confirmation only", 0.10, 0.90, 0.40);
+        candidate.select_snippet();
+        assert_eq!(candidate.local_snippet.as_deref(), Some("lexical evidence"));
+    }
+
+    #[test]
+    fn semantic_topic_cannot_replace_a_clause_with_much_more_specific_evidence() {
+        let mut candidate = Candidate::default();
+        candidate.consider_snippet("specific clause", 0.30, 0.30, 0.90);
+        candidate.consider_snippet(
+            "semantically similar but different clause",
+            0.50,
+            0.50,
+            0.50,
+        );
+        candidate.select_snippet();
+        assert_eq!(candidate.local_snippet.as_deref(), Some("specific clause"));
+    }
+
+    #[test]
+    fn cross_query_support_requires_distinct_document_agreement_and_a_strong_instruction() {
+        let passage = |document: &str, score| SemanticChunkMatch {
+            chunk_id: 1,
+            document_id: document.into(),
+            text: String::new(),
+            score,
+            confirmation: score,
+        };
+        let original = [
+            passage("first", 0.31),
+            passage("first", 0.30),
+            passage("other", 0.18),
+        ];
+        assert_eq!(
+            cross_query_winner(&original, &[passage("first", 0.43), passage("other", 0.24)]),
+            Some("first".into())
+        );
+        for instructed in [
+            vec![passage("other", 0.43), passage("first", 0.24)],
+            vec![passage("first", 0.43), passage("other", 0.42)],
+            vec![passage("first", 0.35), passage("other", 0.20)],
+            vec![passage("first", 0.43)],
+            Vec::new(),
+        ] {
+            assert!(cross_query_winner(&original, &instructed).is_none());
+        }
+        assert!(cross_query_winner(
+            &[passage("first", 0.31), passage("other", 0.30)],
+            &[passage("first", 0.43), passage("other", 0.24)],
+        )
+        .is_none());
+        assert!(cross_query_winner(
+            &[passage("first", 0.20), passage("other", 0.10)],
+            &[passage("first", 0.43), passage("other", 0.24)],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn corroborated_evidence_still_requires_a_supported_local_window() {
+        let mut candidate = Candidate {
+            cross_query_support: true,
+            semantic: 0.43,
+            semantic_confirmation: 0.25,
+            ..Candidate::default()
+        };
+        assert!(body_is_supported(&candidate, 0.40));
+        candidate.semantic_confirmation = 0.10;
+        assert!(!body_is_supported(&candidate, 0.40));
+        candidate.semantic_confirmation = 0.25;
+        candidate.semantic = 0.30;
+        assert!(!body_is_supported(&candidate, 0.40));
+        candidate.cross_query_support = false;
+        candidate.semantic = 0.43;
+        assert!(!body_is_supported(&candidate, 0.40));
+    }
+
+    #[test]
+    fn structure_recall_requires_both_anchor_and_local_body_evidence() {
+        assert_eq!(structure_relevance("概念", 0.9, 0.2), 0.0);
+        assert_eq!(structure_relevance("概念", 0.39, 0.7), 0.0);
+        assert_eq!(structure_relevance("概念", 0.4, 0.24), 0.0);
+        assert_eq!(structure_relevance("更具体的问题", 0.8, 0.28), 0.0);
+        let score = structure_relevance("概念", 0.45, 0.32);
+        assert!(score >= SEMANTIC_RESULT_MIN_SCORE);
+        let mut candidate = Candidate {
+            structure_relevance: score,
+            ..Candidate::default()
+        };
+        finalize_semantic_candidate(&mut candidate, 0.8);
+        assert!(candidate.semantic_relevance >= SEMANTIC_RESULT_MIN_SCORE);
+    }
+
+    #[test]
+    fn structure_recall_returns_source_text_without_changing_keyword_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("missing-model"));
+        let query = "概念";
+        let vector = engine.embed_query(query);
+        let mut orthogonal = vec![0.0; vector.len()];
+        let basis = vector.iter().position(|value| value.abs() < 0.001).unwrap();
+        orthogonal[basis] = 1.0;
+        let body_vector = vector
+            .iter()
+            .zip(orthogonal)
+            .map(|(value, basis)| value * 0.28 + basis * (1.0f32 - 0.28f32.powi(2)).sqrt())
+            .collect::<Vec<_>>();
+        let document = crate::model::PreparedDocument {
+            id: "structured".into(),
+            root: "/test".into(),
+            path: "/test/intro.txt".into(),
+            name: "intro.txt".into(),
+            extension: "txt".into(),
+            modified_ms: 1,
+            size: 100,
+            chunks: vec!["这是章节对应的原始正文，用于返回可核对的片段。".into()],
+            embedding: Vec::new(),
+        };
+        let chunks = storage.upsert_document(&document).unwrap();
+        index
+            .replace_document(&document.id, &document.name, &chunks)
+            .unwrap();
+        index.commit().unwrap();
+        storage
+            .replace_chunk_embeddings(&[(chunks[0].id, document.chunks[0].clone(), body_vector)])
+            .unwrap();
+        let request = |mode| SearchRequest {
+            query: query.into(),
+            mode,
+            extension: None,
+            limit: 10,
+        };
+        assert!(
+            search(&storage, &index, &engine, &request(SearchMode::Semantic))
+                .unwrap()
+                .is_empty()
+        );
+        storage
+            .replace_anchor_embeddings(&[(chunks[0].id, "章节标题".into(), vector)])
+            .unwrap();
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let results = search(&storage, &index, &engine, &request(mode)).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, "structured");
+            assert!(results[0].snippet.contains("原始正文"));
+        }
+        assert!(
+            search(&storage, &index, &engine, &request(SearchMode::Keyword))
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn snippet_keeps_result_bounded() {
@@ -416,6 +1056,226 @@ mod tests {
         let value = snippet(&text, "目标词");
         assert!(value.chars().count() <= 266);
         assert!(value.contains("目标词"));
+    }
+
+    #[test]
+    fn snippet_prefers_a_local_cluster_over_the_first_generic_match() {
+        let text = format!(
+            "文件{}月结时使用入库单和对账单，原始凭据需要保留。{}",
+            "说明".repeat(200),
+            "后文".repeat(200)
+        );
+        let terms = vec!["文件".into(), "月结".into(), "对账".into(), "凭据".into()];
+        let value = snippet_with_weights(&text, "文件月结对账凭据", &terms, &[1.0, 5.0, 5.0, 5.0]);
+        assert!(value.contains("月结"));
+        assert!(value.contains("对账单"));
+        assert!(value.contains("凭据"));
+        assert!(value.chars().count() <= 266);
+    }
+
+    #[test]
+    fn local_keyword_support_requires_same_window_semantics_and_specific_terms() {
+        let terms = query_terms("月结对账需要哪些凭据");
+        let text = "实行月结，提交对账单";
+        let coverage = term_coverage(&terms, text);
+        let relevance = |semantic, confirmation, weighted| {
+            local_keyword_relevance(
+                1.0,
+                coverage,
+                semantic,
+                confirmation,
+                weighted,
+                &terms,
+                text,
+            )
+        };
+        assert!(relevance(0.27, 0.28, 0.8) >= SEMANTIC_RESULT_MIN_SCORE);
+        assert_eq!(relevance(0.20, 0.28, 0.8), 0.0);
+        assert_eq!(relevance(0.27, 0.20, 0.8), 0.0);
+        assert_eq!(relevance(0.27, 0.28, 0.3), 0.0);
+        assert_eq!(
+            local_keyword_relevance(1.0, 1.0, 0.9, 0.9, 1.0, &terms, "凭据"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn paired_query_agreement_can_support_a_paraphrase_without_lowering_the_floor() {
+        let candidate = |semantic, semantic_confirmation| Candidate {
+            semantic,
+            semantic_confirmation,
+            semantic_coverage: 0.1,
+            ..Candidate::default()
+        };
+        assert!(body_is_supported(&candidate(0.35, 0.60), 0.40));
+        assert!(body_is_supported(&candidate(0.48, 0.36), 0.40));
+        assert!(!body_is_supported(&candidate(0.80, 0.10), 0.40));
+        assert!(!body_is_supported(&candidate(0.20, 0.90), 0.40));
+        assert!(!body_is_supported(&candidate(0.35, 0.35), 0.40));
+        let mut ungrounded = Candidate {
+            semantic: 0.42,
+            semantic_confirmation: 0.42,
+            ..Candidate::default()
+        };
+        assert!(!body_is_supported(&ungrounded, 0.40));
+        ungrounded.semantic = 0.50;
+        ungrounded.semantic_confirmation = 0.50;
+        assert!(body_is_supported(&ungrounded, 0.40));
+    }
+
+    #[test]
+    fn semantic_evidence_beyond_the_display_crop_is_not_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("missing-model"));
+        let query = "alpha beta gamma delta epsilon";
+        let query_vector = engine.embed_query(query);
+        let confirmation = engine.embed_query(&format!("关于{query}的资料"));
+        let overlap = crate::embedding::cosine(&query_vector, &confirmation);
+        let raw = 0.42;
+        let confirmed = 0.25;
+        let raw_weight = (raw - confirmed * overlap) / (1.0 - overlap * overlap);
+        let confirmed_weight = (confirmed - raw * overlap) / (1.0 - overlap * overlap);
+        let mut vector = query_vector
+            .iter()
+            .zip(&confirmation)
+            .map(|(left, right)| left * raw_weight + right * confirmed_weight)
+            .collect::<Vec<_>>();
+        let norm = crate::embedding::cosine(&vector, &vector);
+        assert!(norm < 1.0);
+        let unused_dimension = query_vector
+            .iter()
+            .zip(&confirmation)
+            .position(|(left, right)| *left == 0.0 && *right == 0.0)
+            .unwrap();
+        vector[unused_dimension] = (1.0 - norm).sqrt();
+        assert!((crate::embedding::cosine(&query_vector, &vector) - raw).abs() < 0.001);
+        assert!((crate::embedding::cosine(&confirmation, &vector) - confirmed).abs() < 0.001);
+
+        let text = format!("alpha beta {} gamma delta epsilon", "背景".repeat(300));
+        let terms = query_terms(query);
+        assert!(precise_lexical_match(query, &terms, &text));
+        assert!(!precise_lexical_match(
+            query,
+            &terms,
+            &snippet(&text, query)
+        ));
+        for (id, body) in [("evidence", text), ("unrelated", "无关正文".into())] {
+            let document = crate::model::PreparedDocument {
+                id: id.into(),
+                root: "/test".into(),
+                path: format!("/test/{id}.txt"),
+                name: format!("{id}.txt"),
+                extension: "txt".into(),
+                modified_ms: 1,
+                size: body.len() as u64,
+                chunks: vec![body.clone()],
+                embedding: Vec::new(),
+            };
+            let chunks = storage.upsert_document(&document).unwrap();
+            storage
+                .replace_chunk_embeddings(&[(chunks[0].id, body, vector.clone())])
+                .unwrap();
+        }
+        assert!(index.search(query, 10).unwrap().is_empty());
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let results = search(
+                &storage,
+                &index,
+                &engine,
+                &SearchRequest {
+                    query: query.into(),
+                    mode,
+                    extension: None,
+                    limit: 10,
+                },
+            )
+            .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, "evidence");
+            assert!(results[0].snippet.contains("gamma delta epsilon"));
+        }
+    }
+
+    #[test]
+    fn plural_snippet_terms_keep_word_boundaries() {
+        let terms = vec!["annotations".into(), "phone".into()];
+        assert_eq!(
+            weighted_coverage(&terms, &[8.0, 1.0], "Annotation tools on phones"),
+            1.0
+        );
+        assert_eq!(
+            weighted_coverage(&terms, &[8.0, 1.0], "annotationless telephones"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn snippet_handles_lowercase_expansion_without_losing_the_match() {
+        let text = format!("{} target {}", "İ".repeat(300), "İ".repeat(300));
+        for query in ["target", "target additional"] {
+            let value = snippet(&text, query);
+            assert!(value.contains("target"));
+            assert!(value.chars().count() <= 266);
+        }
+    }
+
+    #[test]
+    fn structured_recall_displays_query_specific_content_instead_of_the_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("missing-model"));
+        let query = "新加坡的大学能排到多少名";
+        let vector = engine.embed_query(query);
+        let document = crate::model::PreparedDocument {
+            id: "ranking".into(),
+            root: "/test".into(),
+            path: "/test/ranking.xlsx".into(),
+            name: "ranking.xlsx".into(),
+            extension: "xlsx".into(),
+            modified_ms: 1,
+            size: 100,
+            chunks: vec![
+                "排名、院校名称、地区：麻省理工学院，美国".into(),
+                "排名: 8 | 院校名称: 新加坡国立大学 | 地区: 新加坡".into(),
+            ],
+            embedding: Vec::new(),
+        };
+        let chunks = storage.upsert_document(&document).unwrap();
+        index
+            .replace_document(&document.id, &document.name, &chunks)
+            .unwrap();
+        index.commit().unwrap();
+        storage
+            .replace_chunk_embeddings(
+                &chunks
+                    .iter()
+                    .map(|chunk| (chunk.id, chunk.text.clone(), vector.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        storage
+            .replace_anchor_embeddings(&[(chunks[0].id, "排名、院校名称、地区".into(), vector)])
+            .unwrap();
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let results = search(
+                &storage,
+                &index,
+                &engine,
+                &SearchRequest {
+                    query: query.into(),
+                    mode,
+                    extension: None,
+                    limit: 10,
+                },
+            )
+            .unwrap();
+            assert_eq!(results[0].id, "ranking");
+            assert!(results[0].snippet.contains("新加坡国立大学"));
+            assert!(!results[0].snippet.contains("麻省理工学院"));
+        }
     }
 
     #[test]
@@ -443,32 +1303,83 @@ mod tests {
 
     #[test]
     fn semantic_mode_keeps_strong_keyword_evidence_without_broad_fallbacks() {
-        let strong = Candidate {
-            keyword: 0.9,
-            lexical_coverage: 0.34,
-            ..Candidate::default()
-        };
-        let weak = Candidate {
-            keyword: 1.0,
-            lexical_coverage: 0.2,
-            ..Candidate::default()
-        };
-        assert!(semantic_keyword_fallback(&strong) >= SEMANTIC_RESULT_MIN_SCORE);
-        assert_eq!(semantic_keyword_fallback(&weak), 0.0);
+        assert!(precise_keyword_relevance(0.9, 0.5, true) >= SEMANTIC_RESULT_MIN_SCORE);
+        assert_eq!(precise_keyword_relevance(1.0, 0.2, true), 0.0);
+        assert_eq!(precise_keyword_relevance(1.0, 1.0, false), 0.0);
     }
 
     #[test]
-    fn short_cjk_coverage_requires_every_query_character_for_full_support() {
+    fn lexical_precision_rejects_scattered_generic_terms_but_keeps_prefixes() {
+        for (query, text, expected) in [
+            ("天气预报", "天气寒冷，需要提前报告", false),
+            ("显卡驱动安装", "神秘力量驱动着物体，随后安装了程序", false),
+            ("世界一流大学", "精神世界一片宁静", false),
+            ("坐办公室的岗位", "办公室四级主任科员及以下", false),
+            ("坐办公室的岗位", "岗位名称：办公室四级主任科员及以下", true),
+            ("Praesent pu", "Praesent pulvinar", true),
+            ("cat", "concatenate", false),
+            ("", "anything", false),
+        ] {
+            assert_eq!(
+                precise_lexical_match(query, &query_terms(query), text),
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn weak_keyword_or_structure_cannot_borrow_unsupported_body_score() {
+        let mut candidate = Candidate {
+            keyword: 1.0,
+            semantic: 0.41,
+            semantic_relevance: 0.8,
+            semantic_confirmation: 0.20,
+            ..Candidate::default()
+        };
+        finalize_semantic_candidate(&mut candidate, 0.40);
+        assert_eq!(candidate.semantic_relevance, 0.0);
+        assert_eq!(semantic_keyword_fallback(&candidate), 0.0);
+        candidate.semantic_relevance = 0.8;
+        candidate.structure_relevance = 0.31;
+        candidate.structure_snippet = Some("locally supported body".into());
+        candidate.semantic_snippet = Some("unsupported body".into());
+        finalize_semantic_candidate(&mut candidate, 0.40);
+        assert!((candidate.semantic_relevance - 0.41).abs() < 0.001);
+        assert_eq!(
+            candidate.semantic_snippet.as_deref(),
+            Some("locally supported body")
+        );
+    }
+
+    #[test]
+    fn two_character_concepts_require_local_characters_and_semantic_confirmation() {
+        let text = "逾期付款需要赔偿损失";
+        assert!(short_concept_confirmed("赔款", text, 0.32, 0.30));
+        assert!(!short_concept_confirmed("赔款", text, 0.32, 0.20));
+        assert!(!short_concept_confirmed("赔款", "采购款", 0.32, 0.40));
+        assert!(!short_concept_confirmed("赔款", text, 0.25, 0.40));
+        assert!(!short_concept_confirmed(
+            "天气预报",
+            "天气寒冷，需要提前报告",
+            0.32,
+            0.40
+        ));
+    }
+
+    #[test]
+    fn short_cjk_coverage_requires_contiguous_query_for_full_support() {
         assert_eq!(
             short_cjk_coverage("赔款", "逾期付款需要支付违约金并承担赔偿责任"),
-            1.0
+            0.0
         );
-        assert_eq!(short_cjk_coverage("赔款", "采购款应当按时支付"), 0.5);
+        assert_eq!(short_cjk_coverage("赔款", "采购款应当按时支付"), 0.0);
+        assert_eq!(short_cjk_coverage("赔款", "支付赔款"), 1.0);
         assert_eq!(
             short_cjk_coverage("适合全家一起看的轻松片子", "全家观看"),
             0.0
         );
-        assert!(semantic_is_supported(
+        assert!(body_is_supported(
             &Candidate {
                 semantic: 0.31,
                 short_cjk_coverage: 1.0,
@@ -476,7 +1387,7 @@ mod tests {
             },
             0.40
         ));
-        assert!(!semantic_is_supported(
+        assert!(!body_is_supported(
             &Candidate {
                 semantic: 0.29,
                 short_cjk_coverage: 1.0,
@@ -484,7 +1395,7 @@ mod tests {
             },
             0.40
         ));
-        assert!(!semantic_is_supported(
+        assert!(!body_is_supported(
             &Candidate {
                 semantic: 0.31,
                 short_cjk_coverage: 0.5,
@@ -667,7 +1578,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             results.first().map(|result| result.id.as_str()),
-            Some("contract")
+            Some("contract"),
+            "raw={:?}",
+            storage
+                .semantic_chunk_matches(
+                    &engine.embed_query("赔款"),
+                    &engine.embed_query("关于赔款的资料"),
+                    None,
+                    10
+                )
+                .iter()
+                .map(|hit| (hit.score, hit.confirmation))
+                .collect::<Vec<_>>()
         );
     }
 

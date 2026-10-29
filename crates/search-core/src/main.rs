@@ -6,6 +6,7 @@ mod indexer;
 mod model;
 mod rwkv;
 mod search;
+mod semantic_structure;
 mod storage;
 mod text_index;
 mod watcher;
@@ -17,8 +18,8 @@ use axum::{Json, Router};
 use clap::Parser;
 use embedding::EmbeddingEngine;
 use model::{
-    IndexAccepted, IndexFailure, IndexRequest, IndexedChunk, IndexedDocument, Page, PageRequest,
-    SearchRequest, SearchResponse, ServiceStats,
+    FileIndexTiming, IndexAccepted, IndexFailure, IndexRequest, IndexedChunk, IndexedDocument,
+    Page, PageRequest, SearchRequest, SearchResponse, ServiceStats,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -48,6 +49,8 @@ struct Args {
     extract_output: Option<PathBuf>,
     #[arg(long, hide = true)]
     extract_error_output: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    extract_timing_output: Option<PathBuf>,
 }
 
 struct AppState {
@@ -78,6 +81,8 @@ struct IndexTimingState {
     embedding_ms: u128,
     storage_ms: u128,
     text_index_ms: u128,
+    embedding_windows_processed: usize,
+    embedding_windows_total: usize,
 }
 
 impl Default for IndexTimingState {
@@ -93,6 +98,8 @@ impl Default for IndexTimingState {
             embedding_ms: 0,
             storage_ms: 0,
             text_index_ms: 0,
+            embedding_windows_processed: 0,
+            embedding_windows_total: 0,
         }
     }
 }
@@ -107,6 +114,8 @@ struct IndexTimingSnapshot {
     embedding_ms: u128,
     storage_ms: u128,
     text_index_ms: u128,
+    embedding_windows_processed: usize,
+    embedding_windows_total: usize,
 }
 
 type SharedState = Arc<AppState>;
@@ -114,6 +123,7 @@ type SharedState = Arc<AppState>;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
@@ -122,8 +132,13 @@ async fn main() -> anyhow::Result<()> {
             .extract_output
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("缺少提取结果输出路径"))?;
-        let result = extract::extract_text(input)
-            .and_then(|text| std::fs::write(output, text.as_bytes()).map_err(Into::into));
+        let result = extract::extract_text_with_timing(input).and_then(|(text, ocr_ms)| {
+            std::fs::write(output, text.as_bytes())?;
+            if let Some(timing_output) = args.extract_timing_output.as_deref() {
+                std::fs::write(timing_output, ocr_ms.to_string())?;
+            }
+            Ok(())
+        });
         if let Err(error) = result {
             if let Some(error_output) = args.extract_error_output.as_deref() {
                 let _ = std::fs::write(error_output, format!("{error:#}"));
@@ -197,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/index/resume", post(resume_index))
         .route("/index/cancel", post(cancel_index))
         .route("/failures", get(failures))
+        .route("/file-timings", get(file_timings))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list([
@@ -262,6 +278,8 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
         index_embedding_ms: timing.embedding_ms,
         index_storage_ms: timing.storage_ms,
         index_text_index_ms: timing.text_index_ms,
+        embedding_windows_processed: timing.embedding_windows_processed,
+        embedding_windows_total: timing.embedding_windows_total,
         directories: state.storage.directories().unwrap_or_default(),
         extensions: state.storage.extensions().unwrap_or_default(),
         last_indexed: state.storage.last_indexed().unwrap_or_default(),
@@ -321,6 +339,24 @@ async fn failures(
     Ok(Json(Page {
         items,
         total: counts.failures,
+        offset: request.offset,
+        limit: request.limit,
+    }))
+}
+
+async fn file_timings(
+    State(state): State<SharedState>,
+    Query(request): Query<PageRequest>,
+) -> Result<Json<Page<FileIndexTiming>>, (StatusCode, Json<Value>)> {
+    let request = request.bounded();
+    let total = state.storage.file_timing_count().map_err(internal_error)?;
+    let items = state
+        .storage
+        .file_timing_page(request.offset, request.limit)
+        .map_err(internal_error)?;
+    Ok(Json(Page {
+        items,
+        total,
         offset: request.offset,
         limit: request.limit,
     }))
@@ -523,9 +559,15 @@ fn finish_index_task(state: &SharedState, refresh_watcher: bool) {
 fn update_progress(state: &AppState, update: indexer::ProgressUpdate<'_>) {
     state.processed.store(update.processed, Ordering::Relaxed);
     state.total.store(update.total, Ordering::Relaxed);
-    *state.current_file.lock() = update.current_file.map(ToOwned::to_owned);
+    let file_changed = {
+        let mut current_file = state.current_file.lock();
+        let changed = current_file.as_deref() != update.current_file;
+        *current_file = update.current_file.map(ToOwned::to_owned);
+        changed
+    };
     let mut timing = state.index_timing.lock();
-    if timing.stage != update.stage {
+    let stage_changed = timing.stage != update.stage;
+    if stage_changed {
         timing.stage = update.stage.to_owned();
     }
     timing.stage_started_at = Some(Instant::now());
@@ -535,6 +577,20 @@ fn update_progress(state: &AppState, update: indexer::ProgressUpdate<'_>) {
     timing.embedding_ms = update.embedding_ms;
     timing.storage_ms = update.storage_ms;
     timing.text_index_ms = update.text_index_ms;
+    timing.embedding_windows_processed = update.embedding_windows_processed;
+    timing.embedding_windows_total = update.embedding_windows_total;
+    drop(timing);
+    if file_changed || stage_changed {
+        tracing::info!(
+            file = update.current_file.unwrap_or_default(),
+            stage = update.stage,
+            processed = update.processed,
+            total = update.total,
+            windows_processed = update.embedding_windows_processed,
+            windows_total = update.embedding_windows_total,
+            "index progress"
+        );
+    }
 }
 
 fn reset_index_timing(state: &AppState) {
@@ -584,6 +640,8 @@ fn index_timing_snapshot(state: &AppState, indexing: bool) -> IndexTimingSnapsho
         embedding_ms: timing.embedding_ms,
         storage_ms: timing.storage_ms,
         text_index_ms: timing.text_index_ms,
+        embedding_windows_processed: timing.embedding_windows_processed,
+        embedding_windows_total: timing.embedding_windows_total,
     }
 }
 

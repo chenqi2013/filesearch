@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub const EMBEDDING_DIMENSION: usize = 768;
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-single-eos-mixed-int8-v3";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-corrected-single-eos-ffn3-attnout6-int8-v4";
 const RWKV_HEAD_COUNT: usize = 12;
 const RWKV_HEAD_SIZE: usize = 64;
 const RWKV_HEAD_STATE_SIZE: usize = RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;
@@ -444,6 +444,19 @@ impl RwkvModel {
             .with_intra_threads(threads)?
             .with_intra_op_spinning(spinning)?
             .with_optimization_level(GraphOptimizationLevel::Level3)?;
+        if let Ok(value) = std::env::var("FILESEARCH_ORT_INTER_THREADS") {
+            let inter_threads = value.parse::<usize>()?;
+            anyhow::ensure!(
+                (1..=4).contains(&inter_threads),
+                "Invalid inter-op thread count"
+            );
+            builder = builder
+                .with_inter_threads(inter_threads)?
+                .with_parallel_execution(inter_threads > 1)?;
+        }
+        if let Some(path) = std::env::var_os("FILESEARCH_ORT_PROFILE") {
+            builder = builder.with_profiling(std::path::PathBuf::from(path))?;
+        }
         if use_cuda {
             builder = builder.with_execution_providers([
                 ort::execution_providers::CUDAExecutionProvider::default()
@@ -726,6 +739,51 @@ mod tests {
                     .zip(vectorized)
                     .all(|(left, right)| (left - right).abs() < 1e-6));
             }
+        }
+    }
+
+    #[test]
+    fn full_context_vectorized_recurrence_matches_scalar() {
+        let token_count = 1024;
+        let count = token_count * EMBEDDING_DIMENSION;
+        let values = |offset: usize| {
+            (0..count)
+                .map(|index| (((index * 13 + offset) % 97) as f32 - 48.0) * 0.001)
+                .collect::<Vec<_>>()
+        };
+        let receptance = values(1);
+        let key = values(3);
+        let value = values(5);
+        let context_key = values(7);
+        let context_value = values(11);
+        let decay = vec![0.98; count];
+        let mut scalar = vec![0.0; count];
+        rwkv7_forward_batch_scalar(
+            token_count,
+            &receptance,
+            &decay,
+            &key,
+            &value,
+            &context_key,
+            &context_value,
+            &mut scalar,
+            RWKV_HEAD_COUNT * RWKV_HEAD_STATE_SIZE,
+        );
+        let mut vectorized = vec![f32::NAN; count];
+        rwkv7_forward(
+            1,
+            token_count,
+            &receptance,
+            &decay,
+            &key,
+            &value,
+            &context_key,
+            &context_value,
+            &mut vectorized,
+        );
+        for (expected, actual) in scalar.iter().zip(vectorized) {
+            assert!(actual.is_finite());
+            assert!((expected - actual).abs() < 1e-6);
         }
     }
 }

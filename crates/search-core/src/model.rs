@@ -147,6 +147,22 @@ pub struct IndexedChunk {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileIndexTiming {
+    pub path: String,
+    pub extension: String,
+    pub size: u64,
+    pub status: String,
+    pub check_ms: u64,
+    pub parse_ms: u64,
+    pub ocr_ms: u64,
+    pub embedding_ms: u64,
+    pub storage_ms: u64,
+    pub text_index_ms: u64,
+    pub total_ms: u64,
+    pub recorded_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -194,6 +210,8 @@ pub struct ServiceStats {
     pub index_embedding_ms: u128,
     pub index_storage_ms: u128,
     pub index_text_index_ms: u128,
+    pub embedding_windows_processed: usize,
+    pub embedding_windows_total: usize,
     pub directories: Vec<String>,
     pub extensions: Vec<String>,
     pub last_indexed: Option<String>,

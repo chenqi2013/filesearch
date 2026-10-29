@@ -1,6 +1,6 @@
 use crate::embedding::{normalize, EmbeddingEngine, EMBEDDING_DIMENSION};
-use crate::extract::{extract_text, is_supported, LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER};
-use crate::model::{IndexFailure, PreparedDocument};
+use crate::extract::{is_supported, LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER};
+use crate::model::{FileIndexTiming, IndexFailure, PreparedDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
 use anyhow::{Context, Result};
@@ -29,6 +29,7 @@ const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
 const MAX_SEMANTIC_EMBED_CHARS: usize = 480;
 const SEMANTIC_WINDOW_STRIDE: usize = 400;
+const SEMANTIC_PERSIST_BATCH_SIZE: usize = 16;
 #[cfg(not(test))]
 const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -47,6 +48,7 @@ struct ParseJob {
     root: String,
     modified_ms: u64,
     size: u64,
+    check_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -189,6 +191,8 @@ pub struct ProgressUpdate<'a> {
     pub embedding_ms: u128,
     pub storage_ms: u128,
     pub text_index_ms: u128,
+    pub embedding_windows_processed: usize,
+    pub embedding_windows_total: usize,
 }
 
 const INDEX_CANCELLED: &str = "索引任务已取消";
@@ -279,6 +283,7 @@ where
 {
     let started = Instant::now();
     let mut timings = IndexTimings::default();
+    let extraction_changed = !storage.extraction_profile_matches()?;
     let roots = normalize_roots(paths);
     storage.set_directories(&roots)?;
     storage.clear_failures()?;
@@ -340,11 +345,21 @@ where
                     if previous_by_path
                         .get(path_string.as_str())
                         .is_some_and(|existing| {
-                            existing.modified_ms == modified_ms
+                            !extraction_changed
+                                && existing.modified_ms == modified_ms
                                 && existing.size == size
                                 && storage.has_embedding(&existing.id)
                         })
                     {
+                        record_file_timing(
+                            storage,
+                            path,
+                            size,
+                            "skipped",
+                            check_started.elapsed().as_millis() as u64,
+                            0,
+                            0,
+                        )?;
                         processed += 1;
                         timings.check += check_started.elapsed();
                         continue;
@@ -354,10 +369,22 @@ where
                         root: scan.path.clone(),
                         modified_ms,
                         size,
+                        check_ms: check_started.elapsed().as_millis() as u64,
                     });
                 }
                 Err(error) => {
                     storage.record_failure(&failure_for(path, &error))?;
+                    record_file_timing(
+                        storage,
+                        path,
+                        fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or_default(),
+                        "failed",
+                        check_started.elapsed().as_millis() as u64,
+                        0,
+                        0,
+                    )?;
                     processed += 1;
                 }
             }
@@ -537,7 +564,9 @@ where
             continue;
         };
         let check_started = Instant::now();
+        let mut file_size = 0;
         match metadata(path).and_then(|(modified_ms, size)| {
+            file_size = size;
             if storage
                 .document_by_path(&path_string)?
                 .is_some_and(|existing| {
@@ -556,12 +585,33 @@ where
                 root,
                 modified_ms,
                 size,
+                check_ms: check_started.elapsed().as_millis() as u64,
             }))
         }) {
             Ok(Some(job)) => parse_jobs.push(job),
-            Ok(None) => processed += 1,
+            Ok(None) => {
+                record_file_timing(
+                    storage,
+                    path,
+                    file_size,
+                    "skipped",
+                    check_started.elapsed().as_millis() as u64,
+                    0,
+                    0,
+                )?;
+                processed += 1;
+            }
             Err(error) => {
                 storage.record_failure(&failure_for(path, &error))?;
+                record_file_timing(
+                    storage,
+                    path,
+                    file_size,
+                    "failed",
+                    check_started.elapsed().as_millis() as u64,
+                    0,
+                    0,
+                )?;
                 processed += 1;
             }
         }
@@ -710,7 +760,8 @@ fn persist_batch(
     report_progress(progress, processed, total, None, "storage", accumulated);
     let started = Instant::now();
     let chunks = storage.upsert_documents(&documents)?;
-    timings.storage += started.elapsed();
+    let upsert_elapsed = started.elapsed();
+    timings.storage += upsert_elapsed;
     report_progress_with(
         progress,
         processed,
@@ -738,18 +789,29 @@ fn persist_batch(
         .collect::<Vec<_>>();
     text_index.replace_documents(&updates)?;
     text_index.commit()?;
-    timings.text_index += started.elapsed();
+    let text_index_elapsed = started.elapsed();
+    timings.text_index += text_index_elapsed;
 
     let document_count = documents.len();
+    let per_doc_divisor = document_count.max(1) as u128;
     for (document_index, document) in documents.iter_mut().enumerate() {
         control.checkpoint()?;
-        let semantic_chunks = semantic_chunks_for_document(document);
+        let mut semantic_chunks = semantic_chunks_for_document(document);
+        let body_count = semantic_chunks.len();
+        semantic_chunks.extend(crate::semantic_structure::document_anchors(document));
         let completed = processed
             .saturating_sub(document_count)
             .saturating_add(document_index);
         let current_file = Some(document.path.as_str());
         if semantic_chunks.is_empty() {
             storage.update_document_embeddings(std::slice::from_ref(document))?;
+            storage.add_file_timing_stages(
+                &document.path,
+                0,
+                (upsert_elapsed.as_millis() / per_doc_divisor) as u64,
+                (text_index_elapsed.as_millis() / per_doc_divisor) as u64,
+                ((upsert_elapsed + text_index_elapsed).as_millis() / per_doc_divisor) as u64,
+            )?;
             report_progress_with(
                 progress,
                 completed + 1,
@@ -780,31 +842,132 @@ fn persist_batch(
         );
         let inputs = semantic_chunks
             .iter()
-            .map(|(_, text)| semantic_chunk_text(&document.name, text))
-            .collect::<Vec<_>>();
-        let started = Instant::now();
-        let embeddings = embedder.embed_passages(&inputs);
-        timings.embedding += started.elapsed();
-        anyhow::ensure!(
-            embeddings.len() == semantic_chunks.len(),
-            "Missing semantic passage vectors"
-        );
-        let mut vectors = Vec::with_capacity(embeddings.len());
-        let updates = semantic_chunks
-            .into_iter()
-            .zip(embeddings)
-            .map(|((position, text), embedding)| {
-                vectors.push((position, embedding.clone()));
-                (chunks[document_index][position].id, text, embedding)
+            .enumerate()
+            .map(|(index, (_, text))| {
+                if index < body_count {
+                    semantic_chunk_text(&document.name, text)
+                } else {
+                    text.clone()
+                }
             })
             .collect::<Vec<_>>();
         let started = Instant::now();
-        storage.replace_chunk_embeddings(&updates)?;
-        timings.storage += started.elapsed();
-        document.embedding = average_embedding(&vectors);
+        let batches = embedder.passage_batches(&inputs).unwrap_or_else(|_| {
+            (0..inputs.len())
+                .collect::<Vec<_>>()
+                .chunks(SEMANTIC_PERSIST_BATCH_SIZE)
+                .map(|batch| batch.to_vec())
+                .collect()
+        });
+        let preparation_elapsed = started.elapsed();
+        timings.embedding += preparation_elapsed;
+        storage.add_file_timing_stages(
+            &document.path,
+            preparation_elapsed.as_millis() as u64,
+            (upsert_elapsed.as_millis() / per_doc_divisor) as u64,
+            (text_index_elapsed.as_millis() / per_doc_divisor) as u64,
+            preparation_elapsed.as_millis() as u64
+                + ((upsert_elapsed + text_index_elapsed).as_millis() / per_doc_divisor) as u64,
+        )?;
+        let mut average = vec![0.0; EMBEDDING_DIMENSION];
+        let mut completed_windows = 0;
+        report_window_progress(
+            progress,
+            completed,
+            total,
+            current_file,
+            accumulated,
+            &timings,
+            (completed_windows, inputs.len()),
+        );
+        for indices in &batches {
+            control.checkpoint()?;
+            let batch = indices
+                .iter()
+                .map(|index| inputs[*index].clone())
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            let mut vectors = if embedder.backend() == "fallback" {
+                vec![None; batch.len()]
+            } else {
+                storage.cached_passage_vectors(&batch)?
+            };
+            let lookup_elapsed = started.elapsed();
+            let missing = vectors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, vector)| vector.is_none().then_some(index))
+                .collect::<Vec<_>>();
+            let missing_inputs = missing
+                .iter()
+                .map(|index| batch[*index].clone())
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            let inferred = embedder.embed_passages(&missing_inputs);
+            let embedding_elapsed = started.elapsed();
+            timings.embedding += embedding_elapsed;
+            anyhow::ensure!(
+                inferred.len() == missing.len(),
+                "Missing semantic passage vectors"
+            );
+            let started = Instant::now();
+            if embedder.backend() != "fallback" {
+                storage.cache_passage_vectors(&missing_inputs, &inferred)?;
+            }
+            for (index, vector) in missing.into_iter().zip(inferred) {
+                vectors[index] = Some(vector);
+            }
+            let mut updates = Vec::with_capacity(indices.len());
+            let mut anchor_updates = Vec::new();
+            for (index, vector) in indices.iter().zip(vectors) {
+                let vector = vector.context("Missing cached semantic vector")?;
+                let (position, text) = &semantic_chunks[*index];
+                let update = (chunks[document_index][*position].id, text.clone(), vector);
+                if *index < body_count {
+                    for (target, value) in average.iter_mut().zip(&update.2) {
+                        *target += value;
+                    }
+                    updates.push(update);
+                } else {
+                    anchor_updates.push(update);
+                }
+            }
+            storage.replace_chunk_embeddings(&updates)?;
+            storage.replace_anchor_embeddings(&anchor_updates)?;
+            let storage_elapsed = lookup_elapsed + started.elapsed();
+            timings.storage += storage_elapsed;
+            storage.add_file_timing_stages(
+                &document.path,
+                embedding_elapsed.as_millis() as u64,
+                storage_elapsed.as_millis() as u64,
+                0,
+                (embedding_elapsed + storage_elapsed).as_millis() as u64,
+            )?;
+            completed_windows += indices.len();
+            report_window_progress(
+                progress,
+                completed,
+                total,
+                current_file,
+                accumulated,
+                &timings,
+                (completed_windows, inputs.len()),
+            );
+        }
+        normalize(&mut average);
+        document.embedding = average;
         let started = Instant::now();
         storage.update_document_embeddings(std::slice::from_ref(document))?;
-        timings.storage += started.elapsed();
+        storage.prune_passage_cache()?;
+        let document_storage_elapsed = started.elapsed();
+        timings.storage += document_storage_elapsed;
+        storage.add_file_timing_stages(
+            &document.path,
+            0,
+            document_storage_elapsed.as_millis() as u64,
+            0,
+            document_storage_elapsed.as_millis() as u64,
+        )?;
         report_progress_with(
             progress,
             completed + 1,
@@ -825,6 +988,31 @@ fn persist_batch(
 fn semantic_chunks_for_document(document: &PreparedDocument) -> Vec<(usize, String)> {
     let mut seen = HashSet::new();
     let mut passages = Vec::new();
+    if document.extension == "txt" && !document.chunks.is_empty() {
+        let chars = document
+            .chunks
+            .iter()
+            .enumerate()
+            .flat_map(|(index, chunk)| {
+                chunk
+                    .chars()
+                    .skip(if index == 0 { 0 } else { CHUNK_OVERLAP })
+            })
+            .collect::<Vec<_>>();
+        for start in (0..chars.len()).step_by(SEMANTIC_WINDOW_STRIDE) {
+            let end = (start + MAX_SEMANTIC_EMBED_CHARS).min(chars.len());
+            let text = chars[start..end].iter().collect::<String>();
+            if seen.insert(text.clone()) {
+                let position =
+                    (start / (CHUNK_TARGET - CHUNK_OVERLAP)).min(document.chunks.len() - 1);
+                passages.push((position, text));
+            }
+            if end == chars.len() {
+                break;
+            }
+        }
+        return passages;
+    }
     for (position, chunk) in document.chunks.iter().enumerate() {
         let chars = chunk.chars().collect::<Vec<_>>();
         for start in (0..chars.len()).step_by(SEMANTIC_WINDOW_STRIDE) {
@@ -861,6 +1049,7 @@ fn semantic_embedding_tasks(
         .collect()
 }
 
+#[cfg(test)]
 fn average_embedding(vectors: &[(usize, Vec<f32>)]) -> Vec<f32> {
     if vectors.is_empty() {
         return Vec::new();
@@ -926,13 +1115,13 @@ fn flush_parse_jobs(
                     job.size,
                     legacy_office_cache,
                 );
-                (path, started.elapsed(), result)
+                (path, job.size, job.check_ms, started.elapsed(), result)
             })
             .collect::<Vec<_>>()
     });
     timings.parse += started.elapsed();
     let mut prepared = false;
-    for (job_index, (path, elapsed, result)) in results.into_iter().enumerate() {
+    for (job_index, (path, size, check_ms, elapsed, result)) in results.into_iter().enumerate() {
         control.checkpoint()?;
         if elapsed >= Duration::from_secs(2) {
             tracing::info!(
@@ -942,7 +1131,16 @@ fn flush_parse_jobs(
             );
         }
         match result {
-            Ok(document) => {
+            Ok((document, ocr_ms)) => {
+                record_file_timing(
+                    storage,
+                    &path,
+                    document.size,
+                    "indexed",
+                    check_ms,
+                    ocr_ms,
+                    elapsed.as_millis().saturating_sub(ocr_ms as u128) as u64,
+                )?;
                 pending.push(document);
                 prepared = true;
             }
@@ -954,6 +1152,15 @@ fn flush_parse_jobs(
                     "document extraction failed"
                 );
                 storage.record_failure(&failure_for(&path, &error))?;
+                record_file_timing(
+                    storage,
+                    &path,
+                    size,
+                    "failed",
+                    check_ms,
+                    0,
+                    elapsed.as_millis() as u64,
+                )?;
             }
         }
         if pending.len() >= EMBEDDING_BATCH_SIZE {
@@ -998,6 +1205,36 @@ fn report_progress(
     );
 }
 
+fn record_file_timing(
+    storage: &Storage,
+    path: &Path,
+    size: u64,
+    status: &str,
+    check_ms: u64,
+    ocr_ms: u64,
+    parse_ms: u64,
+) -> Result<()> {
+    storage.record_file_timing(&FileIndexTiming {
+        path: path.to_string_lossy().into_owned(),
+        extension: path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        size,
+        status: status.to_owned(),
+        check_ms,
+        parse_ms,
+        ocr_ms,
+        embedding_ms: 0,
+        storage_ms: 0,
+        text_index_ms: 0,
+        total_ms: check_ms.saturating_add(parse_ms).saturating_add(ocr_ms),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    })?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn report_progress_with(
     progress: &mut dyn FnMut(ProgressUpdate<'_>),
@@ -1023,7 +1260,37 @@ fn report_progress_with(
         embedding_ms: embedding.as_millis(),
         storage_ms: storage.as_millis(),
         text_index_ms: text_index.as_millis(),
+        embedding_windows_processed: 0,
+        embedding_windows_total: 0,
     });
+}
+
+fn report_window_progress(
+    progress: &mut dyn FnMut(ProgressUpdate<'_>),
+    processed: usize,
+    total: usize,
+    current_file: Option<&str>,
+    accumulated: &IndexTimings,
+    timings: &PersistTimings,
+    windows: (usize, usize),
+) {
+    report_progress_with(
+        &mut |mut update| {
+            update.embedding_windows_processed = windows.0;
+            update.embedding_windows_total = windows.1;
+            progress(update);
+        },
+        processed,
+        total,
+        current_file,
+        "embedding",
+        accumulated.scan,
+        accumulated.check,
+        accumulated.parse,
+        accumulated.embedding + timings.embedding,
+        accumulated.storage + timings.storage,
+        accumulated.text_index + timings.text_index,
+    );
 }
 
 fn parse_pool() -> &'static rayon::ThreadPool {
@@ -1064,40 +1331,43 @@ fn prepare_document(
     modified_ms: u64,
     size: u64,
     legacy_office_cache: &LegacyOfficeCapabilityCache,
-) -> Result<PreparedDocument> {
+) -> Result<(PreparedDocument, u64)> {
     if size > MAX_FILE_BYTES {
         anyhow::bail!("文件超过 200 MB 单文件限制");
     }
     let started = Instant::now();
-    let text = legacy_office_cache.extract(path, || extract_text_with_timeout(path))?;
+    let (text, ocr_ms) = legacy_office_cache.extract(path, || extract_text_with_timeout(path))?;
     tracing::debug!(
         path = %path.display(),
         elapsed_ms = started.elapsed().as_millis(),
         "document extracted"
     );
     let path_string = path.to_string_lossy().into_owned();
-    Ok(PreparedDocument {
-        id: stable_id(&path_string),
-        root: root.to_owned(),
-        name: path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_owned(),
-        extension: path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase(),
-        path: path_string,
-        modified_ms,
-        size,
-        chunks: split_chunks(&text),
-        embedding: Vec::new(),
-    })
+    Ok((
+        PreparedDocument {
+            id: stable_id(&path_string),
+            root: root.to_owned(),
+            name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            extension: path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            path: path_string,
+            modified_ms,
+            size,
+            chunks: split_chunks(&text),
+            embedding: Vec::new(),
+        },
+        ocr_ms,
+    ))
 }
 
-fn extract_text_with_timeout(path: &Path) -> Result<String> {
+fn extract_text_with_timeout(path: &Path) -> Result<(String, u64)> {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -1107,12 +1377,12 @@ fn extract_text_with_timeout(path: &Path) -> Result<String> {
         extension.as_str(),
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
     ) {
-        return extract_text(path);
+        return crate::extract::extract_text_with_timing(path);
     }
 
     #[cfg(test)]
     {
-        return extract_text(path);
+        return crate::extract::extract_text_with_timing(path);
     }
 
     #[cfg(not(test))]
@@ -1122,7 +1392,7 @@ fn extract_text_with_timeout(path: &Path) -> Result<String> {
 }
 
 #[cfg(not(test))]
-fn extract_text_in_worker(path: &Path) -> Result<String> {
+fn extract_text_in_worker(path: &Path) -> Result<(String, u64)> {
     let executable = std::env::current_exe().context("无法定位搜索服务程序")?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1135,6 +1405,7 @@ fn extract_text_in_worker(path: &Path) -> Result<String> {
         stable_id(&path.to_string_lossy())
     ));
     let error_output = output.with_extension("error.txt");
+    let timing_output = output.with_extension("timing.txt");
     let mut child = Command::new(executable)
         .arg("--extract-file")
         .arg(path)
@@ -1142,6 +1413,8 @@ fn extract_text_in_worker(path: &Path) -> Result<String> {
         .arg(&output)
         .arg("--extract-error-output")
         .arg(&error_output)
+        .arg("--extract-timing-output")
+        .arg(&timing_output)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1158,6 +1431,7 @@ fn extract_text_in_worker(path: &Path) -> Result<String> {
                 let _ = std::fs::remove_file(&output);
                 let persisted_error = std::fs::read_to_string(&error_output).unwrap_or_default();
                 let _ = std::fs::remove_file(&error_output);
+                let _ = std::fs::remove_file(&timing_output);
                 let detail = if persisted_error.trim().is_empty() {
                     stderr.trim()
                 } else {
@@ -1170,15 +1444,21 @@ fn extract_text_in_worker(path: &Path) -> Result<String> {
             }
             let text = std::fs::read_to_string(&output)
                 .with_context(|| format!("无法读取文件解析结果: {}", path.display()))?;
+            let ocr_ms = std::fs::read_to_string(&timing_output)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or_default();
             let _ = std::fs::remove_file(&output);
             let _ = std::fs::remove_file(&error_output);
-            return Ok(text);
+            let _ = std::fs::remove_file(&timing_output);
+            return Ok((text, ocr_ms));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&output);
             let _ = std::fs::remove_file(&error_output);
+            let _ = std::fs::remove_file(&timing_output);
             anyhow::bail!(
                 "文档解析超时（{} 秒），已跳过文件: {}",
                 FILE_EXTRACTION_TIMEOUT.as_secs(),
@@ -1366,6 +1646,39 @@ mod tests {
     }
 
     #[test]
+    fn txt_windows_cover_unicode_and_chunk_boundaries_without_duplicate_overlap() {
+        let text = (0..2300)
+            .map(|index| char::from_u32(0x4e00 + index).unwrap())
+            .collect::<String>();
+        let document = PreparedDocument {
+            id: "novel".to_owned(),
+            root: "/test".to_owned(),
+            name: "novel.txt".to_owned(),
+            path: "/test/novel.txt".to_owned(),
+            extension: "txt".to_owned(),
+            modified_ms: 0,
+            size: text.len() as u64,
+            chunks: split_chunks(&text),
+            embedding: Vec::new(),
+        };
+        let windows = semantic_chunks_for_document(&document);
+        let chars = text.chars().collect::<Vec<_>>();
+        let mut covered = vec![false; chars.len()];
+        for (window_index, (position, passage)) in windows.iter().enumerate() {
+            let start = window_index * SEMANTIC_WINDOW_STRIDE;
+            let end = (start + MAX_SEMANTIC_EMBED_CHARS).min(chars.len());
+            assert_eq!(*passage, chars[start..end].iter().collect::<String>());
+            assert_eq!(*position, start / (CHUNK_TARGET - CHUNK_OVERLAP));
+            covered[start..end].fill(true);
+        }
+        assert_eq!(windows.len(), 6);
+        assert!(covered.into_iter().all(|value| value));
+        assert!(windows
+            .iter()
+            .any(|(_, passage)| passage.contains(&chars[790..810].iter().collect::<String>())));
+    }
+
+    #[test]
     fn average_embedding_combines_and_normalizes_chunk_vectors() {
         let first = vec![1.0; EMBEDDING_DIMENSION];
         let second = vec![-1.0; EMBEDDING_DIMENSION];
@@ -1543,5 +1856,60 @@ mod tests {
             .unwrap()
             .iter()
             .any(|failure| failure.category == "offline"));
+    }
+
+    #[test]
+    fn extraction_profile_upgrade_reprocesses_unchanged_files_and_adds_anchors() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let path = source.join("contract.txt");
+        fs::write(&path, "第九条：货款结算\n双方协商结算时间。").unwrap();
+        let database = directory.path().join("search.db");
+        let storage = Storage::open(&database).unwrap();
+        let text_index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(directory.path().join("missing-model"));
+        let roots = [source.to_string_lossy().into_owned()];
+        let build = || {
+            build_index(
+                &roots,
+                &storage,
+                &text_index,
+                &engine,
+                &IndexControl::default(),
+                |_| {},
+            )
+            .unwrap()
+        };
+        build();
+        let document = storage
+            .list_documents_without_embeddings()
+            .unwrap()
+            .remove(0);
+        let initial_chunk = storage.chunks_for_document(&document.id).unwrap()[0].id;
+        build();
+        assert_eq!(
+            storage.chunks_for_document(&document.id).unwrap()[0].id,
+            initial_chunk
+        );
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value='previous-extraction' WHERE key='extraction_profile'",
+                [],
+            )
+            .unwrap();
+        build();
+        assert_ne!(
+            storage.chunks_for_document(&document.id).unwrap()[0].id,
+            initial_chunk
+        );
+        assert!(storage.extraction_profile_matches().unwrap());
+        assert_eq!(
+            storage
+                .semantic_anchor_search(&engine.embed_query("结算"), None)
+                .len(),
+            1
+        );
     }
 }

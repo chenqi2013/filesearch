@@ -3,12 +3,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
+  ChartNoAxesCombined,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
   Clock3,
   Cpu,
+  Download,
   ExternalLink,
   File,
   FileSearch,
@@ -16,6 +18,7 @@ import {
   FolderOpen,
   Globe2,
   MoreHorizontal,
+  Minimize2,
   PanelLeftClose,
   PanelLeftOpen,
   Pause,
@@ -27,20 +30,23 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { coreApi } from "./api";
+import { coreApi, CoreRequestError } from "./api";
 import { getMessages, type Locale } from "./i18n";
 import type {
   IndexFailure,
   IndexedChunk,
   IndexedDocument,
+  FileIndexTiming,
   Page,
   SearchMode,
   SearchResponse,
   SearchResult,
   ServiceStats,
+  ServiceDiagnostics,
 } from "./types";
 
 type InventoryKind = "documents" | "chunks" | "failures";
+type ServiceIssue = { kind: string; message: string; time: number; path?: string; file?: string; stage?: string };
 type InventoryState =
   | { kind: "documents"; page: Page<IndexedDocument> }
   | { kind: "chunks"; page: Page<IndexedChunk> }
@@ -68,6 +74,10 @@ function App() {
   const t = getMessages(locale);
   const [stats, setStats] = useState<ServiceStats>(EMPTY_STATS);
   const [connected, setConnected] = useState(false);
+  const [serviceDiagnostics, setServiceDiagnostics] = useState<ServiceDiagnostics | null>(null);
+  const [serviceIssue, setServiceIssue] = useState<ServiceIssue | null>(null);
+  const [serviceDetailsOpen, setServiceDetailsOpen] = useState(false);
+  const [serviceRetrying, setServiceRetrying] = useState(false);
   const [query, setQuery] = useState("");
   const [submittedQuery, setSubmittedQuery] = useState("");
   const [mode, setMode] = useState<SearchMode>("hybrid");
@@ -77,6 +87,8 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [inventory, setInventory] = useState<InventoryState | null>(null);
   const [inventoryLoading, setInventoryLoading] = useState(false);
+  const [timingReport, setTimingReport] = useState<Page<FileIndexTiming> | null>(null);
+  const [timingLoading, setTimingLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [officeSetupRequired, setOfficeSetupRequired] = useState(false);
   const [sidebarHidden, setSidebarHidden] = useState(false);
@@ -92,6 +104,33 @@ function App() {
   const searchRequestId = useRef(0);
   const previousIndexStatus = useRef<ServiceStats["status"] | null>(null);
   const sidebarResize = useRef<{ startX: number; startWidth: number } | null>(null);
+  const refreshingStats = useRef(false);
+  const lastStats = useRef<ServiceStats>(EMPTY_STATS);
+  const lastDiagnosticCheck = useRef(0);
+
+  const inspectService = useCallback(async (context?: string) => {
+    if (!isTauri()) return;
+    try {
+      const diagnostic = await invoke<ServiceDiagnostics>("search_core_diagnostics", { context: context ?? null });
+      setServiceDiagnostics(diagnostic);
+      lastDiagnosticCheck.current = Date.now();
+    } catch (error) {
+      setServiceDiagnostics((current) => current ? { ...current, detail: `${current.detail}\n${String(error)}` } : null);
+    }
+  }, []);
+
+  const recordServiceFailure = useCallback(async (error: unknown) => {
+    const issue = {
+      kind: error instanceof CoreRequestError ? error.kind : "network",
+      message: error instanceof Error ? error.message : String(error),
+      time: Date.now(),
+      path: error instanceof CoreRequestError ? error.path : undefined,
+      file: lastStats.current.current_file,
+      stage: lastStats.current.index_stage,
+    };
+    setServiceIssue(issue);
+    await inspectService(JSON.stringify(issue));
+  }, [inspectService]);
 
   const beginSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     sidebarResize.current = { startX: event.clientX, startWidth: sidebarWidth };
@@ -114,12 +153,16 @@ function App() {
   };
 
   const refreshStats = useCallback(async () => {
+    if (refreshingStats.current) return;
+    refreshingStats.current = true;
     try {
       const next = await coreApi.stats();
+      lastStats.current = next;
       const previous = previousIndexStatus.current;
       previousIndexStatus.current = next.status;
       setStats(next);
       setConnected(true);
+      if (Date.now() - lastDiagnosticCheck.current > 15_000) await inspectService();
       if (
         (previous === "indexing" || previous === "paused")
         && next.status === "ready"
@@ -132,10 +175,13 @@ function App() {
           }
         } catch {}
       }
-    } catch {
+    } catch (error) {
       setConnected(false);
+      await recordServiceFailure(error);
+    } finally {
+      refreshingStats.current = false;
     }
-  }, []);
+  }, [inspectService, recordServiceFailure]);
 
   useEffect(() => {
     const start = async () => {
@@ -144,12 +190,44 @@ function App() {
         await refreshStats();
       } catch (error) {
         setNotice(`${t.error}: ${String(error)}`);
+        await recordServiceFailure(error);
       }
     };
     void start();
     const timer = window.setInterval(refreshStats, 1200);
     return () => window.clearInterval(timer);
-  }, [refreshStats, t.error]);
+  }, [refreshStats, recordServiceFailure, t.error]);
+
+  const retryService = async () => {
+    if (serviceRetrying) return;
+    setServiceRetrying(true);
+    try {
+      if (isTauri()) await invoke("ensure_search_core", { retry: true });
+      await refreshStats();
+      await inspectService();
+    } catch (error) {
+      await recordServiceFailure(error);
+    } finally {
+      setServiceRetrying(false);
+    }
+  };
+
+  const openServiceLogs = async () => {
+    try { await invoke("open_service_logs"); }
+    catch (error) { setNotice(`${t.error}: ${String(error)}`); }
+  };
+
+  const copyServiceDetails = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify({ request: serviceIssue, diagnostics: serviceDiagnostics }, null, 2));
+      setNotice(t.serviceCopied);
+    } catch (error) { setNotice(`${t.error}: ${String(error)}`); }
+  };
+
+  const hideToBackground = async () => {
+    try { await invoke("hide_to_tray"); }
+    catch (error) { setNotice(`${t.error}: ${String(error)}`); }
+  };
 
   useEffect(() => {
     if (notice !== t.indexStarted) return;
@@ -187,10 +265,11 @@ function App() {
         setNotice(t.indexStarted);
         await refreshStats();
       } catch (error) {
+        if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
         setNotice(`${t.error}: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
-    [refreshStats, t.error, t.indexStarted],
+    [refreshStats, recordServiceFailure, t.error, t.indexStarted],
   );
 
   const controlIndex = async (action: "pause" | "resume" | "cancel") => {
@@ -207,6 +286,7 @@ function App() {
       setNotice(action === "pause" ? t.indexPaused : action === "cancel" ? t.indexCancelRequested : t.indexStarted);
       await refreshStats();
     } catch (error) {
+      if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
       setNotice(`${t.error}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
@@ -233,12 +313,13 @@ function App() {
       setSelected(result.results[0] ?? null);
     } catch (error) {
       if (requestId === searchRequestId.current) {
+        if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
         setNotice(`${t.error}: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
       if (requestId === searchRequestId.current) setSearching(false);
     }
-  }, [t.error]);
+  }, [recordServiceFailure, t.error]);
 
   const submitSearch = async (event: FormEvent) => {
     event.preventDefault();
@@ -270,9 +351,47 @@ function App() {
         setInventory({ kind, page: await coreApi.failures(offset) });
       }
     } catch (error) {
+      if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
       setNotice(`${t.error}: ${String(error)}`);
     } finally {
       setInventoryLoading(false);
+    }
+  };
+
+  const showTimingReport = async (offset = 0) => {
+    setTimingLoading(true);
+    try {
+      setTimingReport(await coreApi.fileTimings(offset));
+    } catch (error) {
+      if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
+      setNotice(`${t.error}: ${String(error)}`);
+    } finally {
+      setTimingLoading(false);
+    }
+  };
+
+  const exportTimingReport = async () => {
+    try {
+      const first = await coreApi.fileTimings(0);
+      const items = [...first.items];
+      for (let offset = first.limit; offset < first.total; offset += first.limit) {
+        items.push(...(await coreApi.fileTimings(offset, first.limit)).items);
+      }
+      const quote = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
+      const rows = [
+        ["path", "extension", "size_bytes", "status", "check_ms", "read_parse_ms", "pdf_ocr_ms", "embedding_ms", "sqlite_ms", "text_index_ms", "total_ms", "recorded_at"],
+        ...items.map((item) => [item.path, item.extension, item.size, item.status, item.check_ms, item.parse_ms, item.ocr_ms, item.embedding_ms, item.storage_ms, item.text_index_ms, item.total_ms, item.recorded_at]),
+      ];
+      const csv = `\uFEFF${rows.map((row) => row.map(quote).join(",")).join("\r\n")}`;
+      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `filesearch-index-timings-${new Date().toISOString().slice(0, 10)}.csv`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
+      setNotice(`${t.error}: ${String(error)}`);
     }
   };
 
@@ -365,6 +484,7 @@ function App() {
           >
             {sidebarHidden ? <PanelLeftOpen /> : <PanelLeftClose />}
           </button>
+          {isTauri() && <button className="icon-button" title={t.background} aria-label={t.background} onClick={() => void hideToBackground()}><Minimize2 /></button>}
         </div>
         <form className="searchbox" onSubmit={submitSearch}>
           <Search aria-hidden="true" />
@@ -445,6 +565,13 @@ function App() {
                 </button>
               )}
             </div>
+            {(!connected || serviceIssue || serviceDiagnostics?.last_exit) && (
+              <div className={`service-alert ${connected ? "recovered" : "disconnected"}`} role="status">
+                <span>{connected ? t.serviceRecovered : serviceIssue?.kind === "timeout" ? t.serviceTimeout : serviceIssue?.kind === "invalid_response" ? t.serviceResponse : serviceDiagnostics?.detail ?? t.serviceNetwork}</span>
+                <button onClick={() => { setServiceDetailsOpen(true); void inspectService(); }}>{t.serviceDetails}</button>
+                {!connected && <button disabled={serviceRetrying} onClick={() => void retryService()}>{t.serviceReconnect}</button>}
+              </div>
+            )}
             {!indexDetailsCollapsed && (
               <>
                 <div className={`backend-status ${backend}`} title={stats.embedding_model ?? undefined}>
@@ -455,6 +582,9 @@ function App() {
                   <div className="progress-block">
                     <div className={`progress-track ${modelLoading ? "indeterminate" : ""}`}><span style={modelLoading ? undefined : { width: `${progress}%` }} /></div>
                     <small>{modelLoading ? stats.embedding_model : `${stats.processed_files} / ${stats.total_files}`}</small>
+                    {(stats.embedding_windows_total ?? 0) > 0 && (
+                      <small>{t.embeddingWindows}: {stats.embedding_windows_processed ?? 0} / {stats.embedding_windows_total}</small>
+                    )}
                   </div>
                 )}
                 {showTiming && (
@@ -486,6 +616,7 @@ function App() {
             {!indexDetailsCollapsed && <div className="index-actions">
               <span><Clock3 />{stats.last_indexed ? formatDate(stats.last_indexed, locale) : t.never}</span>
               <div className="index-action-buttons">
+                <button className="icon-button" onClick={() => void showTimingReport()} title={t.fileTimingReport} aria-label={t.fileTimingReport}><ChartNoAxesCombined /></button>
                 {stats.status === "indexing" && <button className="icon-button" onClick={() => void controlIndex("pause")} title={t.pauseIndex}><Pause /></button>}
                 {stats.status === "paused" && <button className="icon-button" onClick={() => void controlIndex("resume")} title={t.resumeIndex}><Play /></button>}
                 {isIndexing && <button className="icon-button danger-icon" onClick={() => void controlIndex("cancel")} title={t.cancelIndex}><Square /></button>}
@@ -554,6 +685,34 @@ function App() {
       </div>
 
       {inventory && <InventoryModal inventory={inventory} loading={inventoryLoading} t={t} locale={locale} onClose={() => setInventory(null)} onPage={(offset) => void showInventory(inventory.kind, offset)} onOpen={openPath} />}
+      {timingReport && <FileTimingModal page={timingReport} loading={timingLoading} t={t} onClose={() => setTimingReport(null)} onPage={(offset) => void showTimingReport(offset)} onOpen={openPath} onExport={() => void exportTimingReport()} />}
+      {serviceDetailsOpen && (
+        <div className="modal-backdrop" onMouseDown={() => setServiceDetailsOpen(false)}>
+          <section className="modal service-modal" role="dialog" aria-modal="true" aria-labelledby="service-title" onMouseDown={(event) => event.stopPropagation()}>
+            <header><h2 id="service-title">{t.serviceDetails}</h2><button className="icon-button" title={t.close} onClick={() => setServiceDetailsOpen(false)}><X /></button></header>
+            <div className="service-details">
+              <p>{serviceDiagnostics?.detail ?? (serviceIssue?.kind === "timeout" ? t.serviceTimeout : t.serviceNetwork)}</p>
+              <dl>
+                <dt>{t.serviceBuild}</dt><dd>{serviceDiagnostics?.build ?? "—"}</dd>
+                <dt>{t.serviceProcess}</dt><dd>{serviceDiagnostics?.pid ?? "—"}</dd>
+                <dt>{t.serviceLastExit}</dt><dd>{serviceDiagnostics?.last_exit ? `${formatTimestamp(serviceDiagnostics.last_exit.timestamp_ms, locale)} · ${serviceDiagnostics.last_exit.reason}` : t.serviceUnknown}</dd>
+                <dt>{t.serviceRequest}</dt><dd>{serviceIssue ? `${formatTimestamp(serviceIssue.time, locale)} · ${serviceIssue.path ?? ""}\n${serviceIssue.message}` : "—"}</dd>
+                <dt>{t.serviceLastFile}</dt><dd>{serviceIssue?.file ?? "—"}</dd>
+                <dt>{t.serviceLastStage}</dt><dd>{serviceIssue?.stage ?? "—"}</dd>
+                <dt>{t.serviceLogs}</dt><dd>{serviceDiagnostics?.log_path ?? "—"}</dd>
+              </dl>
+              {serviceDiagnostics?.log_tail && <pre>{serviceDiagnostics.log_tail}</pre>}
+              <p className="muted">{t.servicePrivacy}</p>
+              <p className="muted">{t.backgroundHint}</p>
+            </div>
+            <footer>
+              <button className="secondary-button" onClick={() => void copyServiceDetails()}>{t.serviceCopy}</button>
+              {isTauri() && <button className="secondary-button" onClick={() => void openServiceLogs()}>{t.serviceLogs}</button>}
+              <button className="primary-button" disabled={serviceRetrying} onClick={() => void retryService()}>{t.serviceReconnect}</button>
+            </footer>
+          </section>
+        </div>
+      )}
       {folderToRemove && (
         <ConfirmRemoveFolderModal
           path={folderToRemove}
@@ -625,6 +784,65 @@ function ConfirmRemoveFolderModal({ path, t, onCancel, onConfirm }: {
     </div>
   );
 
+}
+
+function FileTimingModal({ page, loading, t, onClose, onPage, onOpen, onExport }: {
+  page: Page<FileIndexTiming>;
+  loading: boolean;
+  t: ReturnType<typeof getMessages>;
+  onClose: () => void;
+  onPage: (offset: number) => void;
+  onOpen: (path: string) => void;
+  onExport: () => void;
+}) {
+  const totalPages = Math.max(1, Math.ceil(page.total / page.limit));
+  const currentPage = Math.min(totalPages, Math.floor(page.offset / page.limit) + 1);
+  const statusLabel = (status: FileIndexTiming["status"]) => status === "failed" ? t.timingFailed : status === "skipped" ? t.timingSkipped : t.timingIndexed;
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section className="modal timing-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><ChartNoAxesCombined /><h2>{t.fileTimingReport}</h2></div>
+          <div className="timing-modal-actions">
+            <button className="secondary-button" onClick={onExport} disabled={page.total === 0}><Download />{t.timingExport}</button>
+            <button className="icon-button" onClick={onClose} title={t.close}><X /></button>
+          </div>
+        </header>
+        <p className="timing-note">{t.timingNote}</p>
+        <div className={`timing-table-wrap ${loading ? "loading" : ""}`}>
+          {page.items.length === 0 ? <p className="muted inventory-empty">{t.timingNoData}</p> : (
+            <table className="timing-table">
+              <thead><tr><th>{t.timingStatus}</th><th>{t.size}</th><th>{t.stageChecking}</th><th>{t.timingParse}</th><th>{t.timingOcr}</th><th>{t.stageEmbedding}</th><th>{t.stageStorage}</th><th>{t.stageTextIndex}</th><th>{t.timingTitle}</th><th>{t.details}</th></tr></thead>
+              <tbody>{page.items.map((item) => (
+                <tr key={`${item.path}-${item.recorded_at}`}>
+                  <td><span className={`timing-status ${item.status}`}>{statusLabel(item.status)}</span></td>
+                  <td>{formatBytes(item.size)}</td>
+                  <td>{formatDuration(item.check_ms)}</td>
+                  <td>{formatDuration(item.parse_ms)}</td>
+                  <td>{formatDuration(item.ocr_ms)}</td>
+                  <td>{formatDuration(item.embedding_ms)}</td>
+                  <td>{formatDuration(item.storage_ms)}</td>
+                  <td>{formatDuration(item.text_index_ms)}</td>
+                  <td><strong>{formatDuration(item.total_ms)}</strong></td>
+                  <td><button className="timing-path" title={item.path} onClick={() => onOpen(item.path)}>{item.path}</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          )}
+        </div>
+        <footer className="inventory-footer">
+          <span>{t.listRange(page.total === 0 ? 0 : page.offset + 1, Math.min(page.offset + page.items.length, page.total), page.total)}</span>
+          <div>
+            <button className="icon-button" disabled={loading || page.offset === 0} onClick={() => onPage(Math.max(0, page.offset - page.limit))} title={t.previous}><ChevronLeft /></button>
+            <select className="inventory-page-select" value={currentPage} disabled={loading || page.total === 0} aria-label={t.pageNumber(currentPage, totalPages)} onChange={(event) => onPage((Number(event.target.value) - 1) * page.limit)}>
+              {Array.from({ length: totalPages }, (_, index) => <option key={index + 1} value={index + 1}>{t.pageNumber(index + 1, totalPages)}</option>)}
+            </select>
+            <button className="icon-button" disabled={loading || page.offset + page.limit >= page.total} onClick={() => onPage(page.offset + page.limit)} title={t.next}><ChevronRight /></button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  );
 }
 
 function InventoryModal({

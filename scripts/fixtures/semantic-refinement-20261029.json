@@ -1,0 +1,51 @@
+{
+  "description": "Frozen before implementation on 2026-10-29. Developer-authored queries over existing real indexed documents; first 12 positive cases are development, last 12 are reserved validation. Evidence quotes are partial labels, not exhaustive relevance judgments.",
+  "target_groups": {
+    "contract": ["2024-03-供应商合作协议.pdf"],
+    "software": ["需求.docx", "Windows本地文档智能搜索需求文档_供应商评估版_20260813V1.docx"],
+    "mobile_pdf": ["converted.pdf"],
+    "tika": ["testPDF.pdf"]
+  },
+  "new_positive": [
+    ["contract", "供应商涨了价是不是当天就得执行", "书面回签后 15 天生效"],
+    ["contract", "采购单随便找个人签字算不算", "其他人的签名不予以承认"],
+    ["contract", "没有送货单还能用什么凭证", "收据"],
+    ["contract", "包装箱借给买方弄坏了怎么办", "需方负责赔偿"],
+    ["contract", "生产剩下的材料不退会怎样", "取消供方供货资格"],
+    ["contract", "双方事先留了样品要怎么验货", "依照样品执行检验"],
+    ["contract", "检查合格入库以后货归谁所有", "所有权从供方转移给需方"],
+    ["contract", "供应商给采购员送礼可以取消合作吗", "贿赂需方相关人员"],
+    ["software", "软件能不能用中文和英文混着查", "中英文混合内容"],
+    ["software", "安装完成后普通职员能自己用起来吗", "普通用户可独立完成安装"],
+    ["mobile_pdf", "Can I annotate documents in this viewer", "Annotation tools"],
+    ["tika", "查找能从多种格式读取元信息的组件", "extracting metadata"],
+    ["contract", "买方自己改订单让供方亏钱怎么办", "协议补偿的金额后支付给供方"],
+    ["contract", "不及时确认订单会罚多少钱", "100 元违约金"],
+    ["contract", "质量导致停工时每小时补偿多少", "15 元 /时计算"],
+    ["contract", "退货要让买方代发快递谁付运费", "所产生的费用一律由供方"],
+    ["contract", "包装可以反复用能少收一点货款吗", "扣除包装物的部分"],
+    ["contract", "打官司之前能先协商终止协议的损失吗", "由需 、 供双方协调"],
+    ["contract", "采购订单变更了以前那份还有效吗", "前订单自动作废"],
+    ["contract", "合同之外临时补充的协议算数吗", "同等法律效力"],
+    ["software", "不准改动和覆盖我的原始资料", "不应改变、删除或覆盖用户原始文档"],
+    ["software", "文件正在被别的软件占用要说明原因", "文件被占用"],
+    ["mobile_pdf", "Why is the download control unavailable on Apple phones", "unsupported on iOS"],
+    ["tika", "Which parser detects formats and reads structured content", "structured text content"]
+  ],
+  "negative": [
+    "供应商合作协议的信用证开证银行是哪家",
+    "采购合同要求包装纸箱的抗压值是多少",
+    "合作协议里约定的货币汇率怎么计算",
+    "采购合同里供方车辆的保险单号",
+    "大学排行榜里的留学生活费预算",
+    "心率资料中的新冠疫苗接种时间表",
+    "本地搜索软件如何编辑视频和制作字幕",
+    "手机PDF查看器里的水电费充值教程",
+    "采购协议里每月给员工缴纳多少社保",
+    "供应商的厂房消防验收证书编号",
+    "软件需求里的网上商城优惠券叠加规则",
+    "文档解析组件的公交卡余额查询接口"
+  ],
+  "ambiguous": [],
+  "controls": []
+}

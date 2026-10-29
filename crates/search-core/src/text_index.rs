@@ -166,6 +166,29 @@ impl TextIndex {
     pub fn document_count(&self) -> u64 {
         self.reader.searcher().num_docs()
     }
+
+    pub fn query_term_weights(&self, terms: &[String]) -> Result<Vec<f32>> {
+        let searcher = self.reader.searcher();
+        let total = searcher.num_docs() as f32;
+        terms
+            .iter()
+            .map(|value| {
+                let mut frequency =
+                    searcher.doc_freq(&Term::from_field_text(self.content, value))?;
+                if frequency == 0 && value.is_ascii() && value.len() > 4 {
+                    if let Some(singular) = value.strip_suffix('s') {
+                        frequency =
+                            searcher.doc_freq(&Term::from_field_text(self.content, singular))?;
+                    }
+                }
+                Ok(if frequency == 0 {
+                    0.0
+                } else {
+                    ((total + 1.0) / (frequency as f32 + 1.0)).ln() + 1.0
+                })
+            })
+            .collect()
+    }
 }
 
 fn keyword_query(terms: &[String], content: Field) -> Box<dyn Query> {
@@ -204,6 +227,32 @@ fn build_schema() -> Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_weights_favor_rare_terms_and_recognize_plural_labels() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = TextIndex::open(directory.path()).unwrap();
+        for (chunk_id, text) in [(1, "常用 罕见 Annotation"), (2, "常用")] {
+            let identity = format!("doc-{chunk_id}");
+            index
+                .replace_document(
+                    &identity,
+                    "notes",
+                    &[StoredChunk {
+                        id: chunk_id,
+                        document_id: identity.clone(),
+                        text: text.into(),
+                    }],
+                )
+                .unwrap();
+        }
+        index.commit().unwrap();
+        let terms = ["常用", "罕见", "annotations", "不存在"].map(String::from);
+        let weights = index.query_term_weights(&terms).unwrap();
+        assert!(weights[1] > weights[0]);
+        assert!(weights[2] > 0.0);
+        assert_eq!(weights[3], 0.0);
+    }
 
     #[test]
     fn tantivy_matches_chinese_bigrams() {

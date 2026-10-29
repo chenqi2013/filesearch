@@ -5,8 +5,9 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 const MODEL_NAME: &str = "EmbeddingRWKV Tiny";
-pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-mixed-int8-structured-full-passages-v9";
+pub const EMBEDDING_PROFILE: &str = "rwkv7-tiny-ffn3-attnout6-int8-structured-full-passages-v10";
 const MAX_SEQUENCE_LENGTH: usize = 1024;
 const INFERENCE_MAX_BATCH_SIZE: usize = 4;
 const INFERENCE_MAX_PADDED_TOKENS: usize = 2_048;
@@ -15,7 +16,7 @@ const EMBEDDING_CACHE_CAPACITY: usize = 4096;
 
 struct LocalRwkvModel {
     inference: RwkvModel,
-    tokenizer: RwkvTokenizer,
+    tokenizer: Arc<RwkvTokenizer>,
     backend: RuntimeBackend,
     cache: VectorCache,
 }
@@ -84,6 +85,8 @@ pub struct EmbeddingEngine {
     preferred_backend: RuntimeBackend,
     state: Mutex<ModelState>,
     status: RwLock<String>,
+    backend_status: RwLock<String>,
+    tokenizer: OnceLock<Arc<RwkvTokenizer>>,
 }
 
 impl EmbeddingEngine {
@@ -94,6 +97,12 @@ impl EmbeddingEngine {
         Self {
             model_dir,
             preferred_backend,
+            backend_status: RwLock::new(if force_offline {
+                "fallback".to_owned()
+            } else {
+                preferred_backend.code().to_owned()
+            }),
+            tokenizer: OnceLock::new(),
             state: Mutex::new(if force_offline {
                 ModelState::Fallback
             } else {
@@ -114,12 +123,7 @@ impl EmbeddingEngine {
     }
 
     pub fn backend(&self) -> String {
-        let state = self.state.lock();
-        match &*state {
-            ModelState::Ready(model) => model.backend.code().to_owned(),
-            ModelState::Fallback => "fallback".to_owned(),
-            ModelState::Uninitialized => self.preferred_backend.code().to_owned(),
-        }
+        self.backend_status.read().clone()
     }
 
     pub fn embed_query(&self, query: &str) -> Vec<f32> {
@@ -133,6 +137,24 @@ impl EmbeddingEngine {
         self.embed_batch(passages)
     }
 
+    pub fn passage_batches(&self, passages: &[String]) -> Result<Vec<Vec<usize>>> {
+        let tokenizer = self.tokenizer()?;
+        let tokenized = passages
+            .iter()
+            .enumerate()
+            .map(|(index, text)| (index, tokenizer.encode_with_eos(text)))
+            .collect::<Vec<_>>();
+        Ok(plan_token_batches(&tokenized))
+    }
+
+    fn tokenizer(&self) -> Result<Arc<RwkvTokenizer>> {
+        if let Some(tokenizer) = self.tokenizer.get() {
+            return Ok(Arc::clone(tokenizer));
+        }
+        let tokenizer = Arc::new(RwkvTokenizer::load(&self.model_dir.join("rwkv_vocab.bin"))?);
+        Ok(Arc::clone(self.tokenizer.get_or_init(|| tokenizer)))
+    }
+
     fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
         if texts.is_empty() {
             return Vec::new();
@@ -142,11 +164,13 @@ impl EmbeddingEngine {
             *self.status.write() = format!("{MODEL_NAME}（正在加载内置模型）");
             match self.load_model() {
                 Ok(model) => {
+                    *self.backend_status.write() = model.backend.code().to_owned();
                     *self.status.write() =
                         format!("{MODEL_NAME}（内置 ONNX，{}）", model.backend.label());
                     *state = ModelState::Ready(Box::new(model));
                 }
                 Err(error) => {
+                    *self.backend_status.write() = "fallback".to_owned();
                     tracing::warn!(error = %format_args!("{error:#}"), "local embedding model unavailable; using offline fallback");
                     *self.status.write() = format!("{MODEL_NAME}（内置模型不可用，离线特征降级）");
                     *state = ModelState::Fallback;
@@ -158,6 +182,7 @@ impl EmbeddingEngine {
             match model.embed(texts) {
                 Ok(vectors) => return vectors,
                 Err(error) => {
+                    *self.backend_status.write() = "fallback".to_owned();
                     tracing::warn!(error = %format_args!("{error:#}"), "embedding inference failed; using offline fallback");
                     *self.status.write() = format!("{MODEL_NAME}（推理失败，已降级）");
                     *state = ModelState::Fallback;
@@ -169,7 +194,7 @@ impl EmbeddingEngine {
 
     fn load_model(&self) -> Result<LocalRwkvModel> {
         let model_path = self.model_dir.join("model.onnx");
-        let tokenizer = RwkvTokenizer::load(&self.model_dir.join("rwkv_vocab.bin"))?;
+        let tokenizer = self.tokenizer()?;
         if self.preferred_backend == RuntimeBackend::Cuda {
             match RwkvModel::load_with_cuda(&model_path) {
                 Ok(inference) => {
@@ -695,6 +720,13 @@ mod tests {
         assert!(batches
             .iter()
             .all(|batch| batch.len() * 1024 <= INFERENCE_MAX_PADDED_TOKENS));
+    }
+
+    #[test]
+    fn backend_status_does_not_wait_for_an_inference_lock() {
+        let engine = EmbeddingEngine::new(PathBuf::from("missing-test-model"));
+        let _inference = engine.state.lock();
+        assert!(!engine.backend().is_empty());
     }
 
     fn rwkv_tokenizer() -> RwkvTokenizer {

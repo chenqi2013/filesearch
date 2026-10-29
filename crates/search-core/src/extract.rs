@@ -13,7 +13,7 @@ use zip::ZipArchive;
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json", "log", "rst",
 ];
-pub const EXTRACTION_PROFILE: &str = "office-legacy-conversion-v2";
+pub const EXTRACTION_PROFILE: &str = "office-legacy-conversion-v3-pdf-cjk-spacing";
 pub(crate) const LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER: &str =
     "[filesearch:legacy-office-environment-unavailable]";
 
@@ -37,38 +37,48 @@ pub(crate) fn is_temporary_office_file(path: &Path) -> bool {
 }
 
 pub fn extract_text(path: &Path) -> Result<String> {
+    extract_text_with_timing(path).map(|(text, _)| text)
+}
+
+pub fn extract_text_with_timing(path: &Path) -> Result<(String, u64)> {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    let text = match extension.as_str() {
+    let (text, mut ocr_ms) = match extension.as_str() {
         "txt" | "md" | "csv" | "json" | "log" | "rst" => {
             let bytes =
                 std::fs::read(path).with_context(|| format!("无法读取 {}", path.display()))?;
-            decode_text_bytes(&bytes)
+            (decode_text_bytes(&bytes), 0)
         }
         "pdf" => {
             if pdf_has_encrypt_marker(path)? {
                 return Err(anyhow!("加密 PDF 不支持，请解密后重新索引"));
             }
-            extract_pdf_text(path)?
+            extract_pdf_text_with_timing(path)?
         }
-        "docx" => extract_ooxml(path, OoxmlKind::Word)?,
-        "pptx" => extract_ooxml(path, OoxmlKind::PowerPoint)?,
-        "xlsx" => extract_ooxml(path, OoxmlKind::Excel)?,
-        "doc" => extract_legacy_office(path, OoxmlKind::Word)?,
-        "ppt" => extract_legacy_office(path, OoxmlKind::PowerPoint)?,
-        "xls" => extract_legacy_office(path, OoxmlKind::Excel)?,
+        "docx" => (extract_ooxml(path, OoxmlKind::Word)?, 0),
+        "pptx" => (extract_ooxml(path, OoxmlKind::PowerPoint)?, 0),
+        "xlsx" => (extract_ooxml(path, OoxmlKind::Excel)?, 0),
+        "doc" => (extract_legacy_office(path, OoxmlKind::Word)?, 0),
+        "ppt" => (extract_legacy_office(path, OoxmlKind::PowerPoint)?, 0),
+        "xls" => (extract_legacy_office(path, OoxmlKind::Excel)?, 0),
         _ => return Err(anyhow!("暂不支持 .{extension} 格式")),
     };
 
-    let mut normalized = normalize_text(&text);
+    let mut normalized = if extension == "pdf" {
+        normalize_text(&normalize_pdf_spacing(&text))
+    } else {
+        normalize_text(&text)
+    };
     if extension == "pdf" && pdf_text_needs_ocr(&normalized) {
+        let ocr_started = std::time::Instant::now();
         match extract_pdf_ocr(path) {
             Ok(ocr_text) => {
-                let ocr_text = normalize_text(&ocr_text);
+                ocr_ms = ocr_started.elapsed().as_millis() as u64;
+                let ocr_text = normalize_text(&normalize_pdf_spacing(&ocr_text));
                 if normalized.is_empty()
                     || pdf_text_quality(&ocr_text) > pdf_text_quality(&normalized)
                 {
@@ -79,7 +89,7 @@ pub fn extract_text(path: &Path) -> Result<String> {
                 return Err(error)
                     .with_context(|| format!("PDF 没有文字层，OCR 识别失败: {}", path.display()));
             }
-            Err(_) => {}
+            Err(_) => ocr_ms = ocr_started.elapsed().as_millis() as u64,
         }
     }
     if normalized.is_empty() {
@@ -91,7 +101,7 @@ pub fn extract_text(path: &Path) -> Result<String> {
         }
         return Err(anyhow!("未提取到可索引文本"));
     }
-    Ok(normalized)
+    Ok((normalized, ocr_ms))
 }
 
 fn extract_legacy_office(path: &Path, kind: OoxmlKind) -> Result<String> {
@@ -323,23 +333,31 @@ fn command_failure(output: &Output) -> String {
     }
 }
 
-fn extract_pdf_text(path: &Path) -> Result<String> {
+fn extract_pdf_text_with_timing(path: &Path) -> Result<(String, u64)> {
     match catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text(path))) {
-        Ok(Ok(text)) => Ok(text),
-        Ok(Err(error)) => extract_pdf_ocr(path).with_context(|| {
-            format!(
-                "PDF 文字层解析失败，OCR 降级也失败: {}; 原始解析错误: {error}",
-                path.display()
-            )
-        }),
+        Ok(Ok(text)) => Ok((text, 0)),
+        Ok(Err(error)) => {
+            let started = std::time::Instant::now();
+            extract_pdf_ocr(path)
+                .map(|text| (text, started.elapsed().as_millis() as u64))
+                .with_context(|| {
+                    format!(
+                        "PDF 文字层解析失败，OCR 降级也失败: {}; 原始解析错误: {error}",
+                        path.display()
+                    )
+                })
+        }
         Err(payload) => {
             let panic_message = panic_message(payload.as_ref());
-            extract_pdf_ocr(path).with_context(|| {
-                format!(
-                    "PDF 文字层解析异常，OCR 降级也失败: {}; 原始解析异常: {panic_message}",
-                    path.display()
-                )
-            })
+            let started = std::time::Instant::now();
+            extract_pdf_ocr(path)
+                .map(|text| (text, started.elapsed().as_millis() as u64))
+                .with_context(|| {
+                    format!(
+                        "PDF 文字层解析异常，OCR 降级也失败: {}; 原始解析异常: {panic_message}",
+                        path.display()
+                    )
+                })
         }
     }
 }
@@ -863,10 +881,65 @@ fn normalize_text(value: &str) -> String {
         .join("\n")
 }
 
+fn normalize_pdf_spacing(value: &str) -> String {
+    let is_cjk = |character: char| matches!(character as u32, 0x3400..=0x9fff | 0x20000..=0x2fa1f);
+    let fragments = |line: &str| {
+        let mut single = 0;
+        let mut total = 0;
+        for word in line.split_whitespace() {
+            let count = word.chars().filter(|character| is_cjk(*character)).count();
+            if count > 0 {
+                total += 1;
+                single += usize::from(count == 1);
+            }
+        }
+        (single, total)
+    };
+    let (single, total) = fragments(value);
+    let spaced_document = single >= 12 && single * 2 >= total;
+    value
+        .lines()
+        .map(|line| {
+            let (single, total) = fragments(line);
+            if single < 2 || (!spaced_document && (single < 3 || single * 2 < total)) {
+                return line.to_owned();
+            }
+            let characters = line.chars().collect::<Vec<_>>();
+            characters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, character)| {
+                    let artificial_space = *character == ' '
+                        && index > 0
+                        && index + 1 < characters.len()
+                        && is_cjk(characters[index - 1])
+                        && is_cjk(characters[index + 1]);
+                    (!artificial_space).then_some(*character)
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn pdf_spacing_repairs_fragmented_chinese_without_joining_rows_or_english() {
+        let text = "第 九 条 ：货 款 结 算\n逾 期 付 款 另 议\n金 额\n北京 上海\nEnglish words and RWKV model\n工作表 | 名称: 北京 | 地区: 中国";
+        assert_eq!(normalize_pdf_spacing(text), "第九条 ：货款结算\n逾期付款另议\n金额\n北京 上海\nEnglish words and RWKV model\n工作表 | 名称: 北京 | 地区: 中国");
+        assert_eq!(
+            normalize_pdf_spacing("中文 分词\n北京 上海\n甲 方"),
+            "中文 分词\n北京 上海\n甲 方"
+        );
+        assert_eq!(
+            normalize_pdf_spacing("列 一  列 二\n甲 方\t乙 方\n金 额 单 位"),
+            "列一  列二\n甲方\t乙方\n金额单位"
+        );
+    }
 
     #[test]
     fn extracts_xml_text_without_tags() {

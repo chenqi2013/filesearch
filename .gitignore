@@ -13,6 +13,8 @@ src-tauri/binaries/cublas*.dll
 src-tauri/binaries/cufft*.dll
 src-tauri/binaries/cudart*.dll
 src-tauri/binaries/cudnn*.dll
+src-tauri/binaries/cuda-runtime/*.dll
+src-tauri/binaries/cudnn-runtime/*.dll
 *.local.json
 .filesearch-data/
 assets/models/embedding-rwkv-tiny/model.onnx
