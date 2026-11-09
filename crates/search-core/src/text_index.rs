@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery, TermSetQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, INDEXED, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
@@ -31,10 +31,12 @@ impl TextIndex {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let schema = build_schema();
+        let directory =
+            crate::index_directory::IndexDirectory(tantivy::directory::MmapDirectory::open(path)?);
         let index = if path.join("meta.json").exists() {
-            Index::open_in_dir(path).context("无法打开 Tantivy 索引")?
+            Index::open(directory).context("无法打开 Tantivy 索引")?
         } else {
-            Index::create_in_dir(path, schema).context("无法创建 Tantivy 索引")?
+            Index::create(directory, schema, Default::default()).context("无法创建 Tantivy 索引")?
         };
         let schema = index.schema();
         let content = schema.get_field("content")?;
@@ -143,11 +145,33 @@ impl TextIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<KeywordHit>> {
+        self.search_scoped(query, limit, None)
+    }
+
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        documents: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Vec<KeywordHit>> {
         let terms = query_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let parsed = keyword_query(&terms, self.content);
+        let mut parsed = keyword_query(&terms, self.content);
+        if let Some(documents) = documents {
+            parsed = Box::new(BooleanQuery::new(vec![
+                (Occur::Must, parsed),
+                (
+                    Occur::Must,
+                    Box::new(TermSetQuery::new(
+                        documents
+                            .iter()
+                            .map(|id| Term::from_field_text(self.document_id, id)),
+                    )),
+                ),
+            ]));
+        }
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(&parsed, &TopDocs::with_limit(limit.clamp(1, 2_000)))?;
         let mut hits = Vec::with_capacity(top_docs.len());

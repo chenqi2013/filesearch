@@ -7,6 +7,8 @@ import type {
   SearchMode,
   SearchResponse,
   ServiceStats,
+  SearchFilters,
+  DocumentContent,
 } from "./types";
 
 const CORE_URL = "http://127.0.0.1:47653";
@@ -59,13 +61,16 @@ export const coreApi = {
   pauseIndex: () => request<{ accepted: boolean; message: string }>("/index/pause", { method: "POST" }),
   resumeIndex: () => request<{ accepted: boolean; message: string }>("/index/resume", { method: "POST" }),
   cancelIndex: () => request<{ accepted: boolean; message: string }>("/index/cancel", { method: "POST" }),
-  search: (query: string, mode: SearchMode, extension: string) =>
+  retryFiles: (paths: string[]) => request<{ accepted: boolean; message: string }>("/index/retry", { method: "POST", body: JSON.stringify({ paths }) }),
+  setResources: (mode: "everyday" | "full") => request<{ mode: string }>("/settings/resources", { method: "POST", body: JSON.stringify({ mode }) }),
+  content: (documentId: string, offset = 0, query = "") => request<DocumentContent>(`/document-content?${new URLSearchParams({ document_id: documentId, offset: String(offset), query })}`, undefined, 120_000),
+  search: (query: string, mode: SearchMode, extension: string, filters: SearchFilters = {}, offset = 0) =>
     request<SearchResponse>("/search", {
       method: "POST",
-      body: JSON.stringify({ query, mode, extension: extension || null, limit: 50 }),
+      body: JSON.stringify({ query, mode, extension: extension || null, ...filters, offset, limit: 20 }),
     }, 120_000),
   documents: (offset = 0, limit = 50) => request<Page<IndexedDocument>>(`/documents?offset=${offset}&limit=${limit}`),
   chunks: (offset = 0, limit = 50) => request<Page<IndexedChunk>>(`/chunks?offset=${offset}&limit=${limit}`),
-  failures: (offset = 0, limit = 50) => request<Page<IndexFailure>>(`/failures?offset=${offset}&limit=${limit}`),
+  failures: (offset = 0, limit = 50, skipped = false) => request<Page<IndexFailure>>(`/failures?offset=${offset}&limit=${limit}&skipped=${skipped}`),
   fileTimings: (offset = 0, limit = 100) => request<Page<FileIndexTiming>>(`/file-timings?offset=${offset}&limit=${limit}`),
 };

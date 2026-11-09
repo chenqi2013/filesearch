@@ -39,6 +39,28 @@ pub struct PreparedDocument {
     pub size: u64,
     pub chunks: Vec<String>,
     pub embedding: Vec<f32>,
+    pub locations: Vec<SourceLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceLocation {
+    pub start: usize,
+    pub end: usize,
+    pub label: String,
+    pub page: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentContent {
+    pub chunks: Page<IndexedChunk>,
+    pub locations: Vec<SourceLocation>,
+    pub passages: Vec<PreviewPassage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewPassage {
+    pub position: usize,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +103,7 @@ pub enum SearchMode {
     Hybrid,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct SearchRequest {
     pub query: String,
     #[serde(default)]
@@ -89,6 +111,33 @@ pub struct SearchRequest {
     pub extension: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(flatten)]
+    pub filters: SearchFilters,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchFilters {
+    pub directory: Option<String>,
+    pub modified_after: Option<u64>,
+    pub modified_before: Option<u64>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    #[serde(default)]
+    pub scope: SearchScope,
+    pub exact_phrase: Option<String>,
+    #[serde(default)]
+    pub exclude_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchScope {
+    #[default]
+    All,
+    Name,
+    Content,
 }
 
 fn default_limit() -> usize {
@@ -101,6 +150,9 @@ pub struct SearchResponse {
     pub total: usize,
     pub elapsed_ms: u128,
     pub results: Vec<SearchResult>,
+    pub offset: usize,
+    pub limit: usize,
+    pub candidate_limited: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,6 +250,10 @@ pub struct ServiceStats {
     pub document_count: usize,
     pub chunk_count: usize,
     pub failed_count: usize,
+    pub skipped_count: usize,
+    pub text_ready_count: usize,
+    pub semantic_pending_count: usize,
+    pub resource_mode: String,
     pub processed_files: usize,
     pub total_files: usize,
     pub current_file: Option<String>,

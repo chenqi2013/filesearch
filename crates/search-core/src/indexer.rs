@@ -13,6 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Condvar, Mutex};
 #[cfg(not(test))]
@@ -23,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
-const EMBEDDING_BATCH_SIZE: usize = 4;
+const EMBEDDING_BATCH_SIZE: usize = 1;
 const PARSE_BATCH_SIZE: usize = 16;
 const CHUNK_TARGET: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
@@ -207,9 +208,48 @@ struct ControlState {
 pub struct IndexControl {
     state: Mutex<ControlState>,
     wake: Condvar,
+    everyday: AtomicBool,
+    searches: AtomicUsize,
+}
+
+pub struct SearchPriority<'a>(&'a IndexControl);
+impl Drop for SearchPriority<'_> {
+    fn drop(&mut self) {
+        self.0.searches.fetch_sub(1, Ordering::SeqCst);
+        self.0.wake.notify_all();
+    }
 }
 
 impl IndexControl {
+    pub fn is_cancel_requested(&self) -> bool {
+        self.state
+            .lock()
+            .expect("index control lock poisoned")
+            .cancelled
+    }
+    pub fn set_resource_mode(&self, everyday: bool) {
+        self.everyday.store(everyday, Ordering::Relaxed);
+    }
+    pub fn is_everyday(&self) -> bool {
+        self.everyday.load(Ordering::Relaxed)
+    }
+    pub fn prioritize_search(&self) -> SearchPriority<'_> {
+        self.searches.fetch_add(1, Ordering::SeqCst);
+        SearchPriority(self)
+    }
+    fn embedding_checkpoint(&self, elapsed: Duration) -> Result<()> {
+        if self.is_everyday() {
+            // Bound each wait so pause/cancel remains responsive.
+            let mut remaining = elapsed.min(Duration::from_millis(500));
+            while !remaining.is_zero() {
+                self.checkpoint()?;
+                let duration = remaining.min(Duration::from_millis(25));
+                std::thread::sleep(duration);
+                remaining = remaining.saturating_sub(duration);
+            }
+        }
+        self.checkpoint()
+    }
     pub fn reset(&self) {
         let mut state = self.state.lock().expect("index control lock poisoned");
         state.paused = false;
@@ -245,9 +285,13 @@ impl IndexControl {
 
     pub fn checkpoint(&self) -> Result<()> {
         let mut state = self.state.lock().expect("index control lock poisoned");
-        while state.paused && !state.cancelled {
-            state.waiting = true;
-            state = self.wake.wait(state).expect("index control lock poisoned");
+        while (state.paused || self.searches.load(Ordering::SeqCst) > 0) && !state.cancelled {
+            state.waiting = state.paused;
+            state = self
+                .wake
+                .wait_timeout(state, Duration::from_millis(50))
+                .expect("index control lock poisoned")
+                .0;
         }
         state.waiting = false;
         if state.cancelled {
@@ -282,6 +326,7 @@ where
 {
     let started = Instant::now();
     let mut timings = IndexTimings::default();
+    storage.set_setting("text_index_dirty", "true")?;
     let extraction_changed = !storage.extraction_profile_matches()?;
     let roots = normalize_roots(paths);
     storage.set_directories(&roots)?;
@@ -316,6 +361,11 @@ where
     let scan_elapsed = scan_started.elapsed();
     timings.scan = scan_elapsed;
     let total = scans.iter().map(|scan| scan.files.len()).sum::<usize>();
+    // Finish small documents first; every large document still receives full coverage.
+    for scan in &mut scans {
+        scan.files
+            .sort_by_cached_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX));
+    }
     report_progress(&mut progress, 0, total, None, "checking", &timings);
 
     let mut processed = 0usize;
@@ -344,7 +394,8 @@ where
                     if previous_by_path
                         .get(path_string.as_str())
                         .is_some_and(|existing| {
-                            !extraction_changed
+                            (!extraction_changed
+                                || storage.checkpoint_matches(&existing.id).unwrap_or(false))
                                 && existing.modified_ms == modified_ms
                                 && existing.size == size
                                 && storage.has_embedding(&existing.id)
@@ -472,6 +523,7 @@ where
     storage.set_embedding_profile()?;
     storage.set_extraction_profile()?;
     storage.set_last_indexed_now()?;
+    storage.set_setting("text_index_dirty", "false")?;
     report_progress(&mut progress, total, total, None, "ready", &timings);
     tracing::info!(
         files = total,
@@ -493,11 +545,29 @@ pub fn update_paths<F>(
     text_index: &TextIndex,
     embedder: &EmbeddingEngine,
     control: &IndexControl,
+    progress: F,
+) -> Result<()>
+where
+    F: FnMut(ProgressUpdate<'_>),
+{
+    update_paths_mode(
+        paths, storage, text_index, embedder, control, false, progress,
+    )
+}
+
+pub fn update_paths_mode<F>(
+    paths: &[PathBuf],
+    storage: &Storage,
+    text_index: &TextIndex,
+    embedder: &EmbeddingEngine,
+    control: &IndexControl,
+    force: bool,
     mut progress: F,
 ) -> Result<()>
 where
     F: FnMut(ProgressUpdate<'_>),
 {
+    storage.set_setting("text_index_dirty", "true")?;
     let started = Instant::now();
     let mut timings = IndexTimings::default();
     let configured_roots = storage.directories()?;
@@ -536,7 +606,8 @@ where
         }
     }
 
-    let files = candidates.into_iter().collect::<Vec<_>>();
+    let mut files = candidates.into_iter().collect::<Vec<_>>();
+    files.sort_by_cached_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX));
     report_progress(&mut progress, 0, files.len(), None, "checking", &timings);
     let mut pending = Vec::with_capacity(EMBEDDING_BATCH_SIZE);
     let mut parse_jobs = Vec::with_capacity(PARSE_BATCH_SIZE);
@@ -569,7 +640,8 @@ where
             if storage
                 .document_by_path(&path_string)?
                 .is_some_and(|existing| {
-                    existing.modified_ms == modified_ms
+                    !force
+                        && existing.modified_ms == modified_ms
                         && existing.size == size
                         && existing
                             .embedding
@@ -674,6 +746,7 @@ where
     text_index.commit()?;
     timings.text_index += commit_started.elapsed();
     storage.set_last_indexed_now()?;
+    storage.set_setting("text_index_dirty", "false")?;
     report_progress(
         &mut progress,
         files.len(),
@@ -758,7 +831,7 @@ fn persist_batch(
     let mut documents = std::mem::take(pending);
     report_progress(progress, processed, total, None, "storage", accumulated);
     let started = Instant::now();
-    let chunks = storage.upsert_documents(&documents)?;
+    let chunks = storage.prepare_index_documents(&documents)?;
     let upsert_elapsed = started.elapsed();
     timings.storage += upsert_elapsed;
     report_progress_with(
@@ -804,6 +877,7 @@ fn persist_batch(
         let current_file = Some(document.path.as_str());
         if semantic_chunks.is_empty() {
             storage.update_document_embeddings(std::slice::from_ref(document))?;
+            storage.complete_file_timing(&document.path)?;
             storage.add_file_timing_stages(
                 &document.path,
                 0,
@@ -869,6 +943,7 @@ fn persist_batch(
                 + ((upsert_elapsed + text_index_elapsed).as_millis() / per_doc_divisor) as u64,
         )?;
         let mut average = vec![0.0; EMBEDDING_DIMENSION];
+        let checkpoint_vectors = storage.checkpoint_vectors(&document.id);
         let mut completed_windows = 0;
         report_window_progress(
             progress,
@@ -891,6 +966,11 @@ fn persist_batch(
             } else {
                 storage.cached_passage_vectors(&batch)?
             };
+            for (slot, index) in vectors.iter_mut().zip(indices) {
+                if slot.is_none() {
+                    *slot = checkpoint_vectors.get(&semantic_chunks[*index].1).cloned();
+                }
+            }
             let lookup_elapsed = started.elapsed();
             let missing = vectors
                 .iter()
@@ -952,11 +1032,13 @@ fn persist_batch(
                 &timings,
                 (completed_windows, inputs.len()),
             );
+            control.embedding_checkpoint(embedding_elapsed)?;
         }
         normalize(&mut average);
         document.embedding = average;
         let started = Instant::now();
         storage.update_document_embeddings(std::slice::from_ref(document))?;
+        storage.complete_file_timing(&document.path)?;
         storage.prune_passage_cache()?;
         let document_storage_elapsed = started.elapsed();
         timings.storage += document_storage_elapsed;
@@ -1101,90 +1183,129 @@ fn flush_parse_jobs(
         "parsing",
         timings,
     );
-    let started = Instant::now();
-    let results = parse_pool().install(|| {
-        jobs.into_par_iter()
-            .map(|job| {
-                let path = job.path;
-                let started = Instant::now();
-                let result = prepare_document(
-                    &path,
-                    &job.root,
-                    job.modified_ms,
-                    job.size,
-                    legacy_office_cache,
-                );
-                (path, job.size, job.check_ms, started.elapsed(), result)
-            })
-            .collect::<Vec<_>>()
-    });
-    timings.parse += started.elapsed();
-    let mut prepared = false;
-    for (job_index, (path, size, check_ms, elapsed, result)) in results.into_iter().enumerate() {
-        control.checkpoint()?;
-        if elapsed >= Duration::from_secs(2) {
-            tracing::info!(
-                path = %path.display(),
-                elapsed_ms = elapsed.as_millis(),
-                "slow document extraction"
-            );
-        }
-        match result {
-            Ok((document, ocr_ms)) => {
-                record_file_timing(
-                    storage,
-                    &path,
-                    document.size,
-                    "indexed",
-                    check_ms,
-                    ocr_ms,
-                    elapsed.as_millis().saturating_sub(ocr_ms as u128) as u64,
-                )?;
-                pending.push(document);
-                prepared = true;
-            }
-            Err(error) => {
-                tracing::warn!(
+    // Bounded prefetch: parsing can proceed while the consumer embeds a file.
+    // At most two parsed results wait in memory; extraction concurrency stays bounded.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+    std::thread::scope(|scope| -> Result<(usize, bool)> {
+        scope.spawn(move || {
+            parse_pool(control.is_everyday()).install(|| {
+                jobs.into_par_iter().for_each_with(sender, |sender, job| {
+                    if control.is_cancel_requested() {
+                        return;
+                    }
+                    let result = (|| -> Result<_> {
+                        let path = job.path;
+                        let started = Instant::now();
+                        let result = if let Some(document) = storage.prepared_checkpoint(
+                            &path.to_string_lossy(),
+                            job.modified_ms,
+                            job.size,
+                        )? {
+                            Ok((document, 0))
+                        } else {
+                            prepare_document(
+                                &path,
+                                &job.root,
+                                job.modified_ms,
+                                job.size,
+                                legacy_office_cache,
+                            )
+                        };
+                        let parse_elapsed = started.elapsed();
+                        let started = Instant::now();
+                        if let Ok((document, _)) = &result {
+                            storage.prepare_index_documents(std::slice::from_ref(document))?;
+                        }
+                        Ok((
+                            path,
+                            job.size,
+                            job.check_ms,
+                            parse_elapsed,
+                            started.elapsed(),
+                            result,
+                        ))
+                    })();
+                    let _ = sender.send(result);
+                });
+            });
+        });
+        let mut prepared = false;
+        for (job_index, result) in receiver.into_iter().enumerate() {
+            let (path, size, check_ms, elapsed, checkpoint_elapsed, result) = result?;
+            timings.parse += elapsed;
+            timings.storage += checkpoint_elapsed;
+            control.checkpoint()?;
+            if elapsed >= Duration::from_secs(2) {
+                tracing::info!(
                     path = %path.display(),
                     elapsed_ms = elapsed.as_millis(),
-                    error = %format_args!("{error:#}"),
-                    "document extraction failed"
+                    "slow document extraction"
                 );
-                let failure = failure_for(&path, &error);
-                let status = if failure.category == "skipped" {
-                    "skipped"
-                } else {
-                    "failed"
-                };
-                storage.record_failure(&failure)?;
-                record_file_timing(
+            }
+            match result {
+                Ok((document, ocr_ms)) => {
+                    record_file_timing(
+                        storage,
+                        &path,
+                        document.size,
+                        "embedding",
+                        check_ms,
+                        ocr_ms,
+                        elapsed.as_millis().saturating_sub(ocr_ms as u128) as u64,
+                    )?;
+                    storage.add_file_timing_stages(
+                        &document.path,
+                        0,
+                        checkpoint_elapsed.as_millis() as u64,
+                        0,
+                        checkpoint_elapsed.as_millis() as u64,
+                    )?;
+                    pending.push(document);
+                    prepared = true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        elapsed_ms = elapsed.as_millis(),
+                        error = %format_args!("{error:#}"),
+                        "document extraction failed"
+                    );
+                    let failure = failure_for(&path, &error);
+                    let status = if failure.category == "skipped" {
+                        "skipped"
+                    } else {
+                        "failed"
+                    };
+                    storage.record_failure(&failure)?;
+                    record_file_timing(
+                        storage,
+                        &path,
+                        size,
+                        status,
+                        check_ms,
+                        0,
+                        elapsed.as_millis() as u64,
+                    )?;
+                }
+            }
+            if pending.len() >= EMBEDDING_BATCH_SIZE {
+                let mut batch = pending.drain(..EMBEDDING_BATCH_SIZE).collect::<Vec<_>>();
+                let persisted = persist_batch(
+                    &mut batch,
                     storage,
-                    &path,
-                    size,
-                    status,
-                    check_ms,
-                    0,
-                    elapsed.as_millis() as u64,
+                    text_index,
+                    embedder,
+                    progress,
+                    control,
+                    processed + job_index + 1,
+                    total,
+                    timings,
                 )?;
+                add_persist_timings(timings, persisted);
             }
         }
-        if pending.len() >= EMBEDDING_BATCH_SIZE {
-            let mut batch = pending.drain(..EMBEDDING_BATCH_SIZE).collect::<Vec<_>>();
-            let persisted = persist_batch(
-                &mut batch,
-                storage,
-                text_index,
-                embedder,
-                progress,
-                control,
-                processed + job_index + 1,
-                total,
-                timings,
-            )?;
-            add_persist_timings(timings, persisted);
-        }
-    }
-    Ok((completed, prepared))
+        Ok((completed, prepared))
+    })
 }
 
 fn report_progress(
@@ -1298,13 +1419,14 @@ fn report_window_progress(
     );
 }
 
-fn parse_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
+fn parse_pool(everyday: bool) -> &'static rayon::ThreadPool {
+    static FULL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    static EVERYDAY: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    (if everyday { &EVERYDAY } else { &FULL }).get_or_init(|| {
         let thread_count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(2)
-            .clamp(1, 4);
+            .clamp(1, if everyday { 2 } else { 4 });
         rayon::ThreadPoolBuilder::new()
             .num_threads(thread_count)
             .thread_name(|index| format!("filesearch-parser-{index}"))
@@ -1369,6 +1491,7 @@ fn prepare_document(
             modified_ms,
             size,
             chunks: split_chunks(&text),
+            locations: crate::extract::take_locations(),
             embedding: Vec::new(),
         },
         ocr_ms,
@@ -1452,10 +1575,20 @@ fn extract_text_in_worker(path: &Path) -> Result<(String, u64)> {
             }
             let text = std::fs::read_to_string(&output)
                 .with_context(|| format!("无法读取文件解析结果: {}", path.display()))?;
-            let ocr_ms = std::fs::read_to_string(&timing_output)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
+            let timing = std::fs::read_to_string(&timing_output).unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&timing).unwrap_or_default();
+            let ocr_ms = value
+                .get("ocr_ms")
+                .and_then(|value| value.as_u64())
+                .or_else(|| timing.trim().parse::<u64>().ok())
                 .unwrap_or_default();
+            crate::extract::set_locations(
+                value
+                    .get("locations")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default(),
+            );
             let _ = std::fs::remove_file(&output);
             let _ = std::fs::remove_file(&error_output);
             let _ = std::fs::remove_file(&timing_output);
@@ -1545,6 +1678,26 @@ pub(crate) fn classify_failure(reason: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_priority_yields_index_work_and_cancellation_unblocks_it() {
+        use std::sync::Arc;
+        let control = Arc::new(IndexControl::default());
+        let guard = control.prioritize_search();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_control = Arc::clone(&control);
+        let worker = std::thread::spawn(move || {
+            sender.send(worker_control.checkpoint().is_ok()).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+        assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        let guard = control.prioritize_search();
+        control.cancel();
+        assert!(is_cancelled(&control.checkpoint().unwrap_err()));
+        drop(guard);
+    }
     use crate::embedding::fallback_embed;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1573,6 +1726,7 @@ mod tests {
     #[test]
     fn semantic_chunks_cover_every_document_position() {
         let document = PreparedDocument {
+            locations: Vec::new(),
             id: "id".to_owned(),
             root: "root".to_owned(),
             name: "长文档.docx".to_owned(),
@@ -1592,6 +1746,7 @@ mod tests {
     #[test]
     fn all_extensions_receive_full_semantic_coverage() {
         let build = |extension: &str| PreparedDocument {
+            locations: Vec::new(),
             id: extension.to_owned(),
             root: "root".to_owned(),
             name: format!("table.{extension}"),
@@ -1636,6 +1791,7 @@ mod tests {
     fn semantic_windows_cover_middle_and_end_without_joining_distant_text() {
         let text = format!("{}中心答案{}结尾", "前".repeat(500), "后".repeat(500));
         let document = PreparedDocument {
+            locations: Vec::new(),
             id: "id".to_owned(),
             root: "root".to_owned(),
             name: "test.txt".to_owned(),
@@ -1661,6 +1817,7 @@ mod tests {
             .map(|index| char::from_u32(0x4e00 + index).unwrap())
             .collect::<String>();
         let document = PreparedDocument {
+            locations: Vec::new(),
             id: "novel".to_owned(),
             root: "/test".to_owned(),
             name: "novel.txt".to_owned(),
@@ -1940,6 +2097,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let document = PreparedDocument {
+            locations: Vec::new(),
             id: stable_id(&document_path),
             root: missing_root.to_string_lossy().into_owned(),
             path: document_path,
@@ -2011,9 +2169,9 @@ mod tests {
         );
         rusqlite::Connection::open(&database)
             .unwrap()
-            .execute(
-                "UPDATE settings SET value='previous-extraction' WHERE key='extraction_profile'",
-                [],
+            .execute_batch(
+                "UPDATE settings SET value='previous-extraction' WHERE key='extraction_profile';
+                 UPDATE prepared_checkpoints SET profile='previous-extraction';",
             )
             .unwrap();
         build();

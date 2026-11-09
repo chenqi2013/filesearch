@@ -1,6 +1,6 @@
 use crate::model::{
-    FileIndexTiming, IndexFailure, IndexedChunk, IndexedDocument, LegacyIndex, PreparedDocument,
-    StoredChunk, StoredDocument,
+    FileIndexTiming, IndexFailure, IndexedChunk, IndexedDocument, LegacyIndex, Page,
+    PreparedDocument, StoredChunk, StoredDocument,
 };
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
@@ -105,6 +105,19 @@ impl Storage {
                UNIQUE(chunk_id, text)
              );
              CREATE INDEX IF NOT EXISTS idx_semantic_passages_document ON semantic_passages(document_id);
+             CREATE TABLE IF NOT EXISTS prepared_checkpoints (
+               document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+               profile TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS source_locations (
+               document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+               locations TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS pending_work (
+               path TEXT PRIMARY KEY,
+               force INTEGER NOT NULL DEFAULT 0,
+               generation INTEGER NOT NULL DEFAULT 1
+             );
              CREATE TABLE IF NOT EXISTS semantic_anchors (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
@@ -194,6 +207,7 @@ impl Storage {
                 .cloned()
                 .unwrap_or_default();
             self.upsert_document(&PreparedDocument {
+                locations: Vec::new(),
                 id: document.id,
                 root,
                 path: document.path,
@@ -466,9 +480,20 @@ impl Storage {
         extension: Option<&str>,
         limit: usize,
     ) -> Vec<(String, f32)> {
+        self.semantic_search_scoped(query, extension, limit, None)
+    }
+
+    pub fn semantic_search_scoped(
+        &self,
+        query: &[f32],
+        extension: Option<&str>,
+        limit: usize,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<(String, f32)> {
         let cache = self.embeddings.read();
         let mut scores = cache
             .par_iter()
+            .filter(|(id, _)| allowed.is_none_or(|ids| ids.contains(*id)))
             .filter(|(_, embedding)| extension.is_none_or(|value| value == embedding.extension))
             .filter_map(|(document_id, embedding)| {
                 let score = crate::embedding::cosine(query, &embedding.vector).max(0.0);
@@ -513,9 +538,31 @@ impl Storage {
         windows_per_document: usize,
         keyword_chunks: &[u64],
     ) -> Vec<SemanticChunkMatch> {
+        self.semantic_passage_matches_scoped(
+            query,
+            confirmation,
+            extension,
+            limit,
+            windows_per_document,
+            keyword_chunks,
+            None,
+        )
+    }
+
+    pub fn semantic_passage_matches_scoped(
+        &self,
+        query: &[f32],
+        confirmation: &[f32],
+        extension: Option<&str>,
+        limit: usize,
+        windows_per_document: usize,
+        keyword_chunks: &[u64],
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<SemanticChunkMatch> {
         let cache = self.chunk_embeddings.read();
         let scores = cache
             .par_iter()
+            .filter(|(_, embedding)| allowed.is_none_or(|ids| ids.contains(&embedding.document_id)))
             .filter(|(_, embedding)| extension.is_none_or(|value| value == embedding.extension))
             .map(|(passage_id, embedding)| {
                 (
@@ -890,18 +937,31 @@ impl Storage {
     }
 
     pub fn failure_page(&self, offset: usize, limit: usize) -> Result<Vec<IndexFailure>> {
+        self.outcome_page(offset, limit, None)
+    }
+
+    pub fn outcome_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        skipped: Option<bool>,
+    ) -> Result<Vec<IndexFailure>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT path, category, reason FROM failures
+             WHERE ? IS NULL OR (category = 'skipped') = ?
              ORDER BY updated_at DESC, path LIMIT ? OFFSET ?",
         )?;
-        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
-            Ok(IndexFailure {
-                path: row.get(0)?,
-                category: row.get(1)?,
-                reason: row.get(2)?,
-            })
-        })?;
+        let rows = statement.query_map(
+            params![skipped, skipped, limit as i64, offset as i64],
+            |row| {
+                Ok(IndexFailure {
+                    path: row.get(0)?,
+                    category: row.get(1)?,
+                    reason: row.get(2)?,
+                })
+            },
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -999,6 +1059,14 @@ impl Storage {
         Ok(())
     }
 
+    pub fn complete_file_timing(&self, path: &str) -> Result<()> {
+        self.connection.lock().execute(
+            "UPDATE file_index_timings SET status = 'indexed' WHERE path = ?",
+            [path],
+        )?;
+        Ok(())
+    }
+
     pub fn clear_failures(&self) -> Result<()> {
         self.connection.lock().execute("DELETE FROM failures", [])?;
         Ok(())
@@ -1055,7 +1123,259 @@ impl Storage {
         self.set_setting("extraction_profile", crate::extract::EXTRACTION_PROFILE)
     }
 
-    fn setting(&self, key: &str) -> Result<Option<String>> {
+    pub fn outcome_count(&self, skipped: bool) -> Result<usize> {
+        Ok(self.connection.lock().query_row(
+            "SELECT COUNT(*) FROM failures WHERE (category = 'skipped') = ?",
+            [skipped],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn remove_failure(&self, path: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .execute("DELETE FROM failures WHERE path = ?", [path])?;
+        Ok(())
+    }
+
+    // A generation prevents a new watcher event from being acknowledged by an older task.
+    pub fn queue_work(&self, paths: &[String], force: bool) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        for path in paths {
+            transaction.execute(
+                "INSERT INTO pending_work(path, force) VALUES (?, ?)
+                 ON CONFLICT(path) DO UPDATE SET force = MAX(force, excluded.force), generation = generation + 1",
+                params![path, force],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_work(&self) -> Result<Vec<(String, bool, i64)>> {
+        let connection = self.connection.lock();
+        let mut statement =
+            connection.prepare("SELECT path, force, generation FROM pending_work ORDER BY path")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn acknowledge_work(&self, work: &[(String, bool, i64)]) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        for (path, _, generation) in work {
+            transaction.execute(
+                "DELETE FROM pending_work WHERE path = ? AND generation = ?",
+                params![path, generation],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn checkpoint_profile() -> String {
+        format!(
+            "{}:{}",
+            crate::embedding::EMBEDDING_PROFILE,
+            crate::extract::EXTRACTION_PROFILE
+        )
+    }
+
+    pub fn checkpoint_matches(&self, document_id: &str) -> Result<bool> {
+        Ok(self.connection.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM prepared_checkpoints WHERE document_id = ? AND profile = ?)",
+            params![document_id, Self::checkpoint_profile()], |row| row.get(0),
+        )?)
+    }
+
+    pub fn prepared_checkpoint(
+        &self,
+        path: &str,
+        modified: u64,
+        size: u64,
+    ) -> Result<Option<PreparedDocument>> {
+        let Some(document) = self.document_by_path(path)? else {
+            return Ok(None);
+        };
+        if document.modified_ms != modified
+            || document.size != size
+            || self.has_embedding(&document.id)
+        {
+            return Ok(None);
+        }
+        let compatible: bool = self.connection.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM prepared_checkpoints WHERE document_id = ? AND profile = ?)",
+            params![document.id, Self::checkpoint_profile()], |row| row.get(0),
+        )?;
+        if !compatible {
+            return Ok(None);
+        }
+        let chunks = self
+            .chunks_for_document(&document.id)?
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>();
+        if chunks.is_empty() {
+            return Ok(None);
+        }
+        let locations = self.source_locations(&document.id)?;
+        Ok(Some(PreparedDocument {
+            id: document.id,
+            root: document.root,
+            path: document.path,
+            name: document.name,
+            extension: document.extension,
+            modified_ms: modified,
+            size,
+            chunks,
+            embedding: Vec::new(),
+            locations,
+        }))
+    }
+
+    pub fn prepare_index_documents(
+        &self,
+        documents: &[PreparedDocument],
+    ) -> Result<Vec<Vec<StoredChunk>>> {
+        let mut result = Vec::with_capacity(documents.len());
+        for document in documents {
+            let reusable = self
+                .prepared_checkpoint(&document.path, document.modified_ms, document.size)?
+                .is_some_and(|previous| {
+                    previous.chunks == document.chunks && previous.name == document.name
+                });
+            let chunks = if reusable {
+                self.chunks_for_document(&document.id)?
+            } else {
+                self.upsert_document(document)?
+            };
+            self.connection.lock().execute(
+                "INSERT OR REPLACE INTO prepared_checkpoints(document_id, profile) VALUES (?, ?)",
+                params![document.id, Self::checkpoint_profile()],
+            )?;
+            self.remove_failure(&document.path)?;
+            self.connection.lock().execute(
+                "INSERT OR REPLACE INTO source_locations(document_id, locations) VALUES (?, ?)",
+                params![document.id, serde_json::to_string(&document.locations)?],
+            )?;
+            result.push(chunks);
+        }
+        Ok(result)
+    }
+
+    pub fn checkpoint_vectors(&self, document_id: &str) -> HashMap<String, Vec<f32>> {
+        self.chunk_embeddings
+            .read()
+            .values()
+            .chain(self.anchor_embeddings.read().values())
+            .filter(|vector| vector.document_id == document_id)
+            .map(|vector| (vector.text.clone(), vector.vector.clone()))
+            .collect()
+    }
+
+    pub fn source_locations(&self, document_id: &str) -> Result<Vec<crate::model::SourceLocation>> {
+        let json = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT locations FROM source_locations WHERE document_id = ?",
+                [document_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(json
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn preview_passages(
+        &self,
+        document_id: &str,
+        query: &str,
+        vector: &[f32],
+    ) -> Result<Vec<crate::model::PreviewPassage>> {
+        let chunks = self.chunks_for_document(document_id)?;
+        let positions = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| (chunk.id, index))
+            .collect::<HashMap<_, _>>();
+        let mut candidates = self
+            .chunk_embeddings
+            .read()
+            .values()
+            .filter(|passage| passage.document_id == document_id)
+            .map(|passage| {
+                (
+                    passage.chunk_id,
+                    passage.text.clone(),
+                    crate::embedding::cosine(vector, &passage.vector),
+                )
+            })
+            .collect::<Vec<_>>();
+        for chunk in &chunks {
+            if !query.is_empty() && chunk.text.to_lowercase().contains(&query.to_lowercase()) {
+                candidates.push((chunk.id, chunk.text.clone(), 1.0));
+            }
+        }
+        candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        let mut selected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, text, score) in candidates {
+            if score < 0.24 || !seen.insert(id) {
+                continue;
+            }
+            if let Some(position) = positions.get(&id) {
+                selected.push(crate::model::PreviewPassage {
+                    position: *position,
+                    text,
+                });
+            }
+            if selected.len() == 3 {
+                break;
+            }
+        }
+        Ok(selected)
+    }
+
+    pub fn document_chunk_page(
+        &self,
+        document_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<IndexedChunk>> {
+        let connection = self.connection.lock();
+        let total: usize = connection.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+            [document_id],
+            |row| row.get(0),
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.document_id, d.name, d.path, c.position, c.text
+             FROM chunks c JOIN documents d ON d.id = c.document_id
+             WHERE c.document_id = ? ORDER BY c.position LIMIT ? OFFSET ?",
+        )?;
+        let rows =
+            statement.query_map(params![document_id, limit as i64, offset as i64], |row| {
+                Ok(IndexedChunk {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    document_name: row.get(2)?,
+                    document_path: row.get(3)?,
+                    position: row.get(4)?,
+                    text: row.get(5)?,
+                })
+            })?;
+        Ok(Page {
+            items: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
         self.connection
             .lock()
             .query_row("SELECT value FROM settings WHERE key = ?", [key], |row| {
@@ -1065,7 +1385,7 @@ impl Storage {
             .map_err(Into::into)
     }
 
-    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.connection.lock().execute(
             "INSERT INTO settings(key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1190,10 +1510,118 @@ mod tests {
     use crate::embedding::{fallback_embed, EMBEDDING_DIMENSION};
 
     #[test]
+    fn durable_work_preserves_new_events_and_forced_retries_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("search.db");
+        let storage = Storage::open(&path).unwrap();
+        storage.queue_work(&["a.txt".into()], false).unwrap();
+        let active = storage.pending_work().unwrap();
+        storage
+            .queue_work(&["a.txt".into(), "b.txt".into()], true)
+            .unwrap();
+        storage.acknowledge_work(&active).unwrap();
+        drop(storage);
+        let storage = Storage::open(&path).unwrap();
+        let work = storage.pending_work().unwrap();
+        assert_eq!(work.len(), 2);
+        assert!(work.iter().all(|(_, force, _)| *force));
+        storage.acknowledge_work(&work).unwrap();
+        assert!(storage.pending_work().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prepared_checkpoints_keep_chunk_ids_and_vectors_but_reject_changed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("search.db");
+        let storage = Storage::open(&path).unwrap();
+        let mut document = PreparedDocument {
+            id: "resume".into(),
+            root: "root".into(),
+            path: "root/a.txt".into(),
+            name: "a.txt".into(),
+            extension: "txt".into(),
+            modified_ms: 10,
+            size: 20,
+            chunks: vec!["first passage".into(), "second passage".into()],
+            embedding: Vec::new(),
+            locations: Vec::new(),
+        };
+        let chunks = storage
+            .prepare_index_documents(std::slice::from_ref(&document))
+            .unwrap();
+        let first_id = chunks[0][0].id;
+        storage
+            .replace_chunk_embeddings(&[(
+                first_id,
+                "first passage".into(),
+                fallback_embed("first passage"),
+            )])
+            .unwrap();
+        // Checkpoint reuse does not depend on the evictable global passage cache.
+        storage
+            .connection
+            .lock()
+            .execute("DELETE FROM passage_vector_cache", [])
+            .unwrap();
+        drop(storage);
+        let storage = Storage::open(&path).unwrap();
+        let restored = storage
+            .prepared_checkpoint(&document.path, 10, 20)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.chunks, document.chunks);
+        let reused = storage.prepare_index_documents(&[restored]).unwrap();
+        assert_eq!(reused[0][0].id, first_id);
+        assert!(storage
+            .checkpoint_vectors("resume")
+            .contains_key("first passage"));
+        assert!(storage
+            .prepared_checkpoint(&document.path, 11, 20)
+            .unwrap()
+            .is_none());
+        document.modified_ms = 11;
+        document.chunks = vec!["new text".into()];
+        let updated = storage.prepare_index_documents(&[document]).unwrap();
+        assert_ne!(updated[0][0].id, first_id);
+        assert!(storage.checkpoint_vectors("resume").is_empty());
+        storage
+            .connection
+            .lock()
+            .execute("UPDATE prepared_checkpoints SET profile = 'old'", [])
+            .unwrap();
+        assert!(storage
+            .prepared_checkpoint("root/a.txt", 11, 20)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn skipped_outcomes_have_separate_counts_and_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&temp.path().join("search.db")).unwrap();
+        for (path, category) in [("empty.txt", "skipped"), ("broken.docx", "corrupt")] {
+            storage
+                .record_failure(&IndexFailure {
+                    path: path.into(),
+                    category: category.into(),
+                    reason: category.into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(storage.outcome_count(true).unwrap(), 1);
+        assert_eq!(storage.outcome_count(false).unwrap(), 1);
+        assert_eq!(
+            storage.outcome_page(0, 10, Some(false)).unwrap()[0].path,
+            "broken.docx"
+        );
+    }
+
+    #[test]
     fn anchors_use_local_evidence_survive_restart_and_follow_document_lifecycle() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("search.db");
         let mut document = PreparedDocument {
+            locations: Vec::new(),
             id: "structured".into(),
             root: "/test".into(),
             path: "/test/source.pdf".into(),
@@ -1356,6 +1784,7 @@ mod tests {
         let path = directory.path().join("search.db");
         let storage = Storage::open(&path).unwrap();
         let mut document = PreparedDocument {
+            locations: Vec::new(),
             id: "first".to_owned(),
             root: "/test".to_owned(),
             path: "/test/first.txt".to_owned(),
@@ -1432,6 +1861,7 @@ mod tests {
         for (id, vector) in [("first", vec![1.0, 0.0]), ("second", vec![0.8, 0.6])] {
             let chunks = storage
                 .upsert_document(&PreparedDocument {
+                    locations: Vec::new(),
                     id: id.to_owned(),
                     root: "/test".to_owned(),
                     path: format!("/test/{id}.txt"),
@@ -1467,6 +1897,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
         let chunks = storage
             .upsert_document(&PreparedDocument {
+                locations: Vec::new(),
                 id: "deep".into(),
                 root: "/test".into(),
                 path: "/test/deep.txt".into(),
@@ -1502,6 +1933,7 @@ mod tests {
         for identity in ["first", "second"] {
             let chunks = storage
                 .upsert_document(&PreparedDocument {
+                    locations: Vec::new(),
                     id: identity.into(),
                     root: "/test".into(),
                     path: format!("/test/{identity}.txt"),
@@ -1551,6 +1983,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
         let chunks = storage
             .upsert_document(&PreparedDocument {
+                locations: Vec::new(),
                 id: "document".into(),
                 root: "/test".into(),
                 path: "/test/document.txt".into(),
@@ -1594,6 +2027,7 @@ mod tests {
         let storage = Storage::open(&path).unwrap();
         let mut documents = (0..4)
             .map(|index| PreparedDocument {
+                locations: Vec::new(),
                 id: format!("doc-{index}"),
                 root: "/inventory".to_owned(),
                 path: format!("/inventory/{index}.txt"),
@@ -1669,6 +2103,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
         storage
             .upsert_document(&PreparedDocument {
+                locations: Vec::new(),
                 id: "invalid".to_owned(),
                 root: "/inventory".to_owned(),
                 path: "/inventory/invalid.txt".to_owned(),
@@ -1693,6 +2128,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
         storage
             .upsert_document(&PreparedDocument {
+                locations: Vec::new(),
                 id: "doc-1".to_owned(),
                 root: "/inventory".to_owned(),
                 path: "/inventory/示例.txt".to_owned(),
@@ -1769,6 +2205,7 @@ mod tests {
             let path = format!("/capacity/{index}.txt");
             storage
                 .upsert_document(&PreparedDocument {
+                    locations: Vec::new(),
                     id: format!("doc-{index}"),
                     root: "/capacity".to_owned(),
                     path: path.clone(),

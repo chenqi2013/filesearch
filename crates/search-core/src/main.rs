@@ -2,6 +2,7 @@
 
 mod embedding;
 mod extract;
+mod index_directory;
 mod indexer;
 mod model;
 mod rwkv;
@@ -135,7 +136,12 @@ async fn main() -> anyhow::Result<()> {
         let result = extract::extract_text_with_timing(input).and_then(|(text, ocr_ms)| {
             std::fs::write(output, text.as_bytes())?;
             if let Some(timing_output) = args.extract_timing_output.as_deref() {
-                std::fs::write(timing_output, ocr_ms.to_string())?;
+                std::fs::write(
+                    timing_output,
+                    serde_json::to_vec(
+                        &json!({"ocr_ms":ocr_ms, "locations":extract::take_locations()}),
+                    )?,
+                )?;
             }
             Ok(())
         });
@@ -153,12 +159,15 @@ async fn main() -> anyhow::Result<()> {
     let migrated = storage.migrate_legacy(&args.data_dir.join("index.json"))?;
     let text_index = Arc::new(TextIndex::open(&args.data_dir.join("tantivy"))?);
     let counts = storage.counts()?;
-    if text_index.document_count() != counts.chunks as u64 {
+    if text_index.document_count() != counts.chunks as u64
+        || storage.setting("text_index_dirty")?.as_deref() == Some("true")
+    {
         tracing::info!(
             sqlite_chunks = counts.chunks,
             "rebuilding Tantivy index from SQLite"
         );
         text_index.rebuild(&storage.list_documents()?, &storage.list_chunks()?)?;
+        storage.set_setting("text_index_dirty", "false")?;
     }
     let model_dir = args.model_dir.unwrap_or_else(|| {
         std::env::current_exe()
@@ -184,22 +193,38 @@ async fn main() -> anyhow::Result<()> {
         watcher: Mutex::new(None),
         watcher_status: RwLock::new("starting".to_owned()),
     });
-    restart_watcher(&state);
+    let everyday = state.storage.setting("resource_mode")?.as_deref() == Some("everyday");
+    state.index_control.set_resource_mode(everyday);
 
-    let directories = state.storage.directories()?;
+    let directories = state
+        .storage
+        .setting("active_full")?
+        .filter(|value| !value.is_empty())
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or(state.storage.directories()?);
     let profile_changed = !state.storage.embedding_profile_matches()?;
     let extraction_profile_changed = !state.storage.extraction_profile_matches()?;
+    let active_full = state
+        .storage
+        .setting("active_full")?
+        .is_some_and(|value| !value.is_empty());
+    let cancelled = state.storage.setting("index_cancelled")?.as_deref() == Some("true");
     if profile_changed {
         state.storage.clear_embeddings()?;
+        state.storage.set_embedding_profile()?;
     }
-    if (migrated
-        || profile_changed
-        || extraction_profile_changed
-        || state.storage.missing_embedding_count()? > 0)
-        && !directories.is_empty()
+    if active_full
+        || (!cancelled
+            && (migrated
+                || profile_changed
+                || extraction_profile_changed
+                || state.storage.missing_embedding_count()? > 0)
+            && !directories.is_empty())
     {
         launch_full_index(Arc::clone(&state), directories);
     }
+    launch_pending_incremental(Arc::clone(&state));
+    restart_watcher(&state);
 
     let app = Router::new()
         .route("/health", get(health))
@@ -211,6 +236,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/index/pause", post(pause_index))
         .route("/index/resume", post(resume_index))
         .route("/index/cancel", post(cancel_index))
+        .route("/index/retry", post(retry_files))
+        .route("/settings/resources", post(set_resources))
+        .route("/document-content", get(document_content))
         .route("/failures", get(failures))
         .route("/file-timings", get(file_timings))
         .layer(
@@ -268,7 +296,16 @@ async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
         .to_owned(),
         document_count: counts.documents,
         chunk_count: counts.chunks,
-        failed_count: counts.failures,
+        failed_count: state.storage.outcome_count(false).unwrap_or(0),
+        skipped_count: state.storage.outcome_count(true).unwrap_or(0),
+        text_ready_count: state.storage.counts().map(|c| c.documents).unwrap_or(0),
+        semantic_pending_count: state.storage.missing_embedding_count().unwrap_or(0),
+        resource_mode: if state.index_control.is_everyday() {
+            "everyday"
+        } else {
+            "full"
+        }
+        .to_owned(),
         processed_files: state.processed.load(Ordering::Relaxed),
         total_files: state.total.load(Ordering::Relaxed),
         current_file: state.current_file.lock().clone(),
@@ -329,19 +366,147 @@ async fn chunks(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct OutcomeRequest {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "outcome_limit")]
+    limit: usize,
+    skipped: Option<bool>,
+}
+fn outcome_limit() -> usize {
+    50
+}
+
+#[derive(serde::Deserialize)]
+struct ContentRequest {
+    document_id: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    query: String,
+}
+
+async fn document_content(
+    State(state): State<SharedState>,
+    Query(request): Query<ContentRequest>,
+) -> Result<Json<model::DocumentContent>, (StatusCode, Json<Value>)> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<model::DocumentContent> {
+        let _priority = state.index_control.prioritize_search();
+        let passages = if request.query.trim().is_empty() {
+            Vec::new()
+        } else {
+            let vector = state.embedder.embed_query(&request.query);
+            state
+                .storage
+                .preview_passages(&request.document_id, &request.query, &vector)?
+        };
+        Ok(model::DocumentContent {
+            chunks: state
+                .storage
+                .document_chunk_page(&request.document_id, request.offset, 30)?,
+            locations: state.storage.source_locations(&request.document_id)?,
+            passages,
+        })
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+struct ResourceRequest {
+    mode: String,
+}
+
+async fn set_resources(
+    State(state): State<SharedState>,
+    Json(request): Json<ResourceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !matches!(request.mode.as_str(), "everyday" | "full") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"未知资源模式"})),
+        ));
+    }
+    state
+        .storage
+        .set_setting("resource_mode", &request.mode)
+        .map_err(internal_error)?;
+    state
+        .index_control
+        .set_resource_mode(request.mode == "everyday");
+    Ok(Json(json!({"mode":request.mode})))
+}
+
+async fn retry_files(
+    State(state): State<SharedState>,
+    Json(request): Json<IndexRequest>,
+) -> Result<Json<IndexAccepted>, (StatusCode, Json<Value>)> {
+    let roots = state.storage.directories().map_err(internal_error)?;
+    let paths = if request.paths.is_empty() {
+        let total = state.storage.outcome_count(false).map_err(internal_error)?;
+        state
+            .storage
+            .outcome_page(0, total, Some(false))
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|failure| failure.path)
+            .collect::<Vec<_>>()
+    } else {
+        request.paths
+    };
+    let paths = paths
+        .into_iter()
+        .filter(|path| {
+            roots
+                .iter()
+                .any(|root| std::path::Path::new(path).starts_with(root))
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(Json(IndexAccepted {
+            accepted: false,
+            message: "没有可重试的文件".into(),
+        }));
+    }
+    state
+        .storage
+        .queue_work(&paths, true)
+        .map_err(internal_error)?;
+    state
+        .storage
+        .set_setting("index_cancelled", "false")
+        .map_err(internal_error)?;
+    launch_pending_incremental(Arc::clone(&state));
+    Ok(Json(IndexAccepted {
+        accepted: true,
+        message: "已加入重试队列".into(),
+    }))
+}
+
 async fn failures(
     State(state): State<SharedState>,
-    Query(request): Query<PageRequest>,
+    Query(request): Query<OutcomeRequest>,
 ) -> Result<Json<Page<IndexFailure>>, (StatusCode, Json<Value>)> {
-    let request = request.bounded();
-    let counts = state.storage.counts().map_err(internal_error)?;
+    let skipped = request.skipped.unwrap_or(false);
+    let request = PageRequest {
+        offset: request.offset,
+        limit: request.limit,
+    }
+    .bounded();
+    let total = state
+        .storage
+        .outcome_count(skipped)
+        .map_err(internal_error)?;
     let items = state
         .storage
-        .failure_page(request.offset, request.limit)
+        .outcome_page(request.offset, request.limit, Some(skipped))
         .map_err(internal_error)?;
     Ok(Json(Page {
         items,
-        total: counts.failures,
+        total,
         offset: request.offset,
         limit: request.limit,
     }))
@@ -369,6 +534,22 @@ async fn search_documents(
     State(state): State<SharedState>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, Json<Value>)> {
+    if request
+        .filters
+        .min_size
+        .zip(request.filters.max_size)
+        .is_some_and(|(min, max)| min > max)
+        || request
+            .filters
+            .modified_after
+            .zip(request.filters.modified_before)
+            .is_some_and(|(from, to)| from > to)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"筛选起始值不能大于结束值"})),
+        ));
+    }
     if request.query.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -377,9 +558,17 @@ async fn search_documents(
     }
     let started = Instant::now();
     let query = request.query.clone();
+    let offset = request.offset;
+    let limit = request.limit.clamp(1, 100);
+    let candidate_limited = state
+        .storage
+        .counts()
+        .map(|counts| counts.chunks > 1_000)
+        .unwrap_or(false);
     let task_state = Arc::clone(&state);
     let results = tokio::task::spawn_blocking(move || {
-        search::search(
+        let _priority = task_state.index_control.prioritize_search();
+        search::search_ranked(
             &task_state.storage,
             &task_state.text_index,
             &task_state.embedder,
@@ -389,9 +578,14 @@ async fn search_documents(
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    let total = results.len();
+    let results = results.into_iter().skip(offset).take(limit).collect();
     Ok(Json(SearchResponse {
         query,
-        total: results.len(),
+        total,
+        offset,
+        limit,
+        candidate_limited,
         elapsed_ms: started.elapsed().as_millis(),
         results,
     }))
@@ -429,6 +623,10 @@ async fn pause_index(
         }));
     }
     state.index_control.pause();
+    state
+        .storage
+        .set_setting("index_paused", "true")
+        .map_err(internal_error)?;
     Ok(Json(IndexAccepted {
         accepted: true,
         message: "索引将在当前批次完成后暂停".to_owned(),
@@ -445,6 +643,10 @@ async fn resume_index(
         }));
     }
     state.index_control.resume();
+    state
+        .storage
+        .set_setting("index_paused", "false")
+        .map_err(internal_error)?;
     Ok(Json(IndexAccepted {
         accepted: true,
         message: "索引已继续".to_owned(),
@@ -460,7 +662,21 @@ async fn cancel_index(
             message: "当前没有正在运行的索引任务".to_owned(),
         }));
     }
+    // Drop the queued work visible at cancellation; later watcher changes get new generations.
+    let work = state.storage.pending_work().map_err(internal_error)?;
+    state
+        .storage
+        .acknowledge_work(&work)
+        .map_err(internal_error)?;
     state.index_control.cancel();
+    state
+        .storage
+        .set_setting("index_cancelled", "true")
+        .map_err(internal_error)?;
+    state
+        .storage
+        .set_setting("index_paused", "false")
+        .map_err(internal_error)?;
     Ok(Json(IndexAccepted {
         accepted: true,
         message: "正在取消索引，已完成批次会保留".to_owned(),
@@ -475,9 +691,32 @@ fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
     {
         return false;
     }
+    if let Err(error) = state
+        .storage
+        .set_setting(
+            "active_full",
+            &serde_json::to_string(&paths).unwrap_or_default(),
+        )
+        .and_then(|_| state.storage.set_directories(&paths))
+    {
+        tracing::error!(%error, "cannot persist full indexing request");
+        state.indexing.store(false, Ordering::SeqCst);
+        return false;
+    }
     state.processed.store(0, Ordering::Relaxed);
+    let _ = state.storage.set_setting("index_cancelled", "false");
     state.total.store(0, Ordering::Relaxed);
     state.index_control.reset();
+    if state
+        .storage
+        .setting("index_paused")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+    {
+        state.index_control.pause();
+    }
     reset_index_timing(&state);
     let runtime = state.runtime.clone();
     runtime.spawn_blocking(move || {
@@ -489,8 +728,18 @@ fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
             &state.index_control,
             |update| update_progress(&state, update),
         );
-        if let Err(error) = result {
-            if indexer::is_cancelled(&error) {
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| indexer::is_cancelled(error))
+        {
+            let _ = state.storage.set_setting("active_full", "");
+        }
+        if result.is_ok() {
+            let _ = state.storage.remove_failure("<index-task>");
+        }
+        if let Err(error) = &result {
+            if indexer::is_cancelled(error) {
                 tracing::info!("index task cancelled; completed batches were retained");
             } else {
                 tracing::error!(%error, "full index task failed");
@@ -501,18 +750,32 @@ fn launch_full_index(state: SharedState, paths: Vec<String>) -> bool {
                 });
             }
         }
-        finish_index_task(&state, true);
+        let cancelled = result
+            .as_ref()
+            .is_err_and(|error| indexer::is_cancelled(error));
+        finish_index_task(&state, true, !cancelled && result.is_ok());
     });
     true
 }
 
 fn queue_incremental(state: SharedState, paths: Vec<PathBuf>) {
+    let durable_paths = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if let Err(error) = state.storage.queue_work(&durable_paths, false) {
+        tracing::error!(%error, "cannot persist watcher updates");
+    }
     state.pending_changes.lock().extend(paths);
     launch_pending_incremental(state);
 }
 
 fn launch_pending_incremental(state: SharedState) {
-    if state.pending_changes.lock().is_empty()
+    if state
+        .storage
+        .pending_work()
+        .map(|work| work.is_empty())
+        .unwrap_or(true)
         || state
             .indexing
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -522,39 +785,65 @@ fn launch_pending_incremental(state: SharedState) {
     }
     reset_index_timing(&state);
     state.index_control.reset();
+    if state
+        .storage
+        .setting("index_paused")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+    {
+        state.index_control.pause();
+    }
     let runtime = state.runtime.clone();
     runtime.spawn_blocking(move || {
+        let mut run_pending = true;
         loop {
-            let paths = state.pending_changes.lock().drain().collect::<Vec<_>>();
-            if paths.is_empty() {
+            state.pending_changes.lock().clear();
+            let work = match state.storage.pending_work() { Ok(work) => work, Err(error) => { tracing::error!(%error, "cannot load pending index work"); break; } };
+            if work.is_empty() {
                 break;
             }
-            if let Err(error) = indexer::update_paths(
+            let force = work[0].1;
+            let work = work.into_iter().filter(|(_, selected, _)| *selected == force).collect::<Vec<_>>();
+            let paths = work.iter().map(|(path, _, _)| PathBuf::from(path)).collect::<Vec<_>>();
+            let result = indexer::update_paths_mode(
                 &paths,
                 &state.storage,
                 &state.text_index,
                 &state.embedder,
                 &state.index_control,
+                force,
                 |update| update_progress(&state, update),
-            ) {
-                tracing::error!(%error, "incremental index task failed");
+            );
+            match result {
+                Ok(()) => { let _ = state.storage.acknowledge_work(&work); }
+                Err(error) => {
+                    if indexer::is_cancelled(&error) { let _ = state.storage.acknowledge_work(&work); }
+                    else { tracing::error!(%error, "incremental index task failed; durable work retained for next start"); }
+                    run_pending = false;
+                    break;
+                }
             }
         }
-        finish_index_task(&state, false);
+        finish_index_task(&state, false, run_pending);
     });
 }
 
-fn finish_index_task(state: &SharedState, refresh_watcher: bool) {
+fn finish_index_task(state: &SharedState, refresh_watcher: bool, run_pending: bool) {
     finish_index_timing(state);
-    state
-        .processed
-        .store(state.total.load(Ordering::Relaxed), Ordering::Relaxed);
     *state.current_file.lock() = None;
     state.indexing.store(false, Ordering::SeqCst);
     if refresh_watcher || state.watcher_refresh_pending.swap(false, Ordering::SeqCst) {
         restart_watcher(state);
     }
-    if !state.pending_changes.lock().is_empty() {
+    if run_pending
+        && state
+            .storage
+            .pending_work()
+            .map(|work| !work.is_empty())
+            .unwrap_or(false)
+    {
         launch_pending_incremental(Arc::clone(state));
     }
 }

@@ -173,6 +173,7 @@ mod tests {
     #[test]
     fn anchors_are_bounded_and_keep_their_source_chunk() {
         let document = PreparedDocument {
+            locations: Vec::new(),
             id: "test".into(),
             root: "/test".into(),
             path: "/test/test.txt".into(),
@@ -196,6 +197,7 @@ mod tests {
     #[test]
     fn incomplete_chunk_edges_and_ambiguous_short_headings_are_not_anchors() {
         let document = PreparedDocument {
+            locations: Vec::new(),
             id: "test".into(),
             root: "/test".into(),
             path: "/test/test.pdf".into(),

@@ -159,7 +159,7 @@ def main():
         assert baseline["before"] == report["before"], "Comparison requires the same document/vector snapshot"
         previous = {(row["query"], row["mode"]): row for row in baseline["searches"]}
         comparison = dict(positive_targets_lost=[], positive_targets_gained=[],
-                          negative_documents_added=[], negative_documents_removed=[], keyword_rankings_changed=[])
+                          negative_documents_added=[], negative_documents_removed=[], keyword_rankings_changed=[], keyword_scores_changed=[])
         for row in report["searches"]:
             before_row = previous[(row["query"], row["mode"])]
             if row["kind"] in ("new_positive", "controls"):
@@ -174,9 +174,11 @@ def main():
                                      ("negative_documents_removed", prior - current)):
                     comparison[label].extend(dict(query=row["query"], mode=row["mode"], name=name) for name in sorted(names))
             if row["mode"] == "keyword":
-                ranking = lambda item: [(hit["name"], hit["score"]) for hit in item["results"]]
+                ranking = lambda item: [hit["name"] for hit in item["results"]]
                 if ranking(before_row) != ranking(row):
                     comparison["keyword_rankings_changed"].append(row["query"])
+                if [hit["score"] for hit in before_row["results"]] != [hit["score"] for hit in row["results"]]:
+                    comparison["keyword_scores_changed"].append(row["query"])
         report["comparison"] = comparison
     (output / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = ["# 独立换词／口语查询测试明细", "", "本报告仅评估固定样本，不代表通用准确率。目标文件命中不等于准确定位答案段落。", "",

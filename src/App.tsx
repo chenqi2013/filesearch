@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { coreApi, CoreRequestError } from "./api";
 import { getMessages, type Locale } from "./i18n";
+import { DocumentPreview, SearchFilterPanel, featureMessages, downloadJson } from "./features";
 import type {
   IndexFailure,
   IndexedChunk,
@@ -43,14 +44,15 @@ import type {
   SearchResult,
   ServiceStats,
   ServiceDiagnostics,
+  SearchFilters,
 } from "./types";
 
-type InventoryKind = "documents" | "chunks" | "failures";
+type InventoryKind = "documents" | "chunks" | "failures" | "skipped";
 type ServiceIssue = { kind: string; message: string; time: number; path?: string; file?: string; stage?: string };
 type InventoryState =
   | { kind: "documents"; page: Page<IndexedDocument> }
   | { kind: "chunks"; page: Page<IndexedChunk> }
-  | { kind: "failures"; page: Page<IndexFailure> };
+  | { kind: "failures" | "skipped"; page: Page<IndexFailure> };
 
 const EMPTY_STATS: ServiceStats = {
   status: "ready",
@@ -72,6 +74,7 @@ const MAX_SIDEBAR_WIDTH = 420;
 function App() {
   const [locale, setLocale] = useState<Locale>("zh");
   const t = getMessages(locale);
+  const f = featureMessages(locale);
   const [stats, setStats] = useState<ServiceStats>(EMPTY_STATS);
   const [connected, setConnected] = useState(false);
   const [serviceDiagnostics, setServiceDiagnostics] = useState<ServiceDiagnostics | null>(null);
@@ -82,6 +85,9 @@ function App() {
   const [submittedQuery, setSubmittedQuery] = useState("");
   const [mode, setMode] = useState<SearchMode>("hybrid");
   const [extension, setExtension] = useState("");
+  const [searchFilters, setSearchFilters] = useState<SearchFilters>({});
+  const [preview, setPreview] = useState<SearchResult | null>(null);
+  const [retryingFiles, setRetryingFiles] = useState(false);
   const [response, setResponse] = useState<SearchResponse | null>(null);
   const [selected, setSelected] = useState<SearchResult | null>(null);
   const [searching, setSearching] = useState(false);
@@ -291,6 +297,34 @@ function App() {
     }
   };
 
+  const retryFiles = async (paths: string[]) => {
+    if (retryingFiles) return;
+    setRetryingFiles(true);
+    try { const result = await coreApi.retryFiles(paths); setNotice(result.message); await refreshStats(); }
+    catch (error) { setNotice(`${t.error}: ${String(error)}`); }
+    finally { setRetryingFiles(false); }
+  };
+
+  const changeResources = async (mode: "everyday" | "full") => {
+    try { await coreApi.setResources(mode); await refreshStats(); }
+    catch (error) { setNotice(`${t.error}: ${String(error)}`); }
+  };
+
+  const exportDiagnostics = async () => {
+    try {
+      const [timings, failures, skipped, currentStats, diagnostics] = await Promise.all([
+        collectPages(coreApi.fileTimings), collectPages(coreApi.failures), collectPages((offset, limit) => coreApi.failures(offset, limit, true)),
+        coreApi.stats().catch(() => stats),
+        isTauri() ? invoke<ServiceDiagnostics>("search_core_diagnostics", { context: null }) : Promise.resolve(null),
+      ]);
+      downloadJson(`filesearch-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.json`, { exported_at: new Date().toISOString(), stats: currentStats, timings, failures, skipped, diagnostics, request: serviceIssue });
+    } catch (error) {
+      // Keep the supervisor log export usable even when the HTTP service is down.
+      const diagnostics = isTauri() ? await invoke<ServiceDiagnostics>("search_core_diagnostics", { context: null }).catch(() => serviceDiagnostics) : serviceDiagnostics;
+      downloadJson("filesearch-diagnostics.json", { stats, diagnostics, request: serviceIssue, export_error: String(error) });
+    }
+  };
+
   const addFolder = async () => {
     if (!isTauri()) {
       setNotice("请在 Tauri 桌面应用中选择目录");
@@ -302,11 +336,11 @@ function App() {
     }
   };
 
-  const runSearch = useCallback(async (searchQuery: string, searchMode: SearchMode, searchExtension: string, updateSubmittedQuery: boolean) => {
+  const runSearch = useCallback(async (searchQuery: string, searchMode: SearchMode, searchExtension: string, updateSubmittedQuery: boolean, offset = 0) => {
     const requestId = ++searchRequestId.current;
     setSearching(true);
     try {
-      const result = await coreApi.search(searchQuery, searchMode, searchExtension);
+      const result = await coreApi.search(searchQuery, searchMode, searchExtension, searchFilters, offset);
       if (requestId !== searchRequestId.current) return;
       setResponse(result);
       if (updateSubmittedQuery) setSubmittedQuery(searchQuery);
@@ -319,7 +353,7 @@ function App() {
     } finally {
       if (requestId === searchRequestId.current) setSearching(false);
     }
-  }, [recordServiceFailure, t.error]);
+  }, [recordServiceFailure, t.error, searchFilters]);
 
   const submitSearch = async (event: FormEvent) => {
     event.preventDefault();
@@ -348,7 +382,7 @@ function App() {
       } else if (kind === "chunks") {
         setInventory({ kind, page: await coreApi.chunks(offset) });
       } else {
-        setInventory({ kind, page: await coreApi.failures(offset) });
+        setInventory({ kind, page: await coreApi.failures(offset, 50, kind === "skipped") });
       }
     } catch (error) {
       if (error instanceof CoreRequestError && error.kind !== "http") await recordServiceFailure(error);
@@ -369,6 +403,18 @@ function App() {
       setTimingLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!inventory || (inventory.kind !== "failures" && inventory.kind !== "skipped")) return;
+    let active = true;
+    const kind = inventory.kind;
+    const total = kind === "skipped" ? stats.skipped_count ?? 0 : stats.failed_count;
+    const offset = Math.min(inventory.page.offset, Math.max(0, Math.ceil(total / 50) - 1) * 50);
+    void coreApi.failures(offset, 50, kind === "skipped")
+      .then(page => { if (active) setInventory({ kind, page }); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [inventory?.kind, inventory?.page.offset, stats.failed_count, stats.skipped_count, stats.status]);
 
   const exportTimingReport = async () => {
     try {
@@ -485,6 +531,7 @@ function App() {
             {sidebarHidden ? <PanelLeftOpen /> : <PanelLeftClose />}
           </button>
           {isTauri() && <button className="icon-button" title={t.background} aria-label={t.background} onClick={() => void hideToBackground()}><Minimize2 /></button>}
+          <button className="icon-button" title={f.diagnostics} aria-label={f.diagnostics} onClick={() => { setServiceDetailsOpen(true); void inspectService(); }}><Cpu /></button>
         </div>
         <form className="searchbox" onSubmit={submitSearch}>
           <Search aria-hidden="true" />
@@ -612,7 +659,9 @@ function App() {
               <button onClick={() => void showInventory("documents")}><strong>{stats.document_count}</strong>{t.documents}</button>
               <button onClick={() => void showInventory("chunks")}><strong>{stats.chunk_count}</strong>{t.chunks}</button>
               <button onClick={() => void showInventory("failures")}><strong>{stats.failed_count}</strong>{t.failures}</button>
+              <button onClick={() => void showInventory("skipped")}><strong>{stats.skipped_count ?? 0}</strong>{f.skipped}</button>
             </div>
+            {!indexDetailsCollapsed && <div className="resource-settings"><label>{f.resources}<select value={stats.resource_mode ?? "full"} disabled={!connected} onChange={e => void changeResources(e.target.value as "everyday" | "full")}><option value="everyday">{f.everyday}</option><option value="full">{f.full}</option></select></label><small>{f.textReady}: {stats.text_ready_count ?? stats.document_count} · {f.pending}: {stats.semantic_pending_count ?? 0}</small></div>}
             {!indexDetailsCollapsed && <div className="index-actions">
               <span><Clock3 />{stats.last_indexed ? formatDate(stats.last_indexed, locale) : t.never}</span>
               <div className="index-action-buttons">
@@ -624,6 +673,7 @@ function App() {
               </div>
             </div>}
           </div>
+
         </aside>}
         {!sidebarHidden && (
           <div
@@ -659,6 +709,8 @@ function App() {
             </div>
           </div>
 
+          <SearchFilterPanel locale={locale} directories={stats.directories} onApply={setSearchFilters} />
+          {response?.candidate_limited && <p className="candidate-hint">{f.candidateHint}</p>}
           {!response ? (
             <EmptyState hasFolders={stats.directories.length > 0} title={stats.directories.length ? t.searchTitle : t.startTitle} action={stats.directories.length ? t.searchAction : t.startAction} onAdd={addFolder} />
           ) : response.results.length === 0 ? (
@@ -670,7 +722,7 @@ function App() {
                   <button className={`result-card ${selected?.id === result.id ? "selected" : ""}`} key={result.id} onClick={() => setSelected(result)}>
                     <FileBadge extension={result.extension} />
                     <span className="result-body">
-                      <span className="result-title"><strong><Highlight text={result.name} query={submittedQuery} /></strong><em>{Math.round(result.score * 100)}%</em></span>
+                      <span className="result-title"><strong><Highlight text={result.name} query={submittedQuery} /></strong><em title={f.scoreHint}>{f.relevance} {result.score.toFixed(2)}</em></span>
                       <span className="result-path">{result.path}</span>
                       <span className="snippet"><Highlight text={result.snippet} query={submittedQuery} /></span>
                       <span className="result-meta">{formatBytes(result.size)} · {formatTimestamp(result.modified_ms, locale)}{Boolean(result.duplicates?.length) && <span className="duplicate-count">{t.duplicateCount(result.duplicates!.length)}</span>}</span>
@@ -678,13 +730,15 @@ function App() {
                   </button>
                 ))}
               </section>
-              {selected && <DetailPanel result={selected} t={t} locale={locale} onClose={() => setSelected(null)} onOpen={openPath} />}
+              {selected && <DetailPanel result={selected} t={t} locale={locale} onClose={() => setSelected(null)} onOpen={openPath} onPreview={() => setPreview(selected)} onReparse={() => void retryFiles([selected.path])} />}
             </div>
           )}
+          {response && response.total > response.limit && <div className="search-pagination"><button className="icon-button" title={t.previous} disabled={searching || response.offset === 0} onClick={() => void runSearch(submittedQuery, mode, extension, false, Math.max(0, response.offset - response.limit))}><ChevronLeft /></button><select aria-label={f.page} value={Math.floor(response.offset / response.limit)} disabled={searching} onChange={e => void runSearch(submittedQuery, mode, extension, false, Number(e.target.value) * response.limit)}>{Array.from({ length: Math.ceil(response.total / response.limit) }, (_, index) => <option key={index} value={index}>{t.pageNumber(index + 1, Math.ceil(response.total / response.limit))}</option>)}</select><button className="icon-button" title={t.next} disabled={searching || response.offset + response.limit >= response.total} onClick={() => void runSearch(submittedQuery, mode, extension, false, response.offset + response.limit)}><ChevronRight /></button></div>}
         </main>
       </div>
 
-      {inventory && <InventoryModal inventory={inventory} loading={inventoryLoading} t={t} locale={locale} onClose={() => setInventory(null)} onPage={(offset) => void showInventory(inventory.kind, offset)} onOpen={openPath} />}
+      {inventory && <InventoryModal inventory={inventory} loading={inventoryLoading} t={t} locale={locale} onClose={() => setInventory(null)} onPage={(offset) => void showInventory(inventory.kind, offset)} onOpen={openPath} retrying={retryingFiles} onRetry={paths => void retryFiles(paths)} />}
+      {preview && <DocumentPreview key={preview.id} result={preview} query={submittedQuery} locale={locale} onClose={() => setPreview(null)} onOpen={openPath} />}
       {timingReport && <FileTimingModal page={timingReport} loading={timingLoading} t={t} onClose={() => setTimingReport(null)} onPage={(offset) => void showTimingReport(offset)} onOpen={openPath} onExport={() => void exportTimingReport()} />}
       {serviceDetailsOpen && (
         <div className="modal-backdrop" onMouseDown={() => setServiceDetailsOpen(false)}>
@@ -706,6 +760,7 @@ function App() {
               <p className="muted">{t.backgroundHint}</p>
             </div>
             <footer>
+              <button className="secondary-button" onClick={() => void exportDiagnostics()}><Download />{f.export}</button>
               <button className="secondary-button" onClick={() => void copyServiceDetails()}>{t.serviceCopy}</button>
               {isTauri() && <button className="secondary-button" onClick={() => void openServiceLogs()}>{t.serviceLogs}</button>}
               <button className="primary-button" disabled={serviceRetrying} onClick={() => void retryService()}>{t.serviceReconnect}</button>
@@ -797,7 +852,7 @@ function FileTimingModal({ page, loading, t, onClose, onPage, onOpen, onExport }
 }) {
   const totalPages = Math.max(1, Math.ceil(page.total / page.limit));
   const currentPage = Math.min(totalPages, Math.floor(page.offset / page.limit) + 1);
-  const statusLabel = (status: FileIndexTiming["status"]) => status === "failed" ? t.timingFailed : status === "skipped" ? t.timingSkipped : t.timingIndexed;
+  const statusLabel = (status: FileIndexTiming["status"]) => status === "embedding" ? t.stageEmbedding : status === "failed" ? t.timingFailed : status === "skipped" ? t.timingSkipped : t.timingIndexed;
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section className="modal timing-modal" onMouseDown={(event) => event.stopPropagation()}>
@@ -853,6 +908,8 @@ function InventoryModal({
   onClose,
   onPage,
   onOpen,
+  retrying,
+  onRetry,
 }: {
   inventory: InventoryState;
   loading: boolean;
@@ -861,9 +918,12 @@ function InventoryModal({
   onClose: () => void;
   onPage: (offset: number) => void;
   onOpen: (path: string) => void;
+  retrying: boolean;
+  onRetry: (paths: string[]) => void;
 }) {
+  const f = featureMessages(locale);
   const { page } = inventory;
-  const title = inventory.kind === "documents" ? t.indexedDocuments : inventory.kind === "chunks" ? t.indexedChunks : t.failedFiles;
+  const title = inventory.kind === "documents" ? t.indexedDocuments : inventory.kind === "chunks" ? t.indexedChunks : inventory.kind === "skipped" ? f.skipped : t.failedFiles;
   const emptyText = inventory.kind === "documents" ? t.noDocuments : inventory.kind === "chunks" ? t.noChunks : t.noFailures;
   const start = page.total === 0 ? 0 : page.offset + 1;
   const end = Math.min(page.offset + page.items.length, page.total);
@@ -872,11 +932,12 @@ function InventoryModal({
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <section className="modal inventory-modal" onMouseDown={(event) => event.stopPropagation()}>
+      <section className="modal inventory-modal" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
         <header>
           <div>{inventory.kind === "failures" ? <AlertTriangle /> : <FileSearch />}<h2>{title}</h2></div>
           <button className="icon-button" onClick={onClose} title={t.close}><X /></button>
         </header>
+        {inventory.kind === "failures" && <div className="retry-actions"><button className="secondary-button" disabled={retrying || !page.total} onClick={() => onRetry([])}>{f.retryAll}</button><button className="secondary-button" disabled={retrying || !page.items.length} onClick={() => onRetry(inventory.page.items.map(item => item.path))}>{f.retryPage}</button></div>}
         <div className={`inventory-list ${loading ? "loading" : ""}`}>
           {page.items.length === 0 && <p className="muted inventory-empty">{emptyText}</p>}
           {inventory.kind === "documents" && inventory.page.items.map((document) => (
@@ -901,22 +962,19 @@ function InventoryModal({
               <ExternalLink />
             </button>
           ))}
-          {inventory.kind === "failures" && inventory.page.items.map((failure) => (
-            <button
-              type="button"
+          {(inventory.kind === "failures" || inventory.kind === "skipped") && inventory.page.items.map((failure) => (
+            <div
               className={`inventory-item failure-item${failure.category === "skipped" ? " skipped-item" : ""}`}
               key={failure.path}
-              title={`${t.open}: ${failure.path}`}
-              onClick={() => onOpen(failure.path)}
             >
               <AlertTriangle />
               <span className="inventory-body">
-                <strong>{failure.path}</strong>
+                <button className="failure-open" title={`${t.open}: ${failure.path}`} onClick={() => onOpen(failure.path)}>{failure.path}</button>
                 <small className="failure-category">{failure.category === "skipped" ? t.timingSkipped : failure.category}</small>
                 <p>{failure.reason}</p>
               </span>
-              <ExternalLink />
-            </button>
+              <div className="failure-actions"><button className="icon-button" title={t.open} onClick={() => onOpen(failure.path)}><ExternalLink /></button>{inventory.kind === "failures" && <button className="secondary-button" disabled={retrying} onClick={() => onRetry([failure.path])}>{f.retry}</button>}</div>
+            </div>
           ))}
         </div>
         <footer className="inventory-footer">
@@ -949,13 +1007,16 @@ function EmptyState({ hasFolders, title, action, onAdd }: { hasFolders: boolean;
   return <div className="empty-state"><div className="empty-icon">{hasFolders ? <Search /> : <FolderOpen />}</div><h2>{title}</h2><p>{action}</p>{!hasFolders && <button className="primary-button" onClick={onAdd}><Plus />{action}</button>}</div>;
 }
 
-function DetailPanel({ result, t, locale, onClose, onOpen }: { result: SearchResult; t: ReturnType<typeof getMessages>; locale: Locale; onClose: () => void; onOpen: (path: string, reveal?: boolean) => void }) {
+function DetailPanel({ result, t, locale, onClose, onOpen, onPreview, onReparse }: { result: SearchResult; t: ReturnType<typeof getMessages>; locale: Locale; onClose: () => void; onOpen: (path: string, reveal?: boolean) => void; onPreview: () => void; onReparse: () => void }) {
+  const f = featureMessages(locale);
   return <aside className="detail-panel">
     <header><span>{t.details}</span><button className="icon-button" onClick={onClose} title={t.close}><X /></button></header>
     <FileBadge extension={result.extension} large />
     <h2>{result.name}</h2><p className="detail-path">{result.path}</p>
-    <dl><div><dt>{t.modified}</dt><dd>{formatTimestamp(result.modified_ms, locale)}</dd></div><div><dt>{t.size}</dt><dd>{formatBytes(result.size)}</dd></div><div><dt>{t.relevance}</dt><dd>{Math.round(result.score * 100)}%</dd></div></dl>
+    <dl><div><dt>{t.modified}</dt><dd>{formatTimestamp(result.modified_ms, locale)}</dd></div><div><dt>{t.size}</dt><dd>{formatBytes(result.size)}</dd></div><div title={f.scoreHint}><dt>{f.relevance}</dt><dd>{result.score.toFixed(2)}</dd></div></dl>
     <div className="detail-actions">
+      <button className="secondary-button" onClick={onPreview}><FileSearch />{f.preview}</button>
+      <button className="secondary-button" onClick={onReparse}><RefreshCw />{f.reparse}</button>
       <button className="primary-button" onClick={() => void onOpen(result.path)}><ExternalLink />{t.open}</button>
       <button className="secondary-button" onClick={() => void onOpen(result.path, true)}><FolderOpen />{t.reveal}</button>
     </div>
@@ -982,6 +1043,15 @@ function Highlight({ text, query }: { text: string; query: string }) {
 }
 
 const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+async function collectPages<T>(load: (offset: number, limit: number) => Promise<Page<T>>): Promise<T[]> {
+  const items: T[] = [];
+  for (let offset = 0; ; offset += 100) {
+    const page = await load(offset, 100);
+    items.push(...page.items);
+    if (!page.items.length || offset + page.items.length >= page.total) return items;
+  }
+}
+
 const isOfficeDependencyFailure = (failure: IndexFailure) => failure.category === "dependency"
   || failure.reason.includes("旧版 Office 转换环境不可用");
 const formatBytes = (size: number) => size < 1024 ? `${size} B` : size < 1024 ** 2 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 ** 2).toFixed(1)} MB`;

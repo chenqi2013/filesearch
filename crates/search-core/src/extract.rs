@@ -1,3 +1,4 @@
+use crate::model::SourceLocation;
 use anyhow::{anyhow, Context, Result};
 use encoding_rs::{GB18030, UTF_16BE, UTF_16LE};
 use quick_xml::events::Event;
@@ -9,6 +10,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
+thread_local! {
+    static SOURCE_PAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SOURCE_LOCATIONS: std::cell::RefCell<Vec<SourceLocation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+pub fn take_locations() -> Vec<SourceLocation> {
+    SOURCE_LOCATIONS.with(|value| std::mem::take(&mut *value.borrow_mut()))
+}
+pub fn set_locations(locations: Vec<SourceLocation>) {
+    SOURCE_LOCATIONS.with(|value| *value.borrow_mut() = locations);
+}
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json", "log", "rst",
@@ -42,6 +53,8 @@ pub fn extract_text(path: &Path) -> Result<String> {
 }
 
 pub fn extract_text_with_timing(path: &Path) -> Result<(String, u64)> {
+    SOURCE_PAGES.with(|value| value.borrow_mut().clear());
+    set_locations(Vec::new());
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -110,6 +123,49 @@ pub fn extract_text_with_timing(path: &Path) -> Result<(String, u64)> {
             return Err(anyhow!(EMPTY_DOCUMENT_REASON));
         }
         return Err(anyhow!("未提取到可索引文本"));
+    }
+    if extension == "pdf" {
+        let mut cursor = 0;
+        let mut locations = Vec::new();
+        SOURCE_PAGES.with(|pages| {
+            for (index, page) in pages.borrow().iter().enumerate() {
+                let page = normalize_text(&normalize_pdf_spacing(page));
+                if page.is_empty() {
+                    continue;
+                }
+                if let Some(relative) = normalized[cursor..].find(&page) {
+                    let start = cursor + relative;
+                    let end = start + page.len();
+                    locations.push(SourceLocation {
+                        start: normalized[..start].chars().count(),
+                        end: normalized[..end].chars().count(),
+                        label: format!("PDF 第 {} 页", index + 1),
+                        page: Some(index as u32 + 1),
+                    });
+                    cursor = end;
+                }
+            }
+        });
+        set_locations(locations);
+    } else if matches!(extension.as_str(), "xlsx" | "xls") {
+        let mut offset = 0;
+        let mut locations = Vec::new();
+        for line in normalized.lines() {
+            if let Some(label) = line
+                .split(" | ")
+                .next()
+                .filter(|label| label.starts_with("工作表 ") && label.contains(" 行"))
+            {
+                locations.push(SourceLocation {
+                    start: offset,
+                    end: offset + line.chars().count(),
+                    label: label.to_owned(),
+                    page: None,
+                });
+            }
+            offset += line.chars().count() + 1;
+        }
+        set_locations(locations);
     }
     Ok((normalized, ocr_ms))
 }
@@ -406,7 +462,22 @@ fn command_failure(output: &Output) -> String {
 }
 
 fn extract_pdf_text_with_timing(path: &Path) -> Result<(String, u64)> {
-    match catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text(path))) {
+    match catch_unwind(AssertUnwindSafe(|| -> Result<String> {
+        let doc = lopdf::Document::load(path)?;
+        let mut pages = Vec::new();
+        for page in doc.get_pages().keys() {
+            let mut text = String::new();
+            pdf_extract::output_doc_page(
+                &doc,
+                &mut pdf_extract::PlainTextOutput::new(&mut text),
+                *page,
+            )?;
+            pages.push(text);
+        }
+        let text = pages.join("\n\n");
+        SOURCE_PAGES.with(|value| *value.borrow_mut() = pages);
+        Ok(text)
+    })) {
         Ok(Ok(text)) => Ok((text, 0)),
         Ok(Err(error)) => {
             let started = std::time::Instant::now();
@@ -472,6 +543,7 @@ fn extract_pdf_ocr(path: &Path) -> Result<String> {
     let page_count = document.PageCount()?;
     let mut output = String::new();
 
+    let mut source_pages = Vec::new();
     for page_index in 0..page_count {
         let page = document.GetPage(page_index)?;
         let page_size = page.Size()?;
@@ -498,6 +570,7 @@ fn extract_pdf_ocr(path: &Path) -> Result<String> {
                 page_text = candidate;
             }
         }
+        source_pages.push(page_text.clone());
         if !page_text.trim().is_empty() {
             if !output.is_empty() {
                 output.push_str("\n\n");
@@ -506,6 +579,7 @@ fn extract_pdf_ocr(path: &Path) -> Result<String> {
         }
     }
 
+    SOURCE_PAGES.with(|value| *value.borrow_mut() = source_pages);
     if output.is_empty() {
         return Err(anyhow!("Windows OCR 未识别到可索引文本"));
     }
@@ -997,6 +1071,44 @@ fn normalize_pdf_spacing(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_text_locations_keep_page_numbers_without_polluting_embedding_text() {
+        use lopdf::{dictionary, Document, Object, Stream};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pages.pdf");
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" },
+        );
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+        let mut kids = Vec::new();
+        for text in ["First page reference", "Second page reference"] {
+            let content = doc.add_object(Stream::new(
+                dictionary! {},
+                format!("BT /F1 12 Tf 50 750 Td ({text}) Tj ET").into_bytes(),
+            ));
+            let page = doc.add_object(
+                dictionary! { "Type" => "Page", "Parent" => pages_id, "Contents" => content },
+            );
+            kids.push(Object::Reference(page));
+        }
+        doc.objects.insert(pages_id, dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2, "Resources" => resources, "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()] }.into());
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        doc.save(&path).unwrap();
+        let (text, _) = extract_text_with_timing(&path).unwrap();
+        let locations = take_locations();
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[1].page, Some(2));
+        let chars = text.chars().collect::<Vec<_>>();
+        assert!(chars[locations[1].start..locations[1].end]
+            .iter()
+            .collect::<String>()
+            .contains("Second page"));
+        assert!(!text.contains("PDF 第"));
+    }
     use std::io::Write;
 
     #[test]

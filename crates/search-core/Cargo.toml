@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 encoding_rs = "0.8"
 fastembed = { git = "https://github.com/Anush008/fastembed-rs.git", tag = "v5.7.0", default-features = false, features = ["ort-load-dynamic"] }
 libloading = "0.8"
+lopdf = { version = "0.36", default-features = false }
 notify = "6.1.1"
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda", "load-dynamic", "ndarray"] }
 parking_lot = "0.12"

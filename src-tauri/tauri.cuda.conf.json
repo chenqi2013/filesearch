@@ -1,0 +1,15 @@
+{
+  "build": {
+    "beforeBuildCommand": "pnpm prepare:sidecar:cuda && pnpm build",
+    "beforeDevCommand": "node scripts/prepare-sidecar.mjs debug --cuda && pnpm dev"
+  },
+  "bundle": {
+    "resources": {
+      "binaries/onnxruntime-cuda.dll": "onnxruntime-cuda.dll",
+      "binaries/onnxruntime_providers_cuda.dll": "onnxruntime_providers_cuda.dll",
+      "binaries/onnxruntime_providers_shared.dll": "onnxruntime_providers_shared.dll",
+      "binaries/cuda-runtime": "cuda-runtime",
+      "binaries/cudnn-runtime": "cudnn-runtime"
+    }
+  }
+}

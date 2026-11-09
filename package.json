@@ -10,9 +10,12 @@
     "core": "cargo run -p search-core -- --data-dir .filesearch-data",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs debug",
     "prepare:sidecar:release": "node scripts/prepare-sidecar.mjs release",
+    "prepare:sidecar:cuda": "node scripts/prepare-sidecar.mjs release --cuda",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "desktop:build:cuda": "tauri build --config src-tauri/tauri.cuda.conf.json",
+    "desktop:dev:cuda": "tauri dev --config src-tauri/tauri.cuda.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

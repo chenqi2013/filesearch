@@ -1,5 +1,7 @@
 use crate::embedding::{query_terms, EmbeddingEngine, ASCII_PREFIX_MIN_LENGTH};
-use crate::model::{IndexedDocument, SearchMode, SearchRequest, SearchResult, StoredDocument};
+use crate::model::{
+    IndexedDocument, SearchMode, SearchRequest, SearchResult, SearchScope, StoredDocument,
+};
 use crate::storage::{SemanticChunkMatch, Storage};
 use crate::text_index::TextIndex;
 use anyhow::Result;
@@ -91,6 +93,21 @@ pub fn search(
     embedder: &EmbeddingEngine,
     request: &SearchRequest,
 ) -> Result<Vec<SearchResult>> {
+    let mut results = search_ranked(storage, text_index, embedder, request)?;
+    results = results
+        .into_iter()
+        .skip(request.offset)
+        .take(request.limit.clamp(1, 100))
+        .collect();
+    Ok(results)
+}
+
+pub fn search_ranked(
+    storage: &Storage,
+    text_index: &TextIndex,
+    embedder: &EmbeddingEngine,
+    request: &SearchRequest,
+) -> Result<Vec<SearchResult>> {
     if request.query.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -99,10 +116,70 @@ pub fn search(
         .as_deref()
         .filter(|value| !value.is_empty());
     let stored_documents = storage.list_documents_without_embeddings()?;
-    let documents = stored_documents
+    let mut documents = stored_documents
         .into_iter()
         .filter(|document| extension.is_none_or(|value| value == document.extension))
         .collect::<Vec<_>>();
+    documents.retain(|document| metadata_matches(document, request));
+    if request
+        .filters
+        .exact_phrase
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || !request.filters.exclude_terms.is_empty()
+    {
+        let mut filtered = Vec::new();
+        for document in documents {
+            let mut text = if request.filters.scope == SearchScope::Content {
+                String::new()
+            } else {
+                document.name.clone()
+            };
+            if request.filters.scope != SearchScope::Name {
+                text.push('\n');
+                for (index, chunk) in storage
+                    .chunks_for_document(&document.id)?
+                    .iter()
+                    .enumerate()
+                {
+                    // Stored chunks overlap by 100 characters. Reconstruct before phrase filtering.
+                    text.extend(chunk.text.chars().skip(if index == 0 { 0 } else { 100 }));
+                }
+            }
+            if text_matches(&text, request) {
+                filtered.push(document);
+            }
+        }
+        documents = filtered;
+    }
+    if request.filters.scope == SearchScope::Name {
+        let terms = query_terms(&request.query);
+        let mut results = documents
+            .iter()
+            .filter(|document| precise_lexical_match(&request.query, &terms, &document.name))
+            .map(|document| SearchResult {
+                id: document.id.clone(),
+                path: document.path.clone(),
+                name: document.name.clone(),
+                extension: document.extension.clone(),
+                modified_ms: document.modified_ms,
+                size: document.size,
+                snippet: document.name.clone(),
+                score: term_coverage(&terms, &document.name),
+                duplicates: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        return Ok(results);
+    }
+    let allowed = documents
+        .iter()
+        .map(|d| d.id.clone())
+        .collect::<std::collections::HashSet<_>>();
     let by_id = documents
         .iter()
         .map(|document| (document.id.as_str(), document))
@@ -115,9 +192,9 @@ pub fn search(
     } else {
         text_index.query_term_weights(&terms)?
     };
-    let candidate_limit = (request.limit.clamp(1, 100) * 20).clamp(200, 1_000);
+    let candidate_limit = 1_000;
 
-    let hits = text_index.search(&request.query, candidate_limit)?;
+    let hits = text_index.search_scoped(&request.query, candidate_limit, Some(&allowed))?;
     let keyword_chunks = hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>();
     let mut keyword_scores = HashMap::new();
     let mut semantic_only_min_score = SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE;
@@ -133,7 +210,7 @@ pub fn search(
         let Some(document) = by_id.get(chunk.document_id.as_str()) else {
             continue;
         };
-        let lexical_text = format!("{} {}", document.name, chunk.text);
+        let lexical_text = format!("{} {}", searchable_name(document, request), chunk.text);
         let normalized = (hit.score / max_score).clamp(0.0, 1.0);
         keyword_scores.insert(hit.chunk_id, normalized);
         let coverage = term_coverage(&terms, &lexical_text);
@@ -166,21 +243,26 @@ pub fn search(
     if request.mode != SearchMode::Keyword {
         let query_embedding = embedder.embed_query(&request.query);
         let confirmation = embedder.embed_query(&format!("关于{}的资料", request.query.trim()));
-        let mut semantic_chunks = storage.semantic_passage_matches(
+        let mut semantic_chunks = storage.semantic_passage_matches_scoped(
             &query_embedding,
             &confirmation,
             extension,
             candidate_limit,
             8,
             &keyword_chunks,
+            Some(&allowed),
         );
         let topics = storage
-            .semantic_search(&query_embedding, extension, documents.len())
+            .semantic_search_scoped(&query_embedding, extension, documents.len(), Some(&allowed))
             .into_iter()
             .collect::<HashMap<_, _>>();
         if semantic_chunks.is_empty() {
-            let document_matches =
-                storage.semantic_search(&query_embedding, extension, candidate_limit);
+            let document_matches = storage.semantic_search_scoped(
+                &query_embedding,
+                extension,
+                candidate_limit,
+                Some(&allowed),
+            );
             let best_score = document_matches
                 .iter()
                 .map(|(_, score)| *score)
@@ -188,7 +270,7 @@ pub fn search(
             semantic_only_min_score =
                 (best_score * SEMANTIC_ONLY_RELATIVE_RATIO).max(SEMANTIC_ONLY_ABSOLUTE_MIN_SCORE);
             let confirmations = storage
-                .semantic_search(&confirmation, extension, documents.len())
+                .semantic_search_scoped(&confirmation, extension, documents.len(), Some(&allowed))
                 .into_iter()
                 .collect::<HashMap<_, _>>();
             for (document_id, score) in document_matches {
@@ -210,13 +292,14 @@ pub fn search(
                 "Instruct: Given a query, retrieve documents that answer the query\nQuery: {}",
                 request.query.trim()
             ));
-            let instructed_chunks = storage.semantic_passage_matches(
+            let instructed_chunks = storage.semantic_passage_matches_scoped(
                 &instructed_query,
                 &confirmation,
                 extension,
                 candidate_limit,
                 8,
                 &keyword_chunks,
+                Some(&allowed),
             );
             let instructed_best = instructed_chunks
                 .iter()
@@ -236,7 +319,7 @@ pub fn search(
                     continue;
                 };
                 let local_text = snippet_with_weights(&hit.text, &request.query, &terms, &weights);
-                let lexical_text = format!("{} {}", document.name, hit.text);
+                let lexical_text = format!("{} {}", searchable_name(document, request), hit.text);
                 let coverage = term_coverage(&terms, &lexical_text);
                 let short_coverage = if original_view {
                     short_cjk_coverage(&request.query, &lexical_text)
@@ -335,7 +418,7 @@ pub fn search(
     }
 
     let query_lower = request.query.to_lowercase();
-    if request.mode != SearchMode::Keyword {
+    if request.mode != SearchMode::Keyword && request.filters.scope != SearchScope::Content {
         for document in &documents {
             if document.name.to_lowercase().contains(&query_lower) {
                 candidates.entry(document.id.clone()).or_default();
@@ -353,16 +436,19 @@ pub fn search(
                 .as_deref()
                 .or(candidate.snippet.as_deref())
                 .unwrap_or(document.name.as_str());
-            let coverage = term_coverage(&terms, &format!("{} {semantic_text}", document.name));
+            let coverage = term_coverage(
+                &terms,
+                &format!("{} {semantic_text}", searchable_name(document, request)),
+            );
             let short_cjk_coverage = short_cjk_coverage(
                 &request.query,
-                &format!("{} {semantic_text}", document.name),
+                &format!("{} {semantic_text}", searchable_name(document, request)),
             );
             candidate.short_cjk_coverage = candidate.short_cjk_coverage.max(short_cjk_coverage);
             candidate.semantic_precision = precise_lexical_match(
                 &request.query,
                 &terms,
-                &format!("{} {semantic_text}", document.name),
+                &format!("{} {semantic_text}", searchable_name(document, request)),
             );
             candidate.semantic_coverage = coverage;
             candidate.short_concept_confirmed = short_concept_confirmed(
@@ -410,7 +496,9 @@ pub fn search(
         .into_iter()
         .filter_map(|(document_id, candidate)| {
             let document = by_id.get(document_id.as_str())?;
-            let filename_boost = if document.name.to_lowercase().contains(&query_lower) {
+            let filename_boost = if request.filters.scope != SearchScope::Content
+                && document.name.to_lowercase().contains(&query_lower)
+            {
                 0.20
             } else {
                 0.0
@@ -474,7 +562,6 @@ pub fn search(
     });
     let mut seen = std::collections::HashSet::new();
     ranked.retain(|(id, _, _)| seen.insert(fingerprints.get(id).unwrap_or(id).clone()));
-    ranked.truncate(request.limit.clamp(1, 100));
 
     let mut results = Vec::with_capacity(ranked.len());
     for (document_id, score, matched_text) in ranked {
@@ -516,6 +603,44 @@ pub fn search(
         });
     }
     Ok(results)
+}
+
+fn searchable_name<'a>(document: &'a StoredDocument, request: &SearchRequest) -> &'a str {
+    if request.filters.scope == SearchScope::Content {
+        ""
+    } else {
+        &document.name
+    }
+}
+
+fn metadata_matches(document: &StoredDocument, request: &SearchRequest) -> bool {
+    let f = &request.filters;
+    f.directory
+        .as_ref()
+        .filter(|path| !path.is_empty())
+        .is_none_or(|root| std::path::Path::new(&document.path).starts_with(root))
+        && f.modified_after
+            .is_none_or(|value| document.modified_ms >= value)
+        && f.modified_before
+            .is_none_or(|value| document.modified_ms <= value)
+        && f.min_size.is_none_or(|value| document.size >= value)
+        && f.max_size.is_none_or(|value| document.size <= value)
+}
+
+fn text_matches(text: &str, request: &SearchRequest) -> bool {
+    let lower = text.to_lowercase();
+    request
+        .filters
+        .exact_phrase
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .is_none_or(|phrase| lower.contains(&phrase.to_lowercase()))
+        && !request
+            .filters
+            .exclude_terms
+            .iter()
+            .filter(|term| !term.trim().is_empty())
+            .any(|term| lower.contains(&term.to_lowercase()))
 }
 
 fn cross_query_winner(
@@ -859,6 +984,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filters_apply_before_keyword_candidates_and_pages_keep_stable_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&temp.path().join("search.db")).unwrap();
+        let index = TextIndex::open(&temp.path().join("tantivy")).unwrap();
+        let engine = EmbeddingEngine::new(temp.path().join("no-model"));
+        for number in 0..65 {
+            let document = crate::model::PreparedDocument {
+                id: format!("doc-{number:03}"),
+                root: "C:/allowed".into(),
+                path: format!("C:/allowed/{number}.txt"),
+                name: format!("report-{number}.txt"),
+                extension: "txt".into(),
+                modified_ms: 100,
+                size: 500,
+                chunks: vec![format!("filtertoken unique passage number {number}")],
+                embedding: Vec::new(),
+                locations: Vec::new(),
+            };
+            let chunks = storage.upsert_document(&document).unwrap();
+            index
+                .replace_document(&document.id, &document.name, &chunks)
+                .unwrap();
+        }
+        let noisy = crate::model::PreparedDocument {
+            id: "noise".into(),
+            root: "C:/allowed-other".into(),
+            path: "C:/allowed-other/noise.txt".into(),
+            name: "filtertoken.txt".into(),
+            extension: "txt".into(),
+            modified_ms: 1,
+            size: 1,
+            chunks: vec!["filtertoken".into(); 1100],
+            embedding: Vec::new(),
+            locations: Vec::new(),
+        };
+        let chunks = storage.upsert_document(&noisy).unwrap();
+        index
+            .replace_document(&noisy.id, &noisy.name, &chunks)
+            .unwrap();
+        index.commit().unwrap();
+        let mut request = SearchRequest {
+            query: "filtertoken".into(),
+            mode: SearchMode::Keyword,
+            limit: 20,
+            filters: crate::model::SearchFilters {
+                directory: Some("C:/allowed".into()),
+                modified_after: Some(50),
+                min_size: Some(100),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            search_ranked(&storage, &index, &engine, &request)
+                .unwrap()
+                .len(),
+            65
+        );
+        let first = search(&storage, &index, &engine, &request).unwrap();
+        request.offset = 20;
+        let second = search(&storage, &index, &engine, &request).unwrap();
+        assert_eq!(first.len(), 20);
+        assert_eq!(second.len(), 20);
+        assert!(second
+            .iter()
+            .all(|row| first.iter().all(|other| row.id != other.id)));
+        request.filters.exact_phrase = Some("unique passage number 64".into());
+        request.offset = 0;
+        assert_eq!(
+            search(&storage, &index, &engine, &request).unwrap()[0].id,
+            "doc-064"
+        );
+        request.filters.exclude_terms = vec!["number 64".into()];
+        assert!(search(&storage, &index, &engine, &request)
+            .unwrap()
+            .is_empty());
+        request.filters = crate::model::SearchFilters {
+            scope: SearchScope::Name,
+            ..Default::default()
+        };
+        assert_eq!(
+            search(&storage, &index, &engine, &request).unwrap()[0].id,
+            "noise"
+        );
+        // A required phrase longer than one stored chunk must survive overlapping storage.
+        let mut boundary = noisy;
+        boundary.id = "boundary".into();
+        boundary.name = "boundary.txt".into();
+        boundary.path = "C:/allowed/boundary.txt".into();
+        let phrase = format!("filtertoken {} phrase end", "正文".repeat(430));
+        boundary.chunks = crate::indexer::split_chunks(&phrase);
+        let chunks = storage.upsert_document(&boundary).unwrap();
+        index
+            .replace_document(&boundary.id, &boundary.name, &chunks)
+            .unwrap();
+        index.commit().unwrap();
+        request.filters = crate::model::SearchFilters {
+            scope: SearchScope::Content,
+            exact_phrase: Some(phrase.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            search(&storage, &index, &engine, &request).unwrap()[0].id,
+            "boundary"
+        );
+        request.filters.exclude_terms = vec![phrase];
+        assert!(search(&storage, &index, &engine, &request)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn snippet_can_escape_lexical_overlap_with_clear_local_semantic_support() {
         let mut candidate = Candidate::default();
         candidate.consider_snippet("unrelated repeated query terms", 0.30, 0.30, 0.80);
@@ -1005,6 +1242,7 @@ mod tests {
             .map(|(value, basis)| value * 0.28 + basis * (1.0f32 - 0.28f32.powi(2)).sqrt())
             .collect::<Vec<_>>();
         let document = crate::model::PreparedDocument {
+            locations: Vec::new(),
             id: "structured".into(),
             root: "/test".into(),
             path: "/test/intro.txt".into(),
@@ -1024,6 +1262,8 @@ mod tests {
             .replace_chunk_embeddings(&[(chunks[0].id, document.chunks[0].clone(), body_vector)])
             .unwrap();
         let request = |mode| SearchRequest {
+            offset: 0,
+            filters: Default::default(),
             query: query.into(),
             mode,
             extension: None,
@@ -1163,6 +1403,7 @@ mod tests {
         ));
         for (id, body) in [("evidence", text), ("unrelated", "无关正文".into())] {
             let document = crate::model::PreparedDocument {
+                locations: Vec::new(),
                 id: id.into(),
                 root: "/test".into(),
                 path: format!("/test/{id}.txt"),
@@ -1185,6 +1426,8 @@ mod tests {
                 &index,
                 &engine,
                 &SearchRequest {
+                    offset: 0,
+                    filters: Default::default(),
                     query: query.into(),
                     mode,
                     extension: None,
@@ -1230,6 +1473,7 @@ mod tests {
         let query = "新加坡的大学能排到多少名";
         let vector = engine.embed_query(query);
         let document = crate::model::PreparedDocument {
+            locations: Vec::new(),
             id: "ranking".into(),
             root: "/test".into(),
             path: "/test/ranking.xlsx".into(),
@@ -1265,6 +1509,8 @@ mod tests {
                 &index,
                 &engine,
                 &SearchRequest {
+                    offset: 0,
+                    filters: Default::default(),
                     query: query.into(),
                     mode,
                     extension: None,
@@ -1411,6 +1657,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
         let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
         let document = crate::model::PreparedDocument {
+            locations: Vec::new(),
             id: "jobs".to_owned(),
             root: "/test".to_owned(),
             path: "/test/重庆考公职位表.xlsx".to_owned(),
@@ -1432,6 +1679,8 @@ mod tests {
             &index,
             &engine,
             &SearchRequest {
+                offset: 0,
+                filters: Default::default(),
                 query: "坐办公室的岗位".to_owned(),
                 mode: SearchMode::Semantic,
                 extension: None,
@@ -1485,6 +1734,7 @@ mod tests {
             let extension = name.rsplit_once('.').unwrap().1;
             let vector = engine.embed_passages(&[text.to_string()]).remove(0);
             let document = crate::model::PreparedDocument {
+                locations: Vec::new(),
                 id: (*id).to_owned(),
                 root: "/test".to_owned(),
                 path: format!("/test/{name}"),
@@ -1511,6 +1761,8 @@ mod tests {
                 &index,
                 &engine,
                 &SearchRequest {
+                    offset: 0,
+                    filters: Default::default(),
                     query: query.to_owned(),
                     mode: SearchMode::Semantic,
                     extension: None,
@@ -1545,6 +1797,7 @@ mod tests {
         let passage = format!("{name}\n{text}");
         let vector = engine.embed_passages(&[passage]).remove(0);
         let document = crate::model::PreparedDocument {
+            locations: Vec::new(),
             id: "contract".to_owned(),
             root: "/test".to_owned(),
             path: format!("/test/{name}"),
@@ -1569,6 +1822,8 @@ mod tests {
             &index,
             &engine,
             &SearchRequest {
+                offset: 0,
+                filters: Default::default(),
                 query: "赔款".to_owned(),
                 mode: SearchMode::Semantic,
                 extension: None,
@@ -1605,6 +1860,7 @@ mod tests {
             ("other", "txt", "backup schedule details"),
         ] {
             let document = crate::model::PreparedDocument {
+                locations: Vec::new(),
                 id: id.to_owned(),
                 root: "/test".to_owned(),
                 path: format!("/test/{id}.{extension}"),
@@ -1623,6 +1879,8 @@ mod tests {
         index.commit().unwrap();
         let engine = EmbeddingEngine::new(directory.path().join("unused-model"));
         let mut request = SearchRequest {
+            offset: 0,
+            filters: Default::default(),
             query: "backup".to_owned(),
             mode: SearchMode::Keyword,
             extension: None,
@@ -1701,6 +1959,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
         let index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
         let document = crate::model::PreparedDocument {
+            locations: Vec::new(),
             id: "backup".to_owned(),
             root: "/test".to_owned(),
             path: "/test/备份.txt".to_owned(),
@@ -1725,6 +1984,8 @@ mod tests {
             ("数据库备份", 1),
         ] {
             let request = SearchRequest {
+                offset: 0,
+                filters: Default::default(),
                 query: query.to_owned(),
                 mode: SearchMode::Keyword,
                 extension: None,

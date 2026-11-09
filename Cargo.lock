@@ -3782,6 +3782,7 @@ dependencies = [
  "encoding_rs",
  "fastembed",
  "libloading 0.8.9",
+ "lopdf",
  "notify",
  "ort",
  "parking_lot",

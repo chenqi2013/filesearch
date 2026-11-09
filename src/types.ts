@@ -16,6 +16,10 @@ export interface ServiceStats {
   document_count: number;
   chunk_count: number;
   failed_count: number;
+  skipped_count?: number;
+  text_ready_count?: number;
+  semantic_pending_count?: number;
+  resource_mode?: "everyday" | "full";
   processed_files: number;
   total_files: number;
   current_file?: string;
@@ -56,6 +60,27 @@ export interface SearchResponse {
   total: number;
   elapsed_ms: number;
   results: SearchResult[];
+  offset: number;
+  limit: number;
+  candidate_limited?: boolean;
+}
+
+export interface SearchFilters {
+  directory?: string;
+  modified_after?: number;
+  modified_before?: number;
+  min_size?: number;
+  max_size?: number;
+  scope?: "all" | "name" | "content";
+  exact_phrase?: string;
+  exclude_terms?: string[];
+}
+
+export interface SourceLocation { start: number; end: number; label: string; page: number | null }
+export interface DocumentContent {
+  chunks: Page<IndexedChunk>;
+  locations: SourceLocation[];
+  passages: { position: number; text: string }[];
 }
 
 export interface IndexFailure {
@@ -86,7 +111,7 @@ export interface FileIndexTiming {
   path: string;
   extension: string;
   size: number;
-  status: "indexed" | "failed" | "skipped";
+  status: "indexed" | "embedding" | "failed" | "skipped";
   check_ms: number;
   parse_ms: number;
   ocr_ms: number;

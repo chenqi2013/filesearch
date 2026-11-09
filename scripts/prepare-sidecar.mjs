@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const release = process.argv[2] === "release";
+const includeCuda = process.argv.includes("--cuda");
 const verbose = { cwd: root, stdio: "inherit" };
 
 async function prepareOnnxRuntime() {
@@ -33,6 +34,7 @@ async function prepareOnnxRuntime() {
   copyFileSync(runtimeDll, resolve(buildDir, "onnxruntime.dll"));
   copyFileSync(runtimeDll, resolve(sidecarDir, "onnxruntime.dll"));
 
+  if (!includeCuda) return;
   const gpuPackageRoot = resolve(root, ".codex-tmp", "onnxruntime-gpu-windows-1.22.0");
   const gpuArchive = resolve(root, ".codex-tmp", "onnxruntime-gpu-windows-1.22.0.nupkg");
   const gpuNativeRoot = resolve(gpuPackageRoot, "runtimes", "win-x64", "native");
@@ -63,7 +65,7 @@ async function prepareOnnxRuntime() {
 }
 
 function prepareOptionalCudaLibraries() {
-  if (process.platform !== "win32") return;
+  if (process.platform !== "win32" || !includeCuda) return;
   const buildDir = resolve(root, "target", release ? "release" : "debug");
   const sidecarDir = resolve(root, "src-tauri", "binaries");
   const cudaRuntimeDir = resolve(sidecarDir, "cuda-runtime");
