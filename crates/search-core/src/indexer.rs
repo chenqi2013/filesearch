@@ -1,5 +1,5 @@
 use crate::embedding::{normalize, EmbeddingEngine, EMBEDDING_DIMENSION};
-use crate::extract::{is_supported, LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER};
+use crate::extract::{is_supported, EMPTY_DOCUMENT_REASON, LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER};
 use crate::model::{FileIndexTiming, IndexFailure, PreparedDocument};
 use crate::storage::Storage;
 use crate::text_index::TextIndex;
@@ -60,16 +60,10 @@ enum LegacyOfficeKind {
 
 impl LegacyOfficeKind {
     fn from_path(path: &Path) -> Option<Self> {
-        match path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "doc" => Some(Self::Word),
-            "xls" => Some(Self::Excel),
-            "ppt" => Some(Self::PowerPoint),
+        match crate::extract::legacy_office_extension(path).ok().flatten() {
+            Some("doc") => Some(Self::Word),
+            Some("xls") => Some(Self::Excel),
+            Some("ppt") => Some(Self::PowerPoint),
             _ => None,
         }
     }
@@ -167,10 +161,15 @@ fn skipped_legacy_office_reason(kind: LegacyOfficeKind, reason: &str) -> String 
 }
 
 fn visible_failure_reason(reason: &str) -> String {
-    reason
+    let reason = reason
         .replace(LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER, "")
         .trim()
-        .to_owned()
+        .to_owned();
+    if reason.strip_prefix("文档解析失败: ") == Some(EMPTY_DOCUMENT_REASON) {
+        EMPTY_DOCUMENT_REASON.to_owned()
+    } else {
+        reason
+    }
 }
 
 #[derive(Default)]
@@ -1151,12 +1150,18 @@ fn flush_parse_jobs(
                     error = %format_args!("{error:#}"),
                     "document extraction failed"
                 );
-                storage.record_failure(&failure_for(&path, &error))?;
+                let failure = failure_for(&path, &error);
+                let status = if failure.category == "skipped" {
+                    "skipped"
+                } else {
+                    "failed"
+                };
+                storage.record_failure(&failure)?;
                 record_file_timing(
                     storage,
                     &path,
                     size,
-                    "failed",
+                    status,
                     check_ms,
                     0,
                     elapsed.as_millis() as u64,
@@ -1332,6 +1337,9 @@ fn prepare_document(
     size: u64,
     legacy_office_cache: &LegacyOfficeCapabilityCache,
 ) -> Result<(PreparedDocument, u64)> {
+    if size == 0 {
+        anyhow::bail!(EMPTY_DOCUMENT_REASON);
+    }
     if size > MAX_FILE_BYTES {
         anyhow::bail!("文件超过 200 MB 单文件限制");
     }
@@ -1504,7 +1512,9 @@ fn failure_for(path: &Path, error: &anyhow::Error) -> IndexFailure {
 
 pub(crate) fn classify_failure(reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
-    if lower.contains("旧版 office 转换环境不可用") {
+    if visible_failure_reason(reason) == EMPTY_DOCUMENT_REASON {
+        "skipped"
+    } else if lower.contains("旧版 office 转换环境不可用") {
         "dependency"
     } else if lower.contains("encrypt") || lower.contains("password") || lower.contains("加密") {
         "encrypted"
@@ -1691,6 +1701,81 @@ mod tests {
     }
 
     #[test]
+    fn empty_files_are_skipped_while_nonempty_corruption_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        for name in ["empty.doc", "empty.docx", "empty.txt"] {
+            fs::write(source.join(name), b"").unwrap();
+        }
+        fs::write(source.join("whitespace.txt"), " \r\n\t").unwrap();
+        fs::write(source.join("broken.docx"), b"not a zip archive").unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        let text_index = TextIndex::open(&directory.path().join("tantivy")).unwrap();
+        let embedder = EmbeddingEngine::new(directory.path().join("missing-model"));
+        build_index(
+            &[source.to_string_lossy().into_owned()],
+            &storage,
+            &text_index,
+            &embedder,
+            &IndexControl::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(storage.indexed_counts().unwrap().documents, 0);
+        let failures = storage.failures().unwrap();
+        assert_eq!(failures.len(), 5);
+        for failure in &failures {
+            if failure.path.ends_with("broken.docx") {
+                assert_eq!(failure.category, "corrupt");
+                assert!(failure.reason.contains("无效的 Office"));
+            } else {
+                assert_eq!(failure.category, "skipped");
+                assert_eq!(failure.reason, EMPTY_DOCUMENT_REASON);
+            }
+        }
+        let timings = storage.file_timing_page(0, 50).unwrap();
+        assert_eq!(timings.len(), 5);
+        for timing in timings {
+            assert_eq!(
+                timing.status,
+                if timing.path.ends_with("broken.docx") {
+                    "failed"
+                } else {
+                    "skipped"
+                }
+            );
+            assert_eq!(timing.embedding_ms, 0);
+        }
+    }
+
+    #[test]
+    fn empty_legacy_file_bypasses_unavailable_conversion_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.doc");
+        fs::write(&path, b"").unwrap();
+        let cache = LegacyOfficeCapabilityCache::default();
+        assert!(cache
+            .extract(Path::new("unavailable.doc"), || {
+                Err::<(), _>(anyhow::anyhow!(
+                    "{LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER}Office COM 不可用"
+                ))
+            })
+            .is_err());
+        let error = prepare_document(&path, "source", 0, 0, &cache).unwrap_err();
+        assert_eq!(format!("{error:#}"), EMPTY_DOCUMENT_REASON);
+    }
+
+    #[test]
+    fn empty_worker_reason_is_displayed_as_skipped_without_failure_prefix() {
+        let error = anyhow::anyhow!("文档解析失败: {EMPTY_DOCUMENT_REASON}");
+        let failure = failure_for(Path::new("empty.docx"), &error);
+        assert_eq!(failure.reason, EMPTY_DOCUMENT_REASON);
+        assert_eq!(failure.category, "skipped");
+        assert_eq!(classify_failure(&error.to_string()), "skipped");
+    }
+
+    #[test]
     fn failure_categories_cover_required_cases() {
         assert_eq!(
             classify_failure("旧版 Office 转换环境不可用，请安装 Microsoft Office 或 LibreOffice"),
@@ -1734,6 +1819,38 @@ mod tests {
             })
             .unwrap();
         assert_eq!(xls_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn misnamed_legacy_office_files_share_the_conversion_capability_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.docx");
+        let mut compound = cfb::create(&path).unwrap();
+        compound.create_stream("WordDocument").unwrap();
+        drop(compound);
+        let cache = LegacyOfficeCapabilityCache::default();
+        let attempts = AtomicUsize::new(0);
+        assert!(cache
+            .extract(&path, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!(
+                    "{LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER}Office COM 不可用"
+                ))
+            })
+            .is_err());
+        assert!(cache
+            .extract(Path::new("other.doc"), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+        assert!(cache
+            .extract(&path, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

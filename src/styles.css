@@ -218,6 +218,8 @@ body.resizing-sidebar { cursor: col-resize; user-select: none; }
 .failure-item .inventory-body strong { white-space: normal; overflow-wrap: anywhere; }
 .failure-item .inventory-body p { color: var(--danger); }
 .failure-category { width: fit-content; padding: 2px 6px; border-radius: 3px; background: #f7e9e6; color: var(--danger) !important; text-transform: uppercase; }
+.skipped-item > svg, .skipped-item .inventory-body p { color: var(--muted); }
+.skipped-item .failure-category { background: var(--canvas); color: var(--muted) !important; }
 .inventory-footer { min-height: 52px; padding: 0 16px 0 22px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .inventory-footer > div { display: flex; align-items: center; gap: 6px; }
 .inventory-footer > div > svg { width: 15px; }

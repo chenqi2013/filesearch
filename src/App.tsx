@@ -904,7 +904,7 @@ function InventoryModal({
           {inventory.kind === "failures" && inventory.page.items.map((failure) => (
             <button
               type="button"
-              className="inventory-item failure-item"
+              className={`inventory-item failure-item${failure.category === "skipped" ? " skipped-item" : ""}`}
               key={failure.path}
               title={`${t.open}: ${failure.path}`}
               onClick={() => onOpen(failure.path)}
@@ -912,7 +912,7 @@ function InventoryModal({
               <AlertTriangle />
               <span className="inventory-body">
                 <strong>{failure.path}</strong>
-                <small className="failure-category">{failure.category}</small>
+                <small className="failure-category">{failure.category === "skipped" ? t.timingSkipped : failure.category}</small>
                 <p>{failure.reason}</p>
               </span>
               <ExternalLink />

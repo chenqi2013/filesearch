@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+const DOCUMENT_EMBEDDING_BYTES: usize =
+    crate::embedding::EMBEDDING_DIMENSION * std::mem::size_of::<f32>();
+
 pub struct Storage {
     connection: Mutex<Connection>,
     embeddings: RwLock<HashMap<String, CachedEmbedding>>,
@@ -225,6 +228,27 @@ impl Storage {
         })
     }
 
+    // Text/chunks are stored before embedding starts. Only the final document
+    // embedding marks completion; individual passage vectors may still be partial.
+    // Keep counts() unfiltered for index recovery and legacy migration.
+    pub fn indexed_counts(&self) -> Result<StorageCounts> {
+        let connection = self.connection.lock();
+        Ok(StorageCounts {
+            documents: connection.query_row(
+                "SELECT COUNT(*) FROM documents WHERE length(embedding) = ?",
+                [DOCUMENT_EMBEDDING_BYTES as i64],
+                |row| row.get(0),
+            )?,
+            chunks: connection.query_row(
+                "SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id
+                 WHERE length(d.embedding) = ?",
+                [DOCUMENT_EMBEDDING_BYTES as i64],
+                |row| row.get(0),
+            )?,
+            failures: query_count(&connection, "SELECT COUNT(*) FROM failures")?,
+        })
+    }
+
     pub fn directories(&self) -> Result<Vec<String>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare("SELECT path FROM directories ORDER BY path")?;
@@ -299,18 +323,22 @@ impl Storage {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT id, path, name, extension, modified_ms, size
-             FROM documents ORDER BY name COLLATE NOCASE, path LIMIT ? OFFSET ?",
+             FROM documents WHERE length(embedding) = ?
+             ORDER BY name COLLATE NOCASE, path LIMIT ? OFFSET ?",
         )?;
-        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
-            Ok(IndexedDocument {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                name: row.get(2)?,
-                extension: row.get(3)?,
-                modified_ms: row.get::<_, i64>(4)? as u64,
-                size: row.get::<_, i64>(5)? as u64,
-            })
-        })?;
+        let rows = statement.query_map(
+            params![DOCUMENT_EMBEDDING_BYTES as i64, limit as i64, offset as i64],
+            |row| {
+                Ok(IndexedDocument {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    name: row.get(2)?,
+                    extension: row.get(3)?,
+                    modified_ms: row.get::<_, i64>(4)? as u64,
+                    size: row.get::<_, i64>(5)? as u64,
+                })
+            },
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -824,18 +852,22 @@ impl Storage {
         let mut statement = connection.prepare(
             "SELECT c.id, c.document_id, d.name, d.path, c.position, c.text
              FROM chunks c JOIN documents d ON d.id = c.document_id
+             WHERE length(d.embedding) = ?
              ORDER BY d.name COLLATE NOCASE, d.path, c.position LIMIT ? OFFSET ?",
         )?;
-        let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
-            Ok(IndexedChunk {
-                id: row.get::<_, i64>(0)? as u64,
-                document_id: row.get(1)?,
-                document_name: row.get(2)?,
-                document_path: row.get(3)?,
-                position: row.get::<_, i64>(4)? as usize,
-                text: row.get(5)?,
-            })
-        })?;
+        let rows = statement.query_map(
+            params![DOCUMENT_EMBEDDING_BYTES as i64, limit as i64, offset as i64],
+            |row| {
+                Ok(IndexedChunk {
+                    id: row.get::<_, i64>(0)? as u64,
+                    document_id: row.get(1)?,
+                    document_name: row.get(2)?,
+                    document_path: row.get(3)?,
+                    position: row.get::<_, i64>(4)? as usize,
+                    text: row.get(5)?,
+                })
+            },
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -987,7 +1019,7 @@ impl Storage {
             &connection,
             &format!(
                 "SELECT COUNT(*) FROM documents WHERE embedding IS NULL OR length(embedding) != {}",
-                crate::embedding::EMBEDDING_DIMENSION * std::mem::size_of::<f32>()
+                DOCUMENT_EMBEDDING_BYTES
             ),
         )
     }
@@ -1556,6 +1588,106 @@ mod tests {
     }
 
     #[test]
+    fn inventory_exposes_only_completed_documents_across_batches_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("search.db");
+        let storage = Storage::open(&path).unwrap();
+        let mut documents = (0..4)
+            .map(|index| PreparedDocument {
+                id: format!("doc-{index}"),
+                root: "/inventory".to_owned(),
+                path: format!("/inventory/{index}.txt"),
+                name: format!("{index}.txt"),
+                extension: "txt".to_owned(),
+                modified_ms: 1,
+                size: 12,
+                chunks: vec!["first passage".to_owned(), "second passage".to_owned()],
+                embedding: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let chunks = storage.upsert_documents(&documents).unwrap();
+        // Persisting text and even a few semantic windows must not count as done.
+        storage
+            .replace_chunk_embeddings(&[(
+                chunks[0][0].id,
+                "first passage".to_owned(),
+                fallback_embed("first passage"),
+            )])
+            .unwrap();
+        assert_eq!(storage.counts().unwrap().documents, 4);
+        assert_eq!(storage.indexed_counts().unwrap().documents, 0);
+        assert_eq!(storage.indexed_counts().unwrap().chunks, 0);
+        assert!(storage.document_page(0, 50).unwrap().is_empty());
+        assert!(storage.chunk_page(0, 50).unwrap().is_empty());
+
+        // Finish the last file first so pending entries sort before it.
+        documents[3].embedding = fallback_embed("complete document");
+        storage.update_document_embeddings(&documents[3..]).unwrap();
+        let counts = storage.indexed_counts().unwrap();
+        assert_eq!(counts.documents, 1);
+        assert_eq!(counts.chunks, 2);
+        assert_eq!(storage.document_page(0, 1).unwrap()[0].id, "doc-3");
+        assert!(storage.document_page(1, 1).unwrap().is_empty());
+        assert_eq!(storage.chunk_page(1, 1).unwrap()[0].document_id, "doc-3");
+        assert!(storage.chunk_page(2, 1).unwrap().is_empty());
+        drop(storage);
+
+        // Cancellation/restart must not turn partially embedded files into done.
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.counts().unwrap().documents, 4);
+        assert_eq!(storage.missing_embedding_count().unwrap(), 3);
+        assert_eq!(storage.indexed_counts().unwrap().documents, 1);
+        assert_eq!(storage.document_page(0, 50).unwrap().len(), 1);
+        for document in &mut documents[..3] {
+            document.embedding = fallback_embed("complete document");
+            storage
+                .update_document_embeddings(std::slice::from_ref(document))
+                .unwrap();
+        }
+        assert_eq!(storage.indexed_counts().unwrap().documents, 4);
+        assert_eq!(storage.indexed_counts().unwrap().chunks, 8);
+
+        // A changed file is pending again until its new embeddings complete.
+        documents[0].embedding.clear();
+        storage.upsert_document(&documents[0]).unwrap();
+        assert_eq!(storage.indexed_counts().unwrap().documents, 3);
+        assert_eq!(storage.indexed_counts().unwrap().chunks, 6);
+        assert!(storage
+            .document_page(0, 50)
+            .unwrap()
+            .iter()
+            .all(|document| document.id != "doc-0"));
+        storage.clear_embeddings().unwrap();
+        assert_eq!(storage.indexed_counts().unwrap().documents, 0);
+        assert_eq!(storage.indexed_counts().unwrap().chunks, 0);
+        assert_eq!(storage.counts().unwrap().chunks, 8);
+    }
+
+    #[test]
+    fn inventory_does_not_count_invalid_embeddings_as_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("search.db")).unwrap();
+        storage
+            .upsert_document(&PreparedDocument {
+                id: "invalid".to_owned(),
+                root: "/inventory".to_owned(),
+                path: "/inventory/invalid.txt".to_owned(),
+                name: "invalid.txt".to_owned(),
+                extension: "txt".to_owned(),
+                modified_ms: 1,
+                size: 12,
+                chunks: vec!["some text".to_owned()],
+                embedding: vec![1.0],
+            })
+            .unwrap();
+        assert_eq!(storage.missing_embedding_count().unwrap(), 1);
+        assert_eq!(storage.indexed_counts().unwrap().documents, 0);
+        assert_eq!(storage.indexed_counts().unwrap().chunks, 0);
+        assert!(storage.document_page(0, 50).unwrap().is_empty());
+        assert!(storage.chunk_page(0, 50).unwrap().is_empty());
+    }
+
+    #[test]
     fn inventory_pages_return_documents_chunks_and_failures() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("search.db")).unwrap();
@@ -1583,6 +1715,10 @@ mod tests {
         assert_eq!(storage.document_page(0, 50).unwrap().len(), 1);
         assert_eq!(storage.chunk_page(0, 50).unwrap().len(), 2);
         assert_eq!(storage.failure_page(0, 50).unwrap().len(), 1);
+        let counts = storage.indexed_counts().unwrap();
+        assert_eq!(counts.documents, 1);
+        assert_eq!(counts.chunks, 2);
+        assert_eq!(counts.failures, 1);
     }
 
     #[test]

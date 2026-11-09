@@ -14,6 +14,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json", "log", "rst",
 ];
 pub const EXTRACTION_PROFILE: &str = "office-legacy-conversion-v3-pdf-cjk-spacing";
+pub(crate) const EMPTY_DOCUMENT_REASON: &str = "空文件或仅包含空白内容，已跳过";
 pub(crate) const LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER: &str =
     "[filesearch:legacy-office-environment-unavailable]";
 
@@ -47,6 +48,15 @@ pub fn extract_text_with_timing(path: &Path) -> Result<(String, u64)> {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    if SUPPORTED_EXTENSIONS.contains(&extension.as_str())
+        && std::fs::metadata(path)
+            .with_context(|| format!("无法读取 {}", path.display()))?
+            .len()
+            == 0
+    {
+        anyhow::bail!(EMPTY_DOCUMENT_REASON);
+    }
+
     let (text, mut ocr_ms) = match extension.as_str() {
         "txt" | "md" | "csv" | "json" | "log" | "rst" => {
             let bytes =
@@ -59,9 +69,9 @@ pub fn extract_text_with_timing(path: &Path) -> Result<(String, u64)> {
             }
             extract_pdf_text_with_timing(path)?
         }
-        "docx" => (extract_ooxml(path, OoxmlKind::Word)?, 0),
-        "pptx" => (extract_ooxml(path, OoxmlKind::PowerPoint)?, 0),
-        "xlsx" => (extract_ooxml(path, OoxmlKind::Excel)?, 0),
+        "docx" => (extract_office(path, OoxmlKind::Word)?, 0),
+        "pptx" => (extract_office(path, OoxmlKind::PowerPoint)?, 0),
+        "xlsx" => (extract_office(path, OoxmlKind::Excel)?, 0),
         "doc" => (extract_legacy_office(path, OoxmlKind::Word)?, 0),
         "ppt" => (extract_legacy_office(path, OoxmlKind::PowerPoint)?, 0),
         "xls" => (extract_legacy_office(path, OoxmlKind::Excel)?, 0),
@@ -97,11 +107,57 @@ pub fn extract_text_with_timing(path: &Path) -> Result<(String, u64)> {
             extension.as_str(),
             "txt" | "md" | "csv" | "json" | "log" | "rst"
         ) {
-            return Err(anyhow!("空文件或仅包含空白内容，已跳过"));
+            return Err(anyhow!(EMPTY_DOCUMENT_REASON));
         }
         return Err(anyhow!("未提取到可索引文本"));
     }
     Ok((normalized, ocr_ms))
+}
+
+// Some producers give binary Office files an OOXML suffix. Check the compound
+// directory rather than treating every OLE file (including encrypted OOXML) as DOC.
+pub(crate) fn legacy_office_extension(path: &Path) -> Result<Option<&'static str>> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let (legacy, stream_names): (&str, &[&str]) = match extension.as_str() {
+        "doc" => return Ok(Some("doc")),
+        "xls" => return Ok(Some("xls")),
+        "ppt" => return Ok(Some("ppt")),
+        "docx" => ("doc", &["WordDocument"]),
+        "xlsx" => ("xls", &["Workbook", "Book"]),
+        "pptx" => ("ppt", &["PowerPoint Document"]),
+        _ => return Ok(None),
+    };
+    let mut file = File::open(path)?;
+    let mut signature = [0; 8];
+    if file.read(&mut signature)? != signature.len()
+        || signature != [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]
+    {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let compound = cfb::CompoundFile::open(file).context("无效的 Office 复合文件")?;
+    if compound.is_stream("/EncryptedPackage") || compound.is_stream("/EncryptionInfo") {
+        anyhow::bail!("加密 Office 文件不支持，请解密后重新索引");
+    }
+    if !stream_names
+        .iter()
+        .any(|name| compound.is_stream(format!("/{name}")))
+    {
+        anyhow::bail!("Office 文件实际格式与 .{extension} 扩展名不符，未找到对应的文档数据流");
+    }
+    Ok(Some(legacy))
+}
+
+fn extract_office(path: &Path, kind: OoxmlKind) -> Result<String> {
+    if legacy_office_extension(path)?.is_some() {
+        extract_legacy_office(path, kind)
+    } else {
+        extract_ooxml(path, kind)
+    }
 }
 
 fn extract_legacy_office(path: &Path, kind: OoxmlKind) -> Result<String> {
@@ -123,43 +179,59 @@ impl Drop for ConvertedOfficeFile {
 fn convert_legacy_office(path: &Path, kind: OoxmlKind) -> Result<ConvertedOfficeFile> {
     let directory = legacy_conversion_directory(path)?;
     let extension = legacy_conversion_extension(kind);
-    let converted_path = directory.join(format!(
-        "{}.{}",
-        path.file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("converted"),
-        extension
-    ));
+    let converted = ConvertedOfficeFile {
+        path: directory.join(format!(
+            "{}.{}",
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("converted"),
+            extension
+        )),
+        directory,
+    };
+    // Give converters the actual legacy suffix using a private copy. Keep both
+    // the original bytes and original filename untouched, and avoid input/output
+    // collisions when the original suffix already says .docx/.xlsx/.pptx.
+    let legacy_extension = match kind {
+        OoxmlKind::Word => "doc",
+        OoxmlKind::Excel => "xls",
+        OoxmlKind::PowerPoint => "ppt",
+    };
+    let input_copy = if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(legacy_extension))
+    {
+        let input_directory = converted.directory.join("input");
+        std::fs::create_dir(&input_directory)?;
+        let input = input_directory
+            .join(path.file_name().unwrap_or_default())
+            .with_extension(legacy_extension);
+        std::fs::copy(path, &input)?;
+        Some(input)
+    } else {
+        None
+    };
+    let conversion_input = input_copy.as_deref().unwrap_or(path);
     let mut errors = Vec::new();
 
-    let libreoffice_error = match convert_with_libreoffice(path, &directory, extension) {
-        Ok(()) if converted_path.is_file() => {
-            return Ok(ConvertedOfficeFile {
-                directory,
-                path: converted_path,
-            });
-        }
-        Ok(()) => "LibreOffice 未生成转换文件".to_owned(),
-        Err(error) => format!("LibreOffice: {error:#}"),
-    };
+    let libreoffice_error =
+        match convert_with_libreoffice(conversion_input, &converted.directory, extension) {
+            Ok(()) if converted.path.is_file() => return Ok(converted),
+            Ok(()) => "LibreOffice 未生成转换文件".to_owned(),
+            Err(error) => format!("LibreOffice: {error:#}"),
+        };
     let libreoffice_unavailable = libreoffice_error == "LibreOffice: 未找到 LibreOffice";
     errors.push(libreoffice_error);
 
-    match convert_with_microsoft_office(path, &converted_path, kind) {
-        Ok(()) if converted_path.is_file() => Ok(ConvertedOfficeFile {
-            directory,
-            path: converted_path,
-        }),
-        Ok(()) => {
-            let _ = std::fs::remove_dir_all(&directory);
-            Err(anyhow!("Microsoft Office 未生成转换文件"))
-        }
+    match convert_with_microsoft_office(conversion_input, &converted.path, kind) {
+        Ok(()) if converted.path.is_file() => Ok(converted),
+        Ok(()) => Err(anyhow!("Microsoft Office 未生成转换文件")),
         Err(error) => {
             let microsoft_error = format!("Microsoft Office: {error:#}");
             let environment_unavailable = libreoffice_unavailable
                 && microsoft_office_environment_unavailable(&microsoft_error);
             errors.push(microsoft_error);
-            let _ = std::fs::remove_dir_all(&directory);
             let marker = if environment_unavailable {
                 LEGACY_OFFICE_ENV_UNAVAILABLE_MARKER
             } else {
@@ -1042,6 +1114,17 @@ mod tests {
     }
 
     #[test]
+    fn zero_byte_files_are_skipped_before_format_specific_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        for extension in SUPPORTED_EXTENSIONS {
+            let path = directory.path().join(format!("empty.{extension}"));
+            std::fs::write(&path, b"").unwrap();
+            let error = extract_text(&path).unwrap_err();
+            assert_eq!(format!("{error:#}"), EMPTY_DOCUMENT_REASON, "{extension}");
+        }
+    }
+
+    #[test]
     fn reports_empty_text_files_as_skipped() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.txt");
@@ -1072,6 +1155,53 @@ mod tests {
         assert_eq!(legacy_conversion_extension(OoxmlKind::Word), "docx");
         assert_eq!(legacy_conversion_extension(OoxmlKind::Excel), "xlsx");
         assert_eq!(legacy_conversion_extension(OoxmlKind::PowerPoint), "pptx");
+    }
+
+    #[test]
+    fn detects_legacy_office_content_with_ooxml_suffixes() {
+        let directory = tempfile::tempdir().unwrap();
+        for (suffix, stream, legacy) in [
+            ("docx", "WordDocument", "doc"),
+            ("xlsx", "Workbook", "xls"),
+            ("xlsx", "Book", "xls"),
+            ("pptx", "PowerPoint Document", "ppt"),
+        ] {
+            let path = directory.path().join(format!("source.{suffix}"));
+            let mut compound = cfb::create(&path).unwrap();
+            compound
+                .create_stream(stream)
+                .unwrap()
+                .write_all(b"legacy content")
+                .unwrap();
+            drop(compound);
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(legacy_office_extension(&path).unwrap(), Some(legacy));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn encrypted_ooxml_is_not_sent_to_legacy_conversion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("encrypted.docx");
+        let mut compound = cfb::create(&path).unwrap();
+        compound.create_stream("EncryptedPackage").unwrap();
+        compound.create_stream("EncryptionInfo").unwrap();
+        drop(compound);
+        let error = extract_text(&path).unwrap_err().to_string();
+        assert!(error.contains("加密 Office"));
+        assert!(!error.contains("旧版 Office 转换"));
+    }
+
+    #[test]
+    fn other_compound_formats_are_not_treated_as_word_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wrong.docx");
+        let mut compound = cfb::create(&path).unwrap();
+        compound.create_stream("Workbook").unwrap();
+        drop(compound);
+        let error = extract_text(&path).unwrap_err().to_string();
+        assert!(error.contains("实际格式与 .docx 扩展名不符"));
     }
 
     #[test]

@@ -60,7 +60,7 @@ export interface SearchResponse {
 
 export interface IndexFailure {
   path: string;
-  category?: "dependency" | "encrypted" | "permission" | "offline" | "corrupt" | "timeout" | "parse" | "internal";
+  category?: "dependency" | "encrypted" | "permission" | "offline" | "corrupt" | "timeout" | "parse" | "internal" | "skipped";
   reason: string;
 }
 

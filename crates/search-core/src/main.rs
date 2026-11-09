@@ -246,11 +246,14 @@ async fn health(State(state): State<SharedState>) -> Json<Value> {
 }
 
 async fn stats(State(state): State<SharedState>) -> Json<ServiceStats> {
-    let counts = state.storage.counts().unwrap_or(storage::StorageCounts {
-        documents: 0,
-        chunks: 0,
-        failures: 0,
-    });
+    let counts = state
+        .storage
+        .indexed_counts()
+        .unwrap_or(storage::StorageCounts {
+            documents: 0,
+            chunks: 0,
+            failures: 0,
+        });
     let indexing = state.indexing.load(Ordering::Relaxed);
     let paused = indexing && state.index_control.is_paused();
     let timing = index_timing_snapshot(&state, indexing);
@@ -295,7 +298,7 @@ async fn documents(
     Query(request): Query<PageRequest>,
 ) -> Result<Json<Page<IndexedDocument>>, (StatusCode, Json<Value>)> {
     let request = request.bounded();
-    let counts = state.storage.counts().map_err(internal_error)?;
+    let counts = state.storage.indexed_counts().map_err(internal_error)?;
     let items = state
         .storage
         .document_page(request.offset, request.limit)
@@ -313,7 +316,7 @@ async fn chunks(
     Query(request): Query<PageRequest>,
 ) -> Result<Json<Page<IndexedChunk>>, (StatusCode, Json<Value>)> {
     let request = request.bounded();
-    let counts = state.storage.counts().map_err(internal_error)?;
+    let counts = state.storage.indexed_counts().map_err(internal_error)?;
     let items = state
         .storage
         .chunk_page(request.offset, request.limit)
